@@ -1,0 +1,161 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (set_fact, lineinfile, stat, debug, include_role)
+#                 work identically on both 2.7.17 and 2.14.18.
+#                 | default('') guards are applied on all optional variables.
+#                 No `warn:` parameter is used on any task.
+#
+# error_handle role — Standardises error handling across all upgrade phases.
+# Responsibilities:
+#   1. Record structured FAIL entry into `failed_validations` & `failed_checks` facts.
+#   2. Append the failure reason to the run logs (.txt and .csv).
+#   3. Dispatch an alert email via the sendmail role using error-report.j2.
+#   4. Caller contract: logout is executed by the caller's `always:` block.
+#
+# Consumed variables (passed by caller or defaults):
+#   - current_step_no    — Step number of the failed task (default: 0)
+#   - current_task_name  — Descriptive name of the failed check/task
+#   - current_gate_type  — Gate type ("HARD" or "WARN", default: "HARD")
+#   - failure_reason     — Observed error reason or log line
+#   - failure_observed   — Observed metric/state value
+#   - failed_phase       — Name of the phase where failure occurred
+
+---
+# --- 1. Resolve error metadata facts -----------------------------------------
+- name: Resolve error handling metadata facts
+  set_fact:
+    resolved_error_timestamp: "{{ error_timestamp if (error_timestamp | default('') | length > 0) else (ansible_date_time.iso8601 if (ansible_date_time is defined and ansible_date_time.iso8601 is defined) else lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')) }}"
+    resolved_failed_phase: "{{ failed_phase if (failed_phase | default('') | length > 0) else (phase_name if (phase_name is defined and phase_name | length > 0) else 'Upgrade Phase') }}"
+    resolved_failure_reason: >-
+      {{
+        failure_reason if (failure_reason | default('') | length > 0 and failure_reason != 'non-zero return code')
+        else (
+          (((ansible_failed_result | default({})).stderr | default('')) | trim) if (((ansible_failed_result | default({})).stderr | default('')) | trim != '')
+          else (
+            (((ansible_failed_result | default({})).stderr_lines | default([])) | join(' ') | trim) if ((((ansible_failed_result | default({})).stderr_lines | default([])) | length) > 0)
+            else (
+              (((ansible_failed_result | default({})).msg | default('')) | trim) if (((ansible_failed_result | default({})).msg | default('')) | trim != '' and ((ansible_failed_result | default({})).msg | default('')) != 'non-zero return code')
+              else (
+                (((ansible_failed_result | default({})).message | default('')) | trim) if (((ansible_failed_result | default({})).message | default('')) | trim != '')
+                else (error_message if (error_message is defined and error_message | length > 0) else 'Unspecified task failure')
+              )
+            )
+          )
+        )
+      }}
+    resolved_failure_observed: "{{ failure_observed if (failure_observed | default('') | length > 0) else (observed_value if (observed_value is defined and observed_value | length > 0) else 'Failure condition observed') }}"
+    resolved_log_file_txt: "{{ log_file_txt if (log_file_txt | default('') | length > 0) else (log_path if (log_path is defined and log_path | length > 0) else (log_dir | default(playbook_dir ~ '/logs')) ~ '/' ~ (cluster_name | default('cluster')) ~ '_' ~ (timestamp | default('run')) ~ '.txt') }}"
+    resolved_log_file_csv: "{{ log_file_csv if (log_file_csv | default('') | length > 0) else (log_csv_path if (log_csv_path is defined and log_csv_path | length > 0) else (log_dir | default(playbook_dir ~ '/logs')) ~ '/' ~ (cluster_name | default('cluster')) ~ '_' ~ (timestamp | default('run')) ~ '.csv') }}"
+
+- name: Detect RBAC and permission denial conditions
+  set_fact:
+    is_rbac_error: >-
+      {{ (resolved_failure_reason | lower is search('forbidden')) or
+         (resolved_failure_reason | lower is search('cannot patch')) or
+         (resolved_failure_reason | lower is search('cannot get')) or
+         (resolved_failure_reason | lower is search('cannot create')) or
+         (resolved_failure_reason | lower is search('cannot update')) or
+         (resolved_failure_reason | lower is search('unauthorized')) }}
+    rbac_error_guidance: "Service account lacks required OpenShift RBAC permissions (e.g., cluster-admin or dedicated cluster upgrade permissions for clusterversions / machineconfigpools). Check RoleBinding/ClusterRoleBinding."
+
+# --- 2. Record structured FAIL entry into facts ------------------------------
+- name: Construct structured failure entry
+  set_fact:
+    current_fail_entry:
+      id: "{{ current_step_no | default(0) }}"
+      step: "{{ current_step_no | default(0) }}"
+      name: "{{ current_task_name | default('Unspecified Task') }}"
+      task: "{{ current_task_name | default('Unspecified Task') }}"
+      check_name: "{{ current_task_name | default('Unspecified Task') }}"
+      gate_type: "{{ current_gate_type | default('HARD') }}"
+      observed_value: "{{ resolved_failure_observed }}"
+      observed: "{{ resolved_failure_observed }}"
+      reason: "{{ resolved_failure_reason }}"
+      error_output: "{{ resolved_failure_reason }}"
+      is_rbac_error: "{{ is_rbac_error | default(false) | bool }}"
+      status: "FAIL"
+      timestamp: "{{ resolved_error_timestamp }}"
+      row_bg: "#fff8f8"
+
+- name: Append failure entry to failed_validations and failed_checks facts
+  set_fact:
+    failed_validations: "{{ (failed_validations | default([])) + [current_fail_entry] }}"
+    failed_checks: "{{ (failed_checks | default([])) + [current_fail_entry] }}"
+
+# --- 3. Write failure details to run logs (.txt + .csv) ----------------------
+- name: Append failure entry to .txt run log
+  lineinfile:
+    path: "{{ resolved_log_file_txt }}"
+    line: "[{{ resolved_error_timestamp }}] [FAIL] [{{ current_gate_type | default('HARD') }}] Step {{ current_step_no | default(0) }}: {{ current_task_name | default('Unspecified Task') }} | Phase: {{ resolved_failed_phase }} | Observed: {{ resolved_failure_observed }} | Reason: {{ resolved_failure_reason }}"
+    create: yes
+  failed_when: false
+
+- name: Check if .csv run log exists
+  stat:
+    path: "{{ resolved_log_file_csv }}"
+  register: csv_log_stat
+  failed_when: false
+
+- name: Initialize .csv run log header if new file
+  lineinfile:
+    path: "{{ resolved_log_file_csv }}"
+    line: "Timestamp,Cluster,Phase,Step,Task,Gate,Observed,Reason,Status"
+    create: yes
+  when: not (csv_log_stat.stat.exists | default(false))
+  failed_when: false
+
+- name: Append structured record to .csv run log
+  lineinfile:
+    path: "{{ resolved_log_file_csv }}"
+    line: '"{{ resolved_error_timestamp }}","{{ cluster_name | default(''N/A'') }}","{{ resolved_failed_phase }}","{{ current_step_no | default(0) }}","{{ current_task_name | default(''Unspecified Task'') }}","{{ current_gate_type | default(''HARD'') }}","{{ resolved_failure_observed | replace(''"'', ''""'') }}","{{ resolved_failure_reason | replace(''"'', ''""'') }}","FAIL"'
+    create: yes
+  failed_when: false
+
+# --- 4. Dispatch failure alert email via sendmail role ------------------------
+- name: Dispatch failure alert email via sendmail role
+  include_role:
+    name: sendmail
+  vars:
+    mail_template: "error-report.j2"
+    mail_subject: "{{ alert_subject_prefix | default('[ARO Upgrade] ALERT') }} — {{ cluster_name | default('Cluster') }} — {{ current_task_name | default('Gate Failure') }}"
+    phase_name: "{{ resolved_failed_phase }}"
+    failed_phase: "{{ resolved_failed_phase }}"
+    failed_check_name: "{{ current_task_name | default('Unspecified Task') }}"
+    gate_type: "{{ current_gate_type | default('HARD') }}"
+    observed_value: "{{ resolved_failure_observed }}"
+    failure_reason: "{{ resolved_failure_reason }}"
+    is_rbac_error: "{{ is_rbac_error | default(false) | bool }}"
+    rbac_error_guidance: "{{ rbac_error_guidance | default('') }}"
+    failure_summary: "{{ 'Service account RBAC permission denied (forbidden). Check cluster privileges.' if (is_rbac_error | default(false) | bool) else (error_summary | default('A critical check failed during phase execution. Automated session teardown (logout) was initiated to prevent invalid cluster state.')) }}"
+    log_path: "{{ resolved_log_file_txt }}"
+
+- name: Confirm error handling completed
+  debug:
+    msg: >-
+      ✖ Error recorded for step {{ current_step_no | default(0) }}
+      ('{{ current_task_name | default('Unspecified Task') }}').
+      Logs updated at '{{ resolved_log_file_txt }}'.
+      Caller 'always:' block will ensure session logout.
+
+# ==============================================================================
+# CALLER CONTRACT NOTICE:
+# ==============================================================================
+# The caller playbook/phase MUST include the `logout` role in its `always:`
+# block to guarantee clean session teardown upon task rescue/failure:
+#
+#   block:
+#     - name: Perform critical cluster operation
+#       ...
+#   rescue:
+#     - name: Handle failure and alert
+#       include_role:
+#         name: error_handle
+#       vars:
+#         current_step_no: 1
+#         current_task_name: "Prevalidation API check"
+#         failure_observed: "API returned 503"
+#         failure_reason: "API server unavailable"
+#   always:
+#     - name: Guaranteed session teardown
+#       include_role:
+#         name: logout
+# ==============================================================================
