@@ -1,17 +1,17 @@
 (async () => {
-  const base = "https://github.com/hcsc-paasengineering/openshift-platform-onboarding/pulls";
-  const query = 'is:pr is:closed closed:>=2026-08-01 in:title "Namespace creation request"';
+  const OWNER = "hcsc-paasengineering";
+  const REPO  = "openshift-platform-onboarding";
+  const PREFIX = "Namespace creation request"; // text to strip from Title
+  const query = `is:pr is:closed closed:>=2026-08-01 in:title "${PREFIX}"`;
+  const base = `https://github.com/${OWNER}/${REPO}/pulls`;
+
+  // ---------- PASS 1: collect PRs from the search list ----------
   let page = 1;
-  const rows = [["PR","Title","Author","URL"]];
-
+  const prs = [];
   while (true) {
-    const url = `${base}?q=${encodeURIComponent(query)}&page=${page}`;
-    const res = await fetch(url, { credentials: "include" });
-    if (!res.ok) { console.error("HTTP", res.status); break; }
-    const html = await res.text();
-    const doc = new DOMParser().parseFromString(html, "text/html");
-
-    // Each PR row in the list
+    const res = await fetch(`${base}?q=${encodeURIComponent(query)}&page=${page}`, { credentials: "include" });
+    if (!res.ok) { console.error("List HTTP", res.status); break; }
+    const doc = new DOMParser().parseFromString(await res.text(), "text/html");
     const items = doc.querySelectorAll('div[id^="issue_"]');
     if (items.length === 0) break;
 
@@ -19,25 +19,60 @@
       const link = item.querySelector('a[data-hovercard-type="pull_request"]');
       if (!link) return;
       const number = (item.id.match(/\d+/) || [""])[0];
-      const title = link.textContent.trim();
-      const author = (item.querySelector('a.author') || {}).textContent?.trim() || "";
-      const href = "https://github.com" + link.getAttribute("href");
-      rows.push([number, title, author, href]);
+      const title  = link.textContent.trim();
+      const author = item.querySelector('a.author')?.textContent?.trim() || "";
+      const opened = item.querySelector('relative-time')?.getAttribute('datetime') || "";
+      const merged = !!item.querySelector('.octicon-git-merge');
+      prs.push({ number, title, author, opened, state: merged ? "Merged" : "Closed" });
     });
 
-    // Stop if no "Next" pagination link
     if (!doc.querySelector('a.next_page, a[rel="next"]')) break;
-    page++;
-    if (page > 50) break; // safety cap
+    if (++page > 50) break;
+  }
+  console.log("PRs found in list:", prs.length);
+
+  // ---------- PASS 2: fetch each PR page for merge/close/approval ----------
+  const grab = (html, re) => (html.match(re) || [,""])[1] || "";
+  let done = 0;
+  for (const pr of prs) {
+    try {
+      const res = await fetch(`https://github.com/${OWNER}/${REPO}/pull/${pr.number}`, { credentials: "include" });
+      const html = await res.text();
+      pr.createdAt  = grab(html, /"createdAt":"([^"]+)"/);
+      pr.mergedAt   = grab(html, /"mergedAt":"([^"]+)"/);
+      pr.closedAt   = grab(html, /"closedAt":"([^"]+)"/);
+      pr.reviewDec  = grab(html, /"reviewDecision":"([^"]+)"/); // APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
+    } catch(e) { /* keep going */ }
+    if (++done % 10 === 0) console.log(`Enriched ${done}/${prs.length}`);
   }
 
-  console.log("Matched PRs:", rows.length - 1);
-  if (rows.length === 1) { console.warn("No rows found — check the query or that you're logged in."); return; }
+  // ---------- SORT descending by PR number ----------
+  prs.sort((a,b) => Number(b.number) - Number(a.number));
 
+  // ---------- BUILD CSV ----------
+  const header = ["S.No","PR","Namespace","Title","Author","State","Approval","Opened","Merged Date","Closed Date"];
+  const rows = [header];
+  prs.forEach((pr, i) => {
+    const ns = pr.title.replace(new RegExp(PREFIX, "i"), "").trim();
+    rows.push([
+      i + 1,
+      pr.number,
+      ns,
+      pr.title,
+      pr.author,
+      pr.state,
+      pr.reviewDec || "",
+      pr.createdAt || pr.opened || "",
+      pr.mergedAt || "",
+      pr.closedAt || ""
+    ]);
+  });
+
+  console.log("Rows:", rows.length - 1);
   const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "namespace_prs.csv";
+  a.download = "namespace_prs_detailed.csv";
   a.click();
 })();
