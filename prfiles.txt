@@ -1,11 +1,47 @@
-$headers = @{
-    Authorization = "Bearer <TOKEN>"
-    Accept = "application/vnd.github+json"
-}
+#!/bin/bash
 
-$url = "https://api.github.com/search/issues?q=is:pr+is:closed+closed:>=2026-08-01+namespace+in:title&per_page=100"
+# Configuration
+OWNER="your-org"
+REPO="your-repo"
+TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 
-$data = Invoke-RestMethod -Uri $url -Headers $headers
+OUTPUT="namespace_prs.csv"
+SINCE="2026-08-01"
 
-$data.items | Select-Object number,title,state,created_at,closed_at,html_url |
-Export-Csv -Path "namespace_prs.csv" -NoTypeInformation
+# CSV Header
+echo "PR_Number,Title,Author,Created_At,Closed_At,URL" > "$OUTPUT"
+
+PAGE=1
+
+while true; do
+    RESPONSE=$(curl -s \
+        -H "Accept: application/vnd.github+json" \
+        -H "Authorization: Bearer $TOKEN" \
+        "https://api.github.com/repos/$OWNER/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=$PAGE")
+
+    COUNT=$(echo "$RESPONSE" | jq length)
+
+    if [ "$COUNT" -eq 0 ]; then
+        break
+    fi
+
+    echo "$RESPONSE" | jq -r \
+        --arg since "$SINCE" '
+        .[]
+        | select(.closed_at >= $since)
+        | select(.title | ascii_downcase | contains("namespace"))
+        | [
+            .number,
+            .title,
+            .user.login,
+            .created_at,
+            .closed_at,
+            .html_url
+          ]
+        | @csv
+        ' >> "$OUTPUT"
+
+    PAGE=$((PAGE + 1))
+done
+
+echo "CSV generated: $OUTPUT"
