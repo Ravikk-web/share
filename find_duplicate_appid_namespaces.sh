@@ -7,6 +7,7 @@
 #           same app-id prefix) for each cluster, then save the result to a CSV.
 #
 #           Run this from inside the repo (same as the example script).
+#           NOTE: All clusters are scanned in a SINGLE pass over the repo.
 #
 # Example : Repo contains the namespaces
 #             app123445679-namespace1
@@ -20,6 +21,7 @@
 #   - Namespace name  = the folder name (dirname of values.yaml)
 #   - Cluster mapping = read from that namespace's clusters.yaml (.clusters[].name)
 #   - App ID          = extracted from the namespace name via APP_ID_REGEX
+#   - Buckets keyed by "cluster|appid" so every cluster is handled together.
 #
 # Requires: bash 4+, yq (same dependency your example uses)
 # ------------------------------------------------------------------------------
@@ -28,7 +30,6 @@ set -uo pipefail
 
 # ============================== CONFIG ========================================
 # 1) Root folder that holds the per-namespace directories.
-#    Your example used ../namespaces/  -> keep or change as needed.
 NAMESPACES_ROOT="../namespaces"
 
 # 2) List of clusters to consider. A namespace is only counted for a cluster
@@ -45,7 +46,6 @@ APP_ID_REGEX='^(app[0-9]+)-'
 MIN_COUNT=2
 
 # 5) Namespaces to EXCLUDE from the scan entirely (exact folder-name match).
-#    Add any system / shared namespaces you don't want counted.
 EXCLUDE_NAMESPACES=(
     "default"
     "openshift"
@@ -68,71 +68,72 @@ is_excluded() {
     return 1
 }
 
+# --- helper: is $1 present in the CLUSTERS list? ------------------------------
+is_wanted_cluster() {
+    local c="$1" w
+    for w in "${CLUSTERS[@]}"; do
+        [[ "$c" == "$w" ]] && return 0
+    done
+    return 1
+}
+
 # Write CSV header
 echo '"Cluster","App ID","Namespace Count","Namespaces"' > "$OUTPUT_FILE"
 
-# Process one cluster at a time so duplicates are reported per cluster
-for cluster in "${CLUSTERS[@]}"; do
-    echo "----------------------------------------------------------------------"
-    echo "Processing cluster: $cluster"
+# Single-pass buckets, keyed by "cluster|appid":
+#   appid_count -> how many namespaces share each cluster|appid
+#   appid_list  -> the namespace names (';' separated) for each cluster|appid
+declare -A appid_count=()
+declare -A appid_list=()
 
-    # Reset per-cluster buckets
-    #   appid_count -> how many namespaces share each app-id
-    #   appid_list  -> the namespace names (';' separated) for each app-id
-    declare -A appid_count=()
-    declare -A appid_list=()
+echo "Scanning all clusters in a single pass..."
 
-    # Loop through every namespace defined in the repo
-    while read -r file; do
-        dir="$(dirname "$file")"
-        ns="$(basename "$dir")"            # namespace name = folder name
-        cluster_file="$dir/clusters.yaml"
+# ---- ONE loop over the whole repo; all clusters handled together -------------
+while read -r file; do
+    dir="$(dirname "$file")"
+    ns="$(basename "$dir")"                 # namespace name = folder name
+    cluster_file="$dir/clusters.yaml"
 
-        # Skip excluded namespaces
-        if is_excluded "$ns"; then
-            continue
-        fi
+    # Skip excluded namespaces
+    is_excluded "$ns" && continue
 
-        # Only count this namespace if it targets the current cluster
-        if [[ -f "$cluster_file" ]]; then
-            if ! yq e '.clusters[].name' "$cluster_file" 2>/dev/null \
-                 | grep -qxF "$cluster"; then
-                continue
-            fi
+    # Namespace must match the app-id pattern
+    [[ "$ns" =~ $APP_ID_REGEX ]] || continue
+    appid="${BASH_REMATCH[1]}"
+
+    # A namespace can belong to several clusters; count it under each wanted one
+    [[ -f "$cluster_file" ]] || continue
+    while read -r cl; do
+        [[ -z "$cl" ]] && continue
+        is_wanted_cluster "$cl" || continue
+
+        key="${cl}|${appid}"
+        appid_count["$key"]=$(( ${appid_count["$key"]:-0} + 1 ))
+
+        if [[ -z "${appid_list["$key"]:-}" ]]; then
+            appid_list["$key"]="$ns"
         else
-            # No clusters.yaml -> cannot confirm cluster membership, skip
-            continue
+            appid_list["$key"]="${appid_list["$key"]};$ns"
         fi
+    done < <(yq e '.clusters[].name' "$cluster_file" 2>/dev/null)
 
-        # Extract the app-id from the namespace name
-        if [[ "$ns" =~ $APP_ID_REGEX ]]; then
-            appid="${BASH_REMATCH[1]}"
+done < <(find "$NAMESPACES_ROOT" -type f -name "values.yaml")
 
-            appid_count["$appid"]=$(( ${appid_count["$appid"]:-0} + 1 ))
-
-            if [[ -z "${appid_list["$appid"]:-}" ]]; then
-                appid_list["$appid"]="$ns"
-            else
-                appid_list["$appid"]="${appid_list["$appid"]};$ns"
-            fi
-        fi
-    done < <(find "$NAMESPACES_ROOT" -type f -name "values.yaml")
-
-    # Write only the app-ids that own >= MIN_COUNT namespaces
-    dup_found=0
-    for appid in "${!appid_count[@]}"; do
-        count=${appid_count["$appid"]}
-        if (( count >= MIN_COUNT )); then
-            echo "\"$cluster\",\"$appid\",\"$count\",\"${appid_list["$appid"]}\"" >> "$OUTPUT_FILE"
-            echo "  DUPLICATE: $appid -> $count namespaces"
-            dup_found=1
-        fi
-    done
-    [[ "$dup_found" -eq 0 ]] && echo "  No duplicate app-ids found."
-
-    # Clean up before next cluster
-    unset appid_count appid_list
+# ---- Emit results: only cluster|appid buckets with >= MIN_COUNT --------------
+dup_total=0
+for key in "${!appid_count[@]}"; do
+    count=${appid_count["$key"]}
+    if (( count >= MIN_COUNT )); then
+        cluster="${key%%|*}"        # part before '|'
+        appid="${key##*|}"          # part after  '|'
+        echo "\"$cluster\",\"$appid\",\"$count\",\"${appid_list["$key"]}\"" >> "$OUTPUT_FILE"
+        echo "  DUPLICATE: [$cluster] $appid -> $count namespaces"
+        dup_total=$(( dup_total + 1 ))
+    fi
 done
 
 echo "----------------------------------------------------------------------"
-echo "Done. Output saved to: $OUTPUT_FILE"
+if (( dup_total == 0 )); then
+    echo "No duplicate app-ids found across the configured clusters."
+fi
+echo "Done. $dup_total duplicate app-id group(s) written to: $OUTPUT_FILE"
