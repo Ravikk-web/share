@@ -1,51 +1,80 @@
-#!/bin/bash
-#
+#!/usr/bin/env bash
+###############################################################################
 # find_duplicate_appid_namespaces.sh
-# ------------------------------------------------------------------------------
-# Purpose : Scan the namespace folders in THIS repository and identify "App IDs"
-#           that own MORE THAN ONE namespace (i.e. multiple namespaces share the
-#           same app-id prefix) for each cluster, then save the result to a CSV.
 #
-#           Run this from inside the repo (same as the example script).
-#           NOTE: All clusters are scanned in a SINGLE pass over the repo.
+# PURPOSE
+#   Scan every namespace definition in this repository, resolve each namespace
+#   name, derive its "App ID", and report every App ID that is associated with
+#   MORE THAN ONE namespace. Results are written to a CSV file.
 #
-# Example : Repo contains the namespaces
-#             app123445679-namespace1
-#             app123445679-namespace2
-#             appr214215122-namespace3
-#           => "app123445679" has 2 namespaces  -> reported
-#           => "appr214215122" has 1 namespace  -> NOT reported (single)
+#   Example:
+#     app123445679-namespace1
+#     app123445679-namespace2   -> App ID "app123445679" has 2 namespaces  (REPORTED)
+#     appr214215122-namespace3  -> single namespace                        (SKIPPED)
 #
-# How it works (mirrors your example):
-#   - Finds every namespaces/<name>/values.yaml
-#   - Namespace name  = the folder name (dirname of values.yaml)
-#   - Cluster mapping = read from that namespace's clusters.yaml (.clusters[].name)
-#   - App ID          = extracted from the namespace name via APP_ID_REGEX
-#   - Buckets keyed by "cluster|appid" so every cluster is handled together.
+# HOW IT MIRRORS THE REFERENCE SCRIPT
+#   - Discovers namespaces the same way: find <root> -name "values.yaml".
+#   - Resolves the namespace NAME from values.yaml via yq (NOT the folder name),
+#     which is what the reference does on its (obscured) name= line.
+#   - Uses the same yq (mikefarah v4) 'eval' syntax.
 #
-# Requires: bash 4+, yq (same dependency your example uses)
-# ------------------------------------------------------------------------------
+# APP ID CAN BE DERIVED TWO WAYS (see APP_ID_SOURCE below):
+#   1) "name_regex"  -> parse the prefix out of the namespace name (default).
+#   2) "annotation"  -> read an explicit annotation (e.g. .../application-id),
+#                       which the reference had commented out.
+#
+# USAGE
+#   ./find_duplicate_appid_namespaces.sh                 # normal run
+#   DEBUG=1 ./find_duplicate_appid_namespaces.sh         # verbose per-namespace log
+#
+# REQUIREMENTS
+#   - bash 4+          (associative arrays)
+#   - yq  (mikefarah)  v4+   ->  https://github.com/mikefarah/yq
+#   - find, sort       (coreutils / findutils)
+#
+# EXIT CODES
+#   0  success (ran cleanly; duplicates may or may not exist)
+#   1  usage / dependency / environment error
+###############################################################################
 
-set -uo pipefail
+set -o errexit      # exit on any unhandled command failure
+set -o nounset      # error on use of unset variables
+set -o pipefail     # a pipeline fails if ANY stage fails
 
-# ============================== CONFIG ========================================
-# 1) Root folder that holds the per-namespace directories.
-NAMESPACES_ROOT="../namespaces"
+###############################################################################
+# CONFIGURATION
+###############################################################################
 
-# 2) List of clusters to consider. A namespace is only counted for a cluster
-#    if that cluster appears in the namespace's clusters.yaml (.clusters[].name).
-CLUSTERS=("cluster-prod" "cluster-test" "cluster-dev")
+# Root folder that contains the per-namespace directories.
+# Override at runtime:  NAMESPACES_ROOT=./namespaces ./find_duplicate_appid_namespaces.sh
+NAMESPACES_ROOT="${NAMESPACES_ROOT:-../namespaces}"
 
-# 3) Regex used to extract the App ID from a namespace name.
-#    FIRST capture group ( ... ) = the App ID.
-#    Default: "app" followed by digits, up to the first dash.
-#      app123445679-namespace1 -> app123445679
-APP_ID_REGEX='^(app[0-9]+)-'
+# yq path to the namespace NAME inside each values.yaml.
+# The reference resolves the name from the YAML (not the folder). Adjust if your
+# schema differs (common alternatives: '.namespace', '.metadata.name').
+NAME_YAML_PATH="${NAME_YAML_PATH:-.project.metadata.name}"
 
-# 4) An App ID must own at least this many namespaces (per cluster) to be reported.
-MIN_COUNT=2
+# If the yq name lookup returns nothing/null, fall back to the folder name?
+#   true  -> use the directory name when the YAML has no name
+#   false -> skip the namespace and log a warning
+FALLBACK_TO_FOLDER_NAME="${FALLBACK_TO_FOLDER_NAME:-true}"
 
-# 5) Namespaces to EXCLUDE from the scan entirely (exact folder-name match).
+# How to derive the App ID:  "name_regex"  or  "annotation"
+APP_ID_SOURCE="${APP_ID_SOURCE:-name_regex}"
+
+# [name_regex mode] Regex applied to the namespace name.
+#   The FIRST capture group ( ... ) is taken as the App ID.
+#   Default: "app" + digits, up to the first dash.  app123445679-ns1 -> app123445679
+APP_ID_REGEX="${APP_ID_REGEX:-^(app[0-9]+)-}"
+
+# [annotation mode] yq path to the App ID annotation inside values.yaml.
+# NOTE: keys containing '/' MUST use bracket/quote form in yq v4.
+APP_ID_YAML_PATH="${APP_ID_YAML_PATH:-.project.annotations[\"hcsc/application-id\"]}"
+
+# Minimum namespaces an App ID must own to be reported.
+MIN_COUNT="${MIN_COUNT:-2}"
+
+# Namespaces to EXCLUDE (exact match against the resolved namespace name).
 EXCLUDE_NAMESPACES=(
     "default"
     "openshift"
@@ -55,11 +84,24 @@ EXCLUDE_NAMESPACES=(
     "kube-node-lease"
 )
 
-# 6) Output file
-OUTPUT_FILE="duplicate_appid_namespaces.csv"
-# ==============================================================================
+# Output CSV file.
+OUTPUT_FILE="${OUTPUT_FILE:-duplicate_appid_namespaces.csv}"
 
-# --- helper: is $1 present in the EXCLUDE_NAMESPACES list? ---------------------
+###############################################################################
+# INTERNAL HELPERS
+###############################################################################
+
+log()   { printf '%s\n'  "$*" >&2; }
+debug() { [[ "${DEBUG:-0}" == "1" ]] && printf '  [debug] %s\n' "$*" >&2 || true; }
+die()   { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# CSV-safe: wrap a value in double quotes and escape embedded quotes (RFC 4180).
+csv_wrap() {
+    local val="${1:-}"
+    printf '"%s"' "${val//\"/\"\"}"
+}
+
+# True (0) if the given namespace name is in the exclude list.
 is_excluded() {
     local ns="$1" ex
     for ex in "${EXCLUDE_NAMESPACES[@]}"; do
@@ -68,72 +110,123 @@ is_excluded() {
     return 1
 }
 
-# --- helper: is $1 present in the CLUSTERS list? ------------------------------
-is_wanted_cluster() {
-    local c="$1" w
-    for w in "${CLUSTERS[@]}"; do
-        [[ "$c" == "$w" ]] && return 0
-    done
-    return 1
-}
+###############################################################################
+# PRE-FLIGHT VALIDATION
+###############################################################################
 
-# Write CSV header
-echo '"Cluster","App ID","Namespace Count","Namespaces"' > "$OUTPUT_FILE"
+command -v yq   >/dev/null 2>&1 || die "'yq' (mikefarah v4+) is not installed or not on PATH."
+command -v find >/dev/null 2>&1 || die "'find' is not available."
 
-# Single-pass buckets, keyed by "cluster|appid":
-#   appid_count -> how many namespaces share each cluster|appid
-#   appid_list  -> the namespace names (';' separated) for each cluster|appid
-declare -A appid_count=()
-declare -A appid_list=()
+[[ -d "$NAMESPACES_ROOT" ]] || die "NAMESPACES_ROOT does not exist or is not a directory: '$NAMESPACES_ROOT'"
 
-echo "Scanning all clusters in a single pass..."
+case "$APP_ID_SOURCE" in
+    name_regex|annotation) : ;;
+    *) die "APP_ID_SOURCE must be 'name_regex' or 'annotation' (got '$APP_ID_SOURCE')." ;;
+esac
 
-# ---- ONE loop over the whole repo; all clusters handled together -------------
-while read -r file; do
+[[ "$MIN_COUNT" =~ ^[0-9]+$ ]] || die "MIN_COUNT must be a positive integer (got '$MIN_COUNT')."
+
+###############################################################################
+# MAIN
+###############################################################################
+
+log "----------------------------------------------------------------------"
+log "Duplicate App-ID scan"
+log "  Root            : $NAMESPACES_ROOT"
+log "  Name source     : yq '$NAME_YAML_PATH' (fallback to folder: $FALLBACK_TO_FOLDER_NAME)"
+log "  App ID source   : $APP_ID_SOURCE"
+[[ "$APP_ID_SOURCE" == "name_regex" ]] && log "  App ID regex    : $APP_ID_REGEX"
+[[ "$APP_ID_SOURCE" == "annotation" ]] && log "  App ID yq path  : $APP_ID_YAML_PATH"
+log "  Min. count      : $MIN_COUNT"
+log "----------------------------------------------------------------------"
+
+# Buckets keyed by App ID.
+declare -A appid_count=()     # App ID -> number of namespaces
+declare -A appid_list=()      # App ID -> ';'-joined namespace names
+
+scanned=0     # namespaces successfully processed
+skipped=0     # namespaces skipped (no name / no app-id / excluded)
+
+# Process substitution (NOT a pipe) so the arrays persist in this shell.
+while IFS= read -r file; do
     dir="$(dirname "$file")"
-    ns="$(basename "$dir")"                 # namespace name = folder name
-    cluster_file="$dir/clusters.yaml"
 
-    # Skip excluded namespaces
-    is_excluded "$ns" && continue
-
-    # Namespace must match the app-id pattern
-    [[ "$ns" =~ $APP_ID_REGEX ]] || continue
-    appid="${BASH_REMATCH[1]}"
-
-    # A namespace can belong to several clusters; count it under each wanted one
-    [[ -f "$cluster_file" ]] || continue
-    while read -r cl; do
-        [[ -z "$cl" ]] && continue
-        is_wanted_cluster "$cl" || continue
-
-        key="${cl}|${appid}"
-        appid_count["$key"]=$(( ${appid_count["$key"]:-0} + 1 ))
-
-        if [[ -z "${appid_list["$key"]:-}" ]]; then
-            appid_list["$key"]="$ns"
+    # ---- Resolve namespace NAME (from YAML, per the reference) --------------
+    ns="$(yq e "$NAME_YAML_PATH" "$file" 2>/dev/null || true)"
+    if [[ -z "$ns" || "$ns" == "null" ]]; then
+        if [[ "$FALLBACK_TO_FOLDER_NAME" == "true" ]]; then
+            ns="$(basename "$dir")"
+            debug "name not found in YAML, using folder name: $ns  ($file)"
         else
-            appid_list["$key"]="${appid_list["$key"]};$ns"
+            log "  WARN: no namespace name in '$file' — skipping."
+            skipped=$((skipped + 1))
+            continue
         fi
-    done < <(yq e '.clusters[].name' "$cluster_file" 2>/dev/null)
-
-done < <(find "$NAMESPACES_ROOT" -type f -name "values.yaml")
-
-# ---- Emit results: only cluster|appid buckets with >= MIN_COUNT --------------
-dup_total=0
-for key in "${!appid_count[@]}"; do
-    count=${appid_count["$key"]}
-    if (( count >= MIN_COUNT )); then
-        cluster="${key%%|*}"        # part before '|'
-        appid="${key##*|}"          # part after  '|'
-        echo "\"$cluster\",\"$appid\",\"$count\",\"${appid_list["$key"]}\"" >> "$OUTPUT_FILE"
-        echo "  DUPLICATE: [$cluster] $appid -> $count namespaces"
-        dup_total=$(( dup_total + 1 ))
     fi
-done
 
-echo "----------------------------------------------------------------------"
+    # ---- Exclusions ---------------------------------------------------------
+    if is_excluded "$ns"; then
+        debug "excluded: $ns"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    # ---- Derive the App ID --------------------------------------------------
+    appid=""
+    if [[ "$APP_ID_SOURCE" == "name_regex" ]]; then
+        if [[ "$ns" =~ $APP_ID_REGEX ]]; then
+            appid="${BASH_REMATCH[1]}"
+        fi
+    else # annotation
+        appid="$(yq e "$APP_ID_YAML_PATH" "$file" 2>/dev/null || true)"
+        [[ "$appid" == "null" ]] && appid=""
+    fi
+
+    if [[ -z "$appid" ]]; then
+        debug "no app-id for namespace: $ns"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    # ---- Bucket the namespace under its App ID ------------------------------
+    appid_count["$appid"]=$(( ${appid_count["$appid"]:-0} + 1 ))
+    if [[ -z "${appid_list["$appid"]:-}" ]]; then
+        appid_list["$appid"]="$ns"
+    else
+        appid_list["$appid"]="${appid_list["$appid"]};$ns"
+    fi
+    scanned=$((scanned + 1))
+    debug "namespace '$ns' -> app-id '$appid'"
+
+done < <(find "$NAMESPACES_ROOT" -type f -name "values.yaml" | sort)
+
+# ---- Write CSV (only App IDs owning >= MIN_COUNT namespaces) ----------------
+: > "$OUTPUT_FILE"                                   # truncate/create
+echo '"App ID","Namespace Count","Namespaces"' >> "$OUTPUT_FILE"
+
+dup_total=0
+# Sort the App IDs for stable, readable output.
+while IFS= read -r appid; do
+    count=${appid_count["$appid"]}
+    (( count >= MIN_COUNT )) || continue
+    printf '%s,%s,%s\n' \
+        "$(csv_wrap "$appid")" \
+        "$(csv_wrap "$count")" \
+        "$(csv_wrap "${appid_list["$appid"]}")" >> "$OUTPUT_FILE"
+    log "  DUPLICATE: $appid -> $count namespaces"
+    dup_total=$((dup_total + 1))
+done < <(printf '%s\n' "${!appid_count[@]}" | sort)
+
+# ---- Summary ----------------------------------------------------------------
+log "----------------------------------------------------------------------"
+log "Namespaces processed : $scanned"
+log "Namespaces skipped   : $skipped"
 if (( dup_total == 0 )); then
-    echo "No duplicate app-ids found across the configured clusters."
+    log "Result               : no duplicate app-ids found."
+else
+    log "Result               : $dup_total duplicate app-id group(s)."
 fi
-echo "Done. $dup_total duplicate app-id group(s) written to: $OUTPUT_FILE"
+log "Output               : $OUTPUT_FILE"
+log "----------------------------------------------------------------------"
+
+exit 0
