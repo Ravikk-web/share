@@ -6,8 +6,9 @@
   let page = 1, rows = [["PR","Title","Author","Created","Closed","URL"]];
 
   while (true) {
-    const r = await fetch(`/repos/${owner}/${repo}/pulls?state=closed&per_page=100&page=${page}`,
-      { headers: { "Accept": "application/vnd.github+json" }});
+    const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls?state=closed&per_page=100&page=${page}`,
+      { headers: { "Accept": "application/vnd.github+json" }, credentials: "include" });
+    if (!r.ok) { console.error("HTTP", r.status, await r.text()); break; }
     const data = await r.json();
     if (!Array.isArray(data) || data.length === 0) break;
     for (const pr of data) {
@@ -20,6 +21,7 @@
     page++;
   }
 
+  console.log("Matched rows:", rows.length - 1);
   const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
   const blob = new Blob([csv], {type:"text/csv"});
   const a = document.createElement("a");
