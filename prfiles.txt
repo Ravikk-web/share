@@ -1,146 +1,29 @@
-#!/usr/bin/env bash
-###############################################################################
-# ns_list.sh
-#
-# Fetches CLOSED pull requests from a GitHub repository that were closed on or
-# after a given date, filters them by title, and writes the result to a CSV
-# file that opens cleanly in Excel.
-#
-# Works with:
-#   - GitHub.com  -> API_BASE="https://api.github.com"
-#   - GitHub Enterprise -> API_BASE="https://<your-host>/api/v3"
-#
-# Requirements: bash, curl, jq
-###############################################################################
+(async () => {
+  const owner = "hcsc-paasengineering";
+  const repo  = "openshift-platform-onboarding";
+  const since = "2026-08-01";
+  const filter = "namespace creation request";
+  let page = 1, rows = [["PR","Title","Author","Created","Closed","URL"]];
 
-set -euo pipefail
+  while (true) {
+    const r = await fetch(`/repos/${owner}/${repo}/pulls?state=closed&per_page=100&page=${page}`,
+      { headers: { "Accept": "application/vnd.github+json" }});
+    const data = await r.json();
+    if (!Array.isArray(data) || data.length === 0) break;
+    for (const pr of data) {
+      if (pr.closed_at && pr.closed_at.slice(0,10) >= since &&
+          pr.title.toLowerCase().includes(filter.toLowerCase())) {
+        rows.push([pr.number, pr.title, pr.user.login, pr.created_at, pr.closed_at, pr.html_url]);
+      }
+    }
+    if (data.length < 100) break;
+    page++;
+  }
 
-# ----------------------------------------------------------------------------#
-# 1. CONFIGURATION  (edit these)                                              #
-# ----------------------------------------------------------------------------#
-OWNER="hcsc-paasengineering"
-REPO="openshift-platform-onboarding"
-
-# Personal Access Token. Prefer an environment variable over hardcoding:
-#   export GH_TOKEN="ghp_xxx"   then leave TOKEN="${GH_TOKEN}"
-TOKEN="${GH_TOKEN:-PUT_YOUR_TOKEN_HERE}"
-
-# GitHub.com API base. For Enterprise use: https://<host>/api/v3
-API_BASE="https://api.github.com"
-
-# Only include PRs closed on/after this date (YYYY-MM-DD)
-SINCE="2026-08-01"
-
-# Title filter. Set MATCH_MODE to "contains" or "startswith".
-TITLE_FILTER="namespace creation request"
-MATCH_MODE="contains"          # contains | startswith
-
-# Output file
-OUTPUT="namespace_prs.csv"
-
-PER_PAGE=100
-# ----------------------------------------------------------------------------#
-
-# ----------------------------------------------------------------------------#
-# 2. PRE-FLIGHT CHECKS                                                        #
-# ----------------------------------------------------------------------------#
-die() { echo "ERROR: $*" >&2; exit 1; }
-
-command -v curl >/dev/null 2>&1 || die "'curl' is not installed."
-command -v jq   >/dev/null 2>&1 || die "'jq' is not installed. Install jq or use the Python version."
-
-[ -n "$TOKEN" ] && [ "$TOKEN" != "PUT_YOUR_TOKEN_HERE" ] || \
-    die "No token set. Export GH_TOKEN or edit TOKEN in the script."
-
-case "$MATCH_MODE" in
-    contains|startswith) ;;
-    *) die "MATCH_MODE must be 'contains' or 'startswith'." ;;
-esac
-
-# Lower-case filter once so matching is case-insensitive
-FILTER_LC="$(printf '%s' "$TITLE_FILTER" | tr '[:upper:]' '[:lower:]')"
-
-# ----------------------------------------------------------------------------#
-# 3. CSV HEADER                                                               #
-# ----------------------------------------------------------------------------#
-echo "PR_Number,Title,Author,Created_At,Closed_At,URL" > "$OUTPUT"
-
-# ----------------------------------------------------------------------------#
-# 4. FETCH LOOP (with pagination)                                            #
-# ----------------------------------------------------------------------------#
-PAGE=1
-TOTAL_MATCHED=0
-
-while true; do
-    URL="${API_BASE}/repos/${OWNER}/${REPO}/pulls?state=closed&sort=updated&direction=desc&per_page=${PER_PAGE}&page=${PAGE}"
-
-    # Capture body + HTTP status separately
-    HTTP_BODY="$(mktemp)"
-    HTTP_CODE="$(curl -s -w '%{http_code}' -o "$HTTP_BODY" \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer ${TOKEN}" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "$URL")"
-
-    RESPONSE="$(cat "$HTTP_BODY")"
-    rm -f "$HTTP_BODY"
-
-    # ---- Validate HTTP status ------------------------------------------------
-    if [ "$HTTP_CODE" != "200" ]; then
-        echo "GitHub API returned HTTP $HTTP_CODE for page $PAGE" >&2
-        echo "$RESPONSE" | jq -r '.message? // .' >&2 2>/dev/null || echo "$RESPONSE" >&2
-        die "Aborting. Check token, OWNER/REPO, or API_BASE."
-    fi
-
-    # ---- Validate JSON is an array ------------------------------------------
-    if ! echo "$RESPONSE" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        echo "Unexpected (non-array) response on page $PAGE:" >&2
-        echo "$RESPONSE" | head >&2
-        die "Aborting."
-    fi
-
-    COUNT="$(echo "$RESPONSE" | jq 'length')"
-
-    # No more results -> stop
-    if [ "$COUNT" -eq 0 ]; then
-        break
-    fi
-
-    # ---- Filter + append -----------------------------------------------------
-    MATCHED="$(echo "$RESPONSE" | jq -r \
-        --arg since "$SINCE" \
-        --arg filter "$FILTER_LC" \
-        --arg mode "$MATCH_MODE" '
-        .[]
-        | select(.closed_at != null and (.closed_at[0:10]) >= $since)
-        | select(
-            ($mode == "contains"   and ((.title | ascii_downcase) | contains($filter)))
-            or
-            ($mode == "startswith" and ((.title | ascii_downcase) | startswith($filter)))
-          )
-        | [ .number, .title, .user.login, .created_at, .closed_at, .html_url ]
-        | @csv
-    ')"
-
-    if [ -n "$MATCHED" ]; then
-        echo "$MATCHED" >> "$OUTPUT"
-        PAGE_MATCHES="$(printf '%s\n' "$MATCHED" | grep -c . || true)"
-        TOTAL_MATCHED=$((TOTAL_MATCHED + PAGE_MATCHES))
-    fi
-
-    echo "Page $PAGE processed (fetched $COUNT PRs, running matches: $TOTAL_MATCHED)"
-
-    # Last page reached when fewer than PER_PAGE returned
-    if [ "$COUNT" -lt "$PER_PAGE" ]; then
-        break
-    fi
-
-    PAGE=$((PAGE + 1))
-done
-
-# ----------------------------------------------------------------------------#
-# 5. DONE                                                                     #
-# ----------------------------------------------------------------------------#
-echo "-----------------------------------------------"
-echo "Done. Matched $TOTAL_MATCHED PR(s)."
-echo "CSV written to: $OUTPUT"
+  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], {type:"text/csv"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "namespace_prs.csv";
+  a.click();
+})();
