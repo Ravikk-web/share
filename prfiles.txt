@@ -1,29 +1,41 @@
 (async () => {
-  const owner = "hcsc-paasengineering";
-  const repo  = "openshift-platform-onboarding";
-  const since = "2026-08-01";
-  const filter = "namespace creation request";
-  let page = 1, rows = [["PR","Title","Author","Created","Closed","URL"]];
+  const base = "https://github.com/hcsc-paasengineering/openshift-platform-onboarding/pulls";
+  const query = 'is:pr is:closed closed:>=2026-08-01 in:title "Namespace creation request"';
+  let page = 1;
+  const rows = [["PR","Title","Author","URL"]];
 
   while (true) {
-    const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls?state=closed&per_page=100&page=${page}`,
-      { headers: { "Accept": "application/vnd.github+json" }, credentials: "include" });
-    if (!r.ok) { console.error("HTTP", r.status, await r.text()); break; }
-    const data = await r.json();
-    if (!Array.isArray(data) || data.length === 0) break;
-    for (const pr of data) {
-      if (pr.closed_at && pr.closed_at.slice(0,10) >= since &&
-          pr.title.toLowerCase().includes(filter.toLowerCase())) {
-        rows.push([pr.number, pr.title, pr.user.login, pr.created_at, pr.closed_at, pr.html_url]);
-      }
-    }
-    if (data.length < 100) break;
+    const url = `${base}?q=${encodeURIComponent(query)}&page=${page}`;
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) { console.error("HTTP", res.status); break; }
+    const html = await res.text();
+    const doc = new DOMParser().parseFromString(html, "text/html");
+
+    // Each PR row in the list
+    const items = doc.querySelectorAll('div[id^="issue_"]');
+    if (items.length === 0) break;
+
+    items.forEach(item => {
+      const link = item.querySelector('a[data-hovercard-type="pull_request"]');
+      if (!link) return;
+      const number = (item.id.match(/\d+/) || [""])[0];
+      const title = link.textContent.trim();
+      const author = (item.querySelector('a.author') || {}).textContent?.trim() || "";
+      const href = "https://github.com" + link.getAttribute("href");
+      rows.push([number, title, author, href]);
+    });
+
+    // Stop if no "Next" pagination link
+    if (!doc.querySelector('a.next_page, a[rel="next"]')) break;
     page++;
+    if (page > 50) break; // safety cap
   }
 
-  console.log("Matched rows:", rows.length - 1);
+  console.log("Matched PRs:", rows.length - 1);
+  if (rows.length === 1) { console.warn("No rows found — check the query or that you're logged in."); return; }
+
   const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
-  const blob = new Blob([csv], {type:"text/csv"});
+  const blob = new Blob([csv], { type: "text/csv" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "namespace_prs.csv";
