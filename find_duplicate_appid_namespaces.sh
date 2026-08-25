@@ -229,26 +229,34 @@ done < <(find "$NAMESPACES_ROOT" -type f -name "values.yaml" | sort)
 ###############################################################################
 
 dup_total=0
-# Sort keys for stable, grouped output (cluster then app id).
-while IFS= read -r key; do
-    count=${appid_count["$key"]}
-    (( count >= MIN_COUNT )) || continue
+# Only iterate if we actually collected at least one bucket. Expanding the keys
+# of an EMPTY associative array would emit a blank line and trigger a
+# "bad array subscript" error on the empty key below — so guard against it.
+if (( ${#appid_count[@]} > 0 )); then
+    # Sort keys for stable, grouped output (cluster then app id).
+    while IFS= read -r key; do
+        # Defensive: skip any empty key (should not happen, but keeps us safe).
+        [[ -z "$key" ]] && continue
 
-    cluster="${key%%|*}"        # part before '|'
-    appid="${key##*|}"          # part after  '|'
+        count=${appid_count["$key"]:-0}
+        (( count >= MIN_COUNT )) || continue
 
-    # Explode: write one row for each namespace under this cluster|appid.
-    IFS=';' read -ra ns_arr <<< "${appid_list["$key"]}"
-    for one_ns in "${ns_arr[@]}"; do
-        printf '%s,%s,%s,%s\n' \
-            "$(csv_wrap "$cluster")" \
-            "$(csv_wrap "$appid")" \
-            "$(csv_wrap "$count")" \
-            "$(csv_wrap "$one_ns")" >> "$OUTPUT_FILE"
-    done
-    log "  DUPLICATE: [$cluster] $appid -> $count namespaces"
-    dup_total=$((dup_total + 1))
-done < <(printf '%s\n' "${!appid_count[@]}" | sort)
+        cluster="${key%%|*}"        # part before '|'
+        appid="${key##*|}"          # part after  '|'
+
+        # Explode: write one row for each namespace under this cluster|appid.
+        IFS=';' read -ra ns_arr <<< "${appid_list["$key"]}"
+        for one_ns in "${ns_arr[@]}"; do
+            printf '%s,%s,%s,%s\n' \
+                "$(csv_wrap "$cluster")" \
+                "$(csv_wrap "$appid")" \
+                "$(csv_wrap "$count")" \
+                "$(csv_wrap "$one_ns")" >> "$OUTPUT_FILE"
+        done
+        log "  DUPLICATE: [$cluster] $appid -> $count namespaces"
+        dup_total=$((dup_total + 1))
+    done < <(printf '%s\n' "${!appid_count[@]}" | sort)
+fi
 
 ###############################################################################
 # SUMMARY
