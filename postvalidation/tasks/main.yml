@@ -55,18 +55,49 @@
 
 - name: Extract ClusterVersion condition facts
   set_fact:
-    postval_cv_desired_version: "{{ postval_cv_data.status.desired.version | default(postval_cv_data.spec.desiredUpdate.version | default('unknown')) }}"
-    postval_cv_current_version: "{{ (postval_cv_data.status.history | default([{}]) | first).version | default('unknown') }}"
-    postval_cv_progressing: "{{ (postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first) | default('Unknown') }}"
-    postval_cv_available: "{{ (postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first) | default('Unknown') }}"
-    postval_cv_degraded: "{{ (postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | list | first) | default('False') }}"
-    postval_cv_failing: "{{ (postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Failing') | map(attribute='status') | list | first) | default('False') }}"
-    postval_cv_prog_message: "{{ (postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='message') | list | first) | default('None') }}"
+    postval_cv_desired_version: "{{ postval_cv_data.status.desired.version | default(postval_cv_data.spec.desiredUpdate.version | default('unknown')) | string | trim }}"
+    postval_cv_current_version: "{{ ((postval_cv_data.status.history | default([{}]) | first).version | default('unknown')) | string | trim }}"
+    postval_cv_progressing: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first) | default('Unknown')) | string | trim }}"
+    postval_cv_available: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first) | default('Unknown')) | string | trim }}"
+    postval_cv_degraded: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | list | first) | default('False')) | string | trim }}"
+    postval_cv_failing: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Failing') | map(attribute='status') | list | first) | default('False')) | string | trim }}"
+    postval_cv_prog_message: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='message') | list | first) | default('None')) | string | trim }}"
 
 - name: Evaluate ClusterVersion target version and conditions
   set_fact:
-    postval_cv_version_matches: "{{ (resolved_final_target_version == '') or (postval_cv_desired_version == resolved_final_target_version and postval_cv_current_version == resolved_final_target_version) }}"
-    postval_cv_settled: "{{ (postval_cv_progressing == 'False') and (postval_cv_available == 'True') and (postval_cv_degraded != 'True') and (postval_cv_failing != 'True') }}"
+    postval_cv_version_matches: >-
+      {{
+        (resolved_final_target_version | string | trim == '')
+        or
+        (
+          (postval_cv_desired_version | string | trim) == (resolved_final_target_version | string | trim)
+          and
+          (postval_cv_current_version | string | trim) == (resolved_final_target_version | string | trim)
+        )
+      }}
+    postval_cv_settled: >-
+      {{
+        (not (postval_cv_progressing | default('False') | string | trim | bool))
+        and
+        (postval_cv_available | default('Unknown') | string | trim | bool)
+        and
+        (not (postval_cv_degraded | default('False') | string | trim | bool))
+        and
+        (not (postval_cv_failing | default('False') | string | trim | bool))
+      }}
+
+- name: Debug ClusterVersion evaluation results
+  debug:
+    msg: >-
+      [Check 01 Evaluation] version_matches={{ postval_cv_version_matches }} (type={{ postval_cv_version_matches | type_debug }}),
+      settled={{ postval_cv_settled }} (type={{ postval_cv_settled | type_debug }}),
+      resolved_target='{{ resolved_final_target_version }}',
+      desired='{{ postval_cv_desired_version }}',
+      current='{{ postval_cv_current_version }}',
+      progressing={{ postval_cv_progressing }} (bool={{ postval_cv_progressing | string | trim | bool }}),
+      available={{ postval_cv_available }} (bool={{ postval_cv_available | string | trim | bool }}),
+      degraded={{ postval_cv_degraded }} (bool={{ postval_cv_degraded | string | trim | bool }}),
+      failing={{ postval_cv_failing }} (bool={{ postval_cv_failing | string | trim | bool }})
 
 - name: Enforce HARD gate on ClusterVersion target and condition
   fail:
@@ -80,7 +111,7 @@
       Degraded: {{ postval_cv_degraded }};
       Failing: {{ postval_cv_failing }}.
       Cluster has not completed upgrade to final target version or is still in a progressing/degraded state.
-  when: not (postval_cv_version_matches | bool) or not (postval_cv_settled | bool)
+  when: not (postval_cv_version_matches | string | trim | bool) or not (postval_cv_settled | string | trim | bool)
 
 - name: Record ClusterVersion PASS in health_summary
   set_fact:
