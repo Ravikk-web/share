@@ -200,9 +200,13 @@
   include_role:
     name: sendmail
   vars:
-    mail_subject: "{{ heartbeat_subject_prefix | default('[ARO Upgrade]') }} — Hop {{ hop_label | default('?/?') }} COMPLETE ✔ — {{ hop_target_version | default('') }} — {{ cluster_name | default('UNKNOWN') }}"
+    mail_subject: >-
+      {% if (hop_number | default('1') | int) == 1 %}
+      {{ heartbeat_subject_prefix | default('[ARO Upgrade]') }} — Upgrade phase 1 completed ✔ — {{ cluster_name | default('UNKNOWN') }}
+      {% else %}
+      {{ heartbeat_subject_prefix | default('[ARO Upgrade]') }} — Hop {{ hop_label | default('?/?') }} COMPLETE ✔ — {{ hop_target_version | default('') }} — {{ cluster_name | default('UNKNOWN') }}
+      {% endif %}
     mail_template: "progress-mail.j2"
-    mail_attach: "{{ [report_html_path] if (report_html_path | default('') | length > 0) else [] }}"
     current_hop: "{{ hop_number | default('1') }}"
     total_hops: "{{ hop_total | default('1') }}"
     target_version: "{{ hop_target_version | default('') }}"
@@ -214,11 +218,17 @@
     degraded_nodes: []
     degraded_operators: []
     cluster_version_status: "At {{ hop_target_version | default('target version') }} ✔"
-    status_pill_text: "HOP COMPLETE ✔"
+    status_pill_text: >-
+      {{ 'PHASE 1 COMPLETE ✔' if (hop_number | default('1') | int) == 1 else 'HOP COMPLETE ✔' }}
     status_pill_color: "#1a7f37"
     status_pill_bg: "#e6f4ea"
     status_pill_border: "#b7eb8f"
-    next_update_note: "Hop {{ hop_label | default('?/?') }} complete. {{ 'Next hop will begin shortly.' if (hop_number | default('1') | int) < (hop_total | default('1') | int) else 'All hops complete. Proceeding to postvalidation.' }}"
+    next_update_note: >-
+      {% if (hop_number | default('1') | int) == 1 %}
+      Upgrade phase 1 completed. Upgraded from {{ hop_settle_cv_version | default('previous version') }} to {{ hop_target_version }}. {{ 'Next hop will begin shortly.' if (hop_number | default('1') | int) < (hop_total | default('1') | int) else 'All hops complete. Proceeding to postvalidation.' }}
+      {% else %}
+      Hop {{ hop_label | default('?/?') }} complete. {{ 'Next hop will begin shortly.' if (hop_number | default('1') | int) < (hop_total | default('1') | int) else 'All hops complete. Proceeding to postvalidation.' }}
+      {% endif %}
     run_id: "{{ ansible_date_time.iso8601 | default('N/A') }}"
     timestamp: "{{ ansible_date_time.iso8601 | default('N/A') }}"
     log_path: "{{ log_dir | default('logs/') }}"
