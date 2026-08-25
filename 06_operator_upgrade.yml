@@ -1,0 +1,93 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: JSON quoting in oc patch might require slight adjustments under Python 3 if issues arise, though standard valid JSON strings should work across both.
+
+---
+- name: Phase 08 — Operator Compatibility, Upgrade & Validation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/upgrade.yml
+    - vars/paths.yml
+    - vars/secrets.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+
+  vars:
+    phase_name: "Phase 08 - Operator Upgrade"
+
+  pre_tasks:
+    - name: Check existing kubeconfig session
+      stat:
+        path: "{{ kubeconfig_path }}"
+      register: post_kubeconfig_stat
+
+    - name: Test cluster session reachability
+      command: oc whoami --show-server --kubeconfig "{{ kubeconfig_path }}"
+      register: post_whoami_test
+      changed_when: false
+      failed_when: false
+      when:
+        - not (dry_run | default(false) | bool)
+        - post_kubeconfig_stat.stat.exists | default(false)
+
+    - name: Resolve target cluster credentials if re-authentication needed
+      set_fact:
+        target_cluster_entry: "{{ (clusters | default([]) | selectattr('name', 'equalto', cluster_name) | list | first) | default({}) }}"
+      no_log: true
+      when:
+        - not (dry_run | default(false) | bool)
+        - not (post_kubeconfig_stat.stat.exists | default(false)) or (post_whoami_test.rc | default(1) != 0)
+
+    - name: Set login parameters for cluster {{ cluster_name | default('UNKNOWN') }}
+      set_fact:
+        login_api_url: "{{ target_cluster_entry.api_url | default(login_api_url | default('')) }}"
+        login_username: "{{ target_cluster_entry.username | default(login_username | default('')) }}"
+        login_password: "{{ target_cluster_entry.password | default(login_password | default('')) }}"
+      no_log: true
+      when:
+        - not (dry_run | default(false) | bool)
+        - not (post_kubeconfig_stat.stat.exists | default(false)) or (post_whoami_test.rc | default(1) != 0)
+
+    - name: Authenticate to cluster {{ cluster_name | default('UNKNOWN') }} (if not already logged in)
+      include_role:
+        name: login
+      when:
+        - not (dry_run | default(false) | bool)
+        - not (post_kubeconfig_stat.stat.exists | default(false)) or (post_whoami_test.rc | default(1) != 0)
+
+  tasks:
+    - block:
+        - name: Run Operator Compatibility Check
+          include_role:
+            name: operator_compat
+          
+        - name: Run Operator Upgrade
+          include_role:
+            name: operator_upgrade
+
+        - name: Run Operator Final Validation
+          include_role:
+            name: operator_validate
+
+        - name: Render Phase 08 Operator HTML Report
+          include_role:
+            name: report
+          vars:
+            report_phase: "operator_upgrade"
+            report_title: "Operator Upgrade Validation Report"
+
+      rescue:
+        - name: Handle Phase 08 Failure
+          include_role:
+            name: error_handle
+          vars:
+            failed_phase: "{{ phase_name }}"
+
+      always:
+        - name: Teardown session unconditionally
+          include_role:
+            name: logout
+          when: not dry_run | default(false) | bool
