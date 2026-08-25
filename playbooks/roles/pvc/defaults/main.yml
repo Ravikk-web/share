@@ -1,0 +1,20 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: No changes required — pure variable defaults.
+#                 | default('') guards are applied on all optional variables.
+#
+# pvc role defaults — validates Persistent Volume Claim (PVC) status across all namespaces (WARN gate).
+
+---
+# Kubeconfig path — defaults to the session kubeconfig established in Phase 01.
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+
+# Cluster name used in log messages and report entries.
+cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+
+# Prevalidation check metadata for health_summary reporting.
+pvc_id: "09"
+pvc_name: "Persistent Volume Claim (PVC) Status"
+pvc_gate: "WARN"
+
+# Optional list of PVC identifiers (e.g. "namespace/pvc-name") permitted to be non-Bound without triggering WARN.
+pvc_allow_list: []

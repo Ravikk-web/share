@@ -1,0 +1,35 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: No changes required — pure variable definitions.
+#                 | default('') guards are in place for Jinja2 strictness.
+#
+# Default variables for the sendmail role.
+# Provides fallback defaults for SMTP settings, recipients, subject, and template.
+# Callers can supply variables directly, via vars/smtp.yml, or as role params.
+
+---
+# --- SMTP server configuration -----------------------------------------------
+# Host and port for mail delivery. Sourced from vars/smtp.yml or overridden.
+smtp_host: "smtp.example.com"
+smtp_port: 25
+
+# --- Sender and recipient settings -------------------------------------------
+# mail_from: sender address for MIME From: header
+# mail_to: recipient address or list of addresses for MIME To: header
+mail_from: "aro-upgrade@example.com"
+mail_to: []
+
+# --- Email content defaults --------------------------------------------------
+# mail_subject: subject line for the email (heartbeat, alert, or report)
+# mail_template: template filename under playbooks/templates/ or absolute path
+# mail_html_body: pre-rendered HTML body (if not using mail_template)
+mail_subject: ""
+mail_template: ""
+mail_html_body: ""
+
+# --- Delivery configuration --------------------------------------------------
+# Optional attachments list or single file path
+mail_attach: []
+
+# MIME format parameters
+mail_subtype: "html"
+mail_charset: "UTF-8"

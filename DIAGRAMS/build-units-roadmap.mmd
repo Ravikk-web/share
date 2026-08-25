@@ -1,0 +1,40 @@
+graph TD
+    classDef default fill:#f8f9fb,stroke:#e4e7ec,stroke-width:2px;
+    classDef stage fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#101828;
+
+    subgraph Foundation ["1. Foundation & Init"]
+        U1["Unit 01: Scaffold & Vars"]:::stage
+        U2["Unit 02: CLI Entrypoint"]:::stage
+        U4["Unit 04: Email Templates"]:::stage
+        U5["Unit 05: Sendmail Role"]:::stage
+    end
+
+    subgraph Session ["2. Session & Error"]
+        U3["Unit 03: Login/Logout"]:::stage
+        U6["Unit 06: Error Handle"]:::stage
+        U7["Unit 07: Snapshot (Phase 01)"]:::stage
+    end
+
+    subgraph Checks ["3. Validation Roles"]
+        U8["Unit 08: API Readiness"]:::stage
+        U9["Unit 09: ClusterOperators"]:::stage
+        U10["Unit 10: MachineConfigPool"]:::stage
+        U11["Unit 11: Nodes"]:::stage
+        U12["Unit 12: etcd"]:::stage
+        U13["Unit 13: Utilization"]:::stage
+        U14["Unit 14: Storage/PDB"]:::stage
+    end
+
+    subgraph Gates ["4. Aggregation & Gates"]
+        U15["Unit 15: Report Rendering"]:::stage
+        U16["Unit 16: Prevalidation (Phase 02)"]:::stage
+        U19["Unit 19: Postval (Phase 05)"]:::stage
+    end
+
+    subgraph Execution ["5. Upgrade Execution"]
+        U17["Unit 17: Hop Trigger (Phase 03)"]:::stage
+        U18["Unit 18: Live Monitor (Phase 04)"]:::stage
+        U20["Unit 20: Operator Upgrade"]:::stage
+    end
+    
+    Foundation --> Session --> Checks --> Gates --> Execution

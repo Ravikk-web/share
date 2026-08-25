@@ -1,0 +1,32 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Defaults are forward-compatible; 2.7.17 is lenient but
+#                 explicit typed defaults and | default('') guards prevent
+#                 undefined-variable failures in 2.14's stricter Jinja2 parser.
+#
+# error_handle role — Standardises error handling across all upgrade phases.
+# Records structured failure facts, logs failure details to both .txt and .csv
+# run logs, and dispatches alert emails via the sendmail role with error-report.j2.
+#
+# Caller contract:
+#   - Invoked from `rescue:` blocks across phase playbooks.
+#   - Session teardown (`logout` role) MUST be placed in the caller's `always:` block.
+
+---
+# --- Step and task identifiers (supplied by caller) -------------------------
+current_step_no: 0
+current_task_name: ""
+current_gate_type: "HARD"
+
+# --- Failure details (supplied by caller or registered failure result) --------
+failure_reason: ""
+failure_observed: ""
+error_summary: "A critical check failed during phase execution. Automated session teardown (logout) was initiated to prevent invalid cluster state."
+failed_phase: ""
+
+# --- Execution metadata ------------------------------------------------------
+error_timestamp: ""
+
+# --- Log file path overrides (optional) --------------------------------------
+# If left empty, resolved dynamically in tasks/main.yml from log_dir/playbook_dir.
+log_file_txt: ""
+log_file_csv: ""

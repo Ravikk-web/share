@@ -1,0 +1,27 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names work on both versions.
+#                 | default('') guards are applied on all optional variables.
+#
+# Defaults for etcd role (etcd Member Health check)
+
+---
+# Kubeconfig path (derived from playbook_dir by default)
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+
+# Cluster name for reporting and error messages
+cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+
+# Prevalidation check metadata
+etcd_id: "06"
+etcd_name: "etcd Member Health"
+etcd_gate: "HARD"
+
+# etcd namespace and pod label selector
+etcd_namespace: "openshift-etcd"
+etcd_pod_selector: "app=etcd"
+
+# Minimum expected member count (standard HA control plane has 3 etcd members)
+etcd_min_members: 1
+
+# Allow-list for etcd members (permitted exceptions, default empty)
+etcd_allow_list: []

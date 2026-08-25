@@ -1,0 +1,31 @@
+graph TD
+    classDef default fill:#f8f9fb,stroke:#e4e7ec,stroke-width:2px;
+    classDef step fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#101828;
+    classDef decision fill:#fff8e1,stroke:#d97706,stroke-width:2px,color:#101828,shape:diamond;
+    classDef action fill:#e6f4ea,stroke:#16a34a,stroke-width:2px,color:#101828;
+    classDef fail fill:#fdecea,stroke:#dc2626,stroke-width:2px,color:#101828;
+
+    A([Start Monitor Loop]) --> B["Wait 2 Minutes"]:::step
+    B --> C["Poll CV / MCP / Nodes<br>oc get ... | jq"]:::step
+    
+    C --> D{"State Changed?"}:::decision
+    D -- Yes --> E["Send Change-Alert Email"]:::action
+    D -- No --> F{"20 Min Passed?"}:::decision
+    
+    E --> F
+    
+    F -- Yes --> G["Send Heartbeat Email"]:::action
+    F -- No --> H{"Is MCP Complete?"}:::decision
+    G --> H
+    
+    H -- Yes --> I["Evaluate Settle Gate"]:::step
+    
+    H -- No --> J{"90-Min Timeout<br>Reached?"}:::decision
+    J -- No --> B
+    
+    J -- Yes --> K["Fail: MCP Stalled"]:::fail
+    K --> L["Send Alert & Logout"]:::fail
+    
+    I --> M{"Settle Gate<br>Passed?"}:::decision
+    M -- Yes --> N(["Hop Complete"]):::action
+    M -- No --> K

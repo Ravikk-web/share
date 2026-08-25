@@ -1,0 +1,33 @@
+graph TD
+    classDef default fill:#f8f9fb,stroke:#e4e7ec,stroke-width:2px;
+    classDef blue fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#101828;
+    classDef output fill:#f2f4f7,stroke:#344054,stroke-width:2px,color:#101828;
+
+    subgraph RHEL_Jump_Server ["RHEL 8 Jump Server"]
+        A[CLI Entrypoint<br>00_Run.sh]:::blue
+        B[Ansible Engine<br>2.7.17 / 2.14.18]:::blue
+        C[Dependencies<br>oc, jq, sendmail]:::blue
+        
+        A -->|invokes main.yml| B
+        B -->|executes commands| C
+    end
+
+    subgraph Storage ["Storage Model (Outputs)"]
+        D[output/<br>HTML Reports]:::output
+        E[logs/<br>.txt & .csv]:::output
+        F[snapshots/<br>Baseline JSON]:::output
+    end
+
+    subgraph External ["External Services"]
+        G[ARO Cluster]:::blue
+        H[Conjur Vault<br>Secrets]:::blue
+        I[SMTP Server<br>Emails]:::blue
+    end
+
+    C -- "Live Queries & Upgrades<br>(oc/jq)" --> G
+    B -- "Reads Credentials" --> H
+    C -- "Sends Alerts & Reports" --> I
+    
+    B -.-> D
+    B -.-> E
+    B -.-> F

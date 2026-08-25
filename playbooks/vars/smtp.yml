@@ -1,0 +1,22 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: No changes required — pure variable definitions.
+#
+# SMTP configuration for heartbeat, change-alert, and report emails.
+# All email-sending tasks use sendmail (active) with a commented
+# community.general.mail block for 2.14 migration.
+
+---
+# --- SMTP server settings ---------------------------------------------------
+smtp_host: "smtp.example.com"
+smtp_port: 25
+
+# --- Sender and recipients ---------------------------------------------------
+mail_from: "aro-upgrade@example.com"
+mail_to:
+  - "platform-team@example.com"
+  - "cloud-ops@example.com"
+
+# --- Subject prefixes --------------------------------------------------------
+# These are prepended to the dynamic subject line (cluster, hop, status).
+heartbeat_subject_prefix: "[ARO Upgrade] Heartbeat"
+alert_subject_prefix: "[ARO Upgrade] ALERT"

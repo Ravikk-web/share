@@ -1,0 +1,25 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: No changes required — pure variable defaults.
+#                 | default('') guards are applied on all optional variables.
+#
+# pdb role defaults — validates PodDisruptionBudget (PDB) configurations for blocking-drain risk.
+
+---
+# Kubeconfig path — defaults to the session kubeconfig established in Phase 01.
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+
+# Cluster name used in log messages and report entries.
+cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+
+# Prevalidation check metadata for health_summary reporting.
+pdb_id: "10"
+pdb_name: "Pod Disruption Budget (PDB) Risk"
+
+# Escalation toggle: if true, zero-disruption PDBs escalate to HARD gate fail; if false, WARN only.
+fail_on_zero_disruption_pdb: false
+
+# Gate type dynamically reflects whether escalation is enabled.
+pdb_gate: "{{ 'HARD' if (fail_on_zero_disruption_pdb | default(false)) else 'WARN' }}"
+
+# Optional list of PDB identifiers (e.g. "namespace/pdb-name" or "pdb-name") permitted to have 0 disruptions.
+pdb_allow_list: []

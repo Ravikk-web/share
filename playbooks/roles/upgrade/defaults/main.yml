@@ -1,0 +1,38 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: No changes required — pure variable definitions.
+#
+# upgrade role defaults — per-hop upgrade trigger.
+#
+# This role executes the core upgrade sequence for a single hop:
+#   1. Set the update channel to stable-<major>.<minor> for the target version
+#   2. Re-verify the target version is a live available/conditional edge
+#   3. Apply required admin-ack ConfigMap if the target requires it
+#   4. Trigger the upgrade: oc adm upgrade --to=<version>
+#
+# The only cluster write is `oc adm upgrade --to`. The `--to-image ... --force`
+# path exists only as a hard-gated manual last resort, never automatic.
+#
+# Required variables (supplied by caller — hop.yml via loop_var):
+#   - hop_target_version    — the version to upgrade to in this hop
+#   - cluster_name          — target cluster identifier
+#   - kubeconfig_path       — path to the active kubeconfig
+#
+# Optional variables:
+#   - force_upgrade         — manual last-resort flag (default: false, hard-gated)
+#   - force_upgrade_image   — digest for --to-image (default: '', requires force_upgrade)
+
+---
+# --- Target hop version (supplied by caller) ----------------------------------
+hop_target_version: ""
+
+# --- Cluster identifier (supplied by caller or vars_files) --------------------
+# cluster_name: "" — inherited from vars/upgrade.yml
+
+# --- Kubeconfig path (inherited from vars/paths.yml) --------------------------
+# kubeconfig_path: "" — inherited from vars/paths.yml
+
+# --- Last-resort force upgrade (NEVER automatic) -----------------------------
+# Setting force_upgrade: true requires explicit manual opt-in.
+# A fail: guard blocks execution unless the operator deliberately sets this.
+force_upgrade: false
+force_upgrade_image: ""

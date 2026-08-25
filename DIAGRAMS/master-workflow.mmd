@@ -1,0 +1,34 @@
+graph TD
+    classDef default fill:#f8f9fb,stroke:#e4e7ec,stroke-width:2px;
+    classDef step fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#101828;
+    classDef decision fill:#fff8e1,stroke:#d97706,stroke-width:2px,color:#101828,shape:diamond;
+    classDef pass fill:#e6f4ea,stroke:#16a34a,stroke-width:2px,color:#101828;
+    classDef fail fill:#fdecea,stroke:#dc2626,stroke-width:2px,color:#101828;
+    
+    A([Start]) --> B[Phase 01: Login & Snapshot]:::step
+    B --> C[Load Secrets]:::step
+    C --> D[Phase 02: Prevalidation]:::step
+    
+    D --> E{HARD Gate<br>Passed?}:::decision
+    E -- Yes --> F[Phase 03: Hop Loop]:::step
+    
+    E -- No --> X[Send Alert Email]:::fail
+    X --> Y[Logout]:::fail
+    Y --> Z([Stop])
+    
+    F --> G{More Hops?}:::decision
+    G -- Yes --> H[Execute Upgrade Hop]:::step
+    H --> I[Phase 04: Monitor & Settle]:::step
+    I --> J{Settle Gate<br>Passed?}:::decision
+    
+    J -- Yes --> F
+    J -- No --> X
+    
+    G -- No --> K[Phase 05: Postvalidation & Diff]:::step
+    
+    K --> L{HARD Gate<br>Passed?}:::decision
+    L -- Yes --> M[Unit 20: Operator Upgrade]:::step
+    L -- No --> X
+    
+    M --> N[Logout]:::pass
+    N --> O([Success])

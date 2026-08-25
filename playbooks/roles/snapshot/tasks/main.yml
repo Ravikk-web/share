@@ -1,0 +1,188 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (file, set_fact, command, copy, debug, fail)
+#                 work on both versions.
+#                 # MIGRATION 2.14: Retest to_nice_json and from_json filters
+#                 under Python 3 during migration.
+#                 | default('') guards are applied on all optional variables.
+#
+# Snapshot role — captures cluster baseline state and writes
+# snapshots/<cluster>_<timestamp>_baseline.json.
+#
+# Contract:
+#   - Baseline JSON is the single sanctioned cross-phase persistence.
+#   - Captures: clusterversion, clusteroperators, nodes, routes.
+#   - Read later only by Phase 05 for baseline diffing.
+#   - All reads are changed_when: false.
+#   - Paths derive from playbook_dir / snapshot_dir.
+
+---
+- name: Ensure snapshots directory exists
+  file:
+    path: "{{ snapshot_dir | default(playbook_dir ~ '/snapshots') }}"
+    state: directory
+    mode: "0755"
+
+- name: Resolve snapshot timestamp
+  set_fact:
+    resolved_snapshot_timestamp: >-
+      {{
+        snapshot_timestamp
+        if (snapshot_timestamp | default('') != '')
+        else (
+          (ansible_date_time.year | default('1970')) ~
+          (ansible_date_time.month | default('01')) ~
+          (ansible_date_time.day | default('01')) ~ '_' ~
+          (ansible_date_time.hour | default('00')) ~
+          (ansible_date_time.minute | default('00')) ~
+          (ansible_date_time.second | default('00'))
+        )
+      }}
+
+- name: Resolve snapshot destination file path
+  set_fact:
+    resolved_snapshot_file: >-
+      {{
+        snapshot_file
+        if (snapshot_file | default('') != '')
+        else (
+          (snapshot_dir | default(playbook_dir ~ '/snapshots')) ~ '/' ~
+          (cluster_name | default('unknown_cluster')) ~ '_' ~
+          resolved_snapshot_timestamp ~ '_baseline.json'
+        )
+      }}
+
+- name: Capture ClusterVersion resource (oc get clusterversion version -o json)
+  command: oc get clusterversion version -o json --kubeconfig {{ kubeconfig_path }}
+  register: oc_cv_raw
+  changed_when: false
+  failed_when: oc_cv_raw.rc != 0
+
+- name: Parse ClusterVersion JSON data
+  set_fact:
+    cv_raw_json: "{{ oc_cv_raw.stdout | from_json }}"
+
+- name: Extract ClusterVersion metadata and conditions
+  set_fact:
+    baseline_clusterversion:
+      desired_version: "{{ cv_raw_json.status.desired.version | default(cv_raw_json.spec.desiredUpdate.version | default('unknown')) }}"
+      current_version: "{{ (cv_raw_json.status.history | default([{}]) | first).version | default(cv_raw_json.status.desired.version | default('unknown')) }}"
+      channel: "{{ cv_raw_json.spec.channel | default('') }}"
+      available_updates: "{{ cv_raw_json.status.availableUpdates | default([]) }}"
+      history: "{{ cv_raw_json.status.history | default([]) }}"
+      conditions: "{{ cv_raw_json.status.conditions | default([]) }}"
+
+- name: Capture ClusterOperators (oc get clusteroperators -o json)
+  command: oc get clusteroperators -o json --kubeconfig {{ kubeconfig_path }}
+  register: oc_co_raw
+  changed_when: false
+  failed_when: oc_co_raw.rc != 0
+
+- name: Parse ClusterOperators JSON data
+  set_fact:
+    co_raw_json: "{{ oc_co_raw.stdout | from_json }}"
+
+- name: Assemble structured ClusterOperators list
+  set_fact:
+    baseline_clusteroperators: >-
+      [
+        {% for item in co_raw_json['items'] | default([]) %}
+        {
+          "name": "{{ item.metadata.name | default('') }}",
+          "available": "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first) | default('Unknown') }}",
+          "progressing": "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first) | default('Unknown') }}",
+          "degraded": "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | list | first) | default('Unknown') }}",
+          "versions": {{ item.status.versions | default([]) | to_json }}
+        }{{ '' if loop.last else ',' }}
+        {% endfor %}
+      ]
+
+- name: Capture Nodes (oc get nodes -o json)
+  command: oc get nodes -o json --kubeconfig {{ kubeconfig_path }}
+  register: oc_nodes_raw
+  changed_when: false
+  failed_when: oc_nodes_raw.rc != 0
+
+- name: Parse Nodes JSON data
+  set_fact:
+    nodes_raw_json: "{{ oc_nodes_raw.stdout | from_json }}"
+
+- name: Assemble structured Nodes list
+  set_fact:
+    baseline_nodes: >-
+      [
+        {% for item in nodes_raw_json['items'] | default([]) %}
+        {
+          "name": "{{ item.metadata.name | default('') }}",
+          "ready": "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | list | first) | default('Unknown') }}",
+          "kubelet_version": "{{ item.status.nodeInfo.kubeletVersion | default('unknown') }}",
+          "kernel_version": "{{ item.status.nodeInfo.kernelVersion | default('unknown') }}",
+          "os_image": "{{ item.status.nodeInfo.osImage | default('unknown') }}",
+          "unschedulable": {{ (item.spec.unschedulable | default(false)) | to_json }},
+          "roles": {{ item.metadata.labels | default({}) | list | select('match', 'node-role.kubernetes.io/.*') | map('regex_replace', 'node-role.kubernetes.io/', '') | list | to_json }},
+        }{{ '' if loop.last else ',' }}
+        {% endfor %}
+      ]
+
+- name: Capture Routes across all namespaces (oc get routes --all-namespaces -o json)
+  command: oc get routes --all-namespaces -o json --kubeconfig {{ kubeconfig_path }}
+  register: oc_routes_raw
+  changed_when: false
+  failed_when: oc_routes_raw.rc != 0
+
+- name: Parse Routes JSON data
+  set_fact:
+    routes_raw_json: "{{ oc_routes_raw.stdout | from_json }}"
+
+- name: Assemble structured Routes list
+  set_fact:
+    baseline_routes: >-
+      [
+        {% for item in routes_raw_json['items'] | default([]) %}
+        {
+          "namespace": "{{ item.metadata.namespace | default('') }}",
+          "name": "{{ item.metadata.name | default('') }}",
+          "host": "{{ item.spec.host | default('') }}",
+          "to": "{{ item.spec.to.name | default('') }}",
+          "tls_termination": "{{ (item.spec.tls | default({})).termination | default('none') }}"
+        }{{ '' if loop.last else ',' }}
+        {% endfor %}
+      ]
+
+- name: Assemble complete baseline JSON payload
+  set_fact:
+    baseline_snapshot_payload:
+      metadata:
+        cluster_name: "{{ cluster_name | default('UNKNOWN') }}"
+        timestamp: "{{ resolved_snapshot_timestamp }}"
+        captured_at: "{{ ansible_date_time.iso8601 | default('unknown') }}"
+        kubeconfig_path: "{{ kubeconfig_path }}"
+        ansible_version: "{{ ansible_version.full | default('unknown') }}"
+      clusterversion: "{{ baseline_clusterversion }}"
+      clusteroperators: "{{ baseline_clusteroperators }}"
+      nodes: "{{ baseline_nodes }}"
+      routes: "{{ baseline_routes }}"
+      summary:
+        total_nodes: "{{ baseline_nodes | length }}"
+        total_clusteroperators: "{{ baseline_clusteroperators | length }}"
+        total_routes: "{{ baseline_routes | length }}"
+
+# MIGRATION 2.14: Retest to_nice_json / to_json filter serialization under Python 3
+- name: Write baseline snapshot to {{ resolved_snapshot_file }}
+  copy:
+    content: "{{ baseline_snapshot_payload | to_nice_json }}"
+    dest: "{{ resolved_snapshot_file }}"
+    mode: "0644"
+
+- name: Export baseline snapshot path fact for downstream phases
+  set_fact:
+    baseline_snapshot_file_path: "{{ resolved_snapshot_file }}"
+    baseline_captured_version: "{{ baseline_clusterversion.desired_version | default('unknown') }}"
+
+- name: Confirm baseline snapshot capture
+  debug:
+    msg: >-
+      ✔ Baseline snapshot written to {{ resolved_snapshot_file }}
+      (Nodes: {{ baseline_nodes | length }},
+       Operators: {{ baseline_clusteroperators | length }},
+       Routes: {{ baseline_routes | length }},
+       Current version: {{ baseline_captured_version }}).

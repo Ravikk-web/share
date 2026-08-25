@@ -1,0 +1,26 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: No changes required — pure variable definitions.
+#                 | default('') guards are already in place for Jinja2 strictness.
+#
+# Default variables for the login role.
+# kubeconfig_path is derived from playbook_dir — never hardcoded to a machine.
+# Optional overrides use | default('') so callers can pass them at runtime
+# without Jinja2 undefined errors on either Ansible version.
+
+---
+# --- Kubeconfig path (primary default) ----------------------------------------
+# Written by `oc login` in this role. Stored under playbook_dir so it is
+# cleaned up on logout and never collides with the operator's personal config.
+# Override at runtime to place the kubeconfig elsewhere if needed.
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+
+# --- Optional overrides -------------------------------------------------------
+# These are intentionally empty-string defaults. The caller (secrets.yml /
+# extra-vars) is expected to supply real values. The | default('') pattern
+# is required here so the vars are always defined, even when the role is
+# included without the parent playbook's vars_files (e.g. in isolation tests).
+# MIGRATION 2.14: Jinja2 strictness requires these defaults; 2.7.17 is lenient
+#                 but we define them for forward compatibility.
+login_api_url: "{{ api_url | default('') }}"
+login_username: "{{ username | default('') }}"
+login_password: "{{ password | default('') }}"

@@ -1,0 +1,24 @@
+graph TD
+    classDef default fill:#f8f9fb,stroke:#e4e7ec,stroke-width:2px;
+    classDef step fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#101828;
+    classDef decision fill:#fff8e1,stroke:#d97706,stroke-width:2px,color:#101828,shape:diamond;
+    classDef action fill:#e6f4ea,stroke:#16a34a,stroke-width:2px,color:#101828;
+    classDef fail fill:#fdecea,stroke:#dc2626,stroke-width:2px,color:#101828;
+    classDef warn fill:#fff8e1,stroke:#d97706,stroke-width:2px,color:#101828;
+
+    A([Start Prevalidation]) --> B[Run 13 Checks]:::step
+    
+    B --> C{Any HARD<br>Failure?}:::decision
+    
+    C -- Yes --> D[Fail: Abort Upgrade]:::fail
+    C -- No --> E{Any WARN<br>Items?}:::decision
+    
+    D --> F[Log, Alert, & Logout]:::fail
+    
+    E -- Yes --> G[Record WARN items]:::warn
+    E -- No --> H[All Checks PASS]:::action
+    
+    G --> I[Render HTML Report]:::step
+    H --> I
+    
+    I --> J([Proceed to Phase 03]):::action

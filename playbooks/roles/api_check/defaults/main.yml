@@ -1,0 +1,28 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: No changes required — pure variable definitions.
+#                 | default('') guards are already in place for Jinja2 strictness.
+#
+# Default variables for the api_check role.
+# Confirms current cluster API-server context matches the expected cluster regex.
+#
+# Contract:
+#   - Read-only; queries `oc whoami --show-server`.
+#   - Validates the current server URL against `desired_cluster_api_regex`.
+#   - Appends a structured PASS/FAIL entry to the `health_summary` list.
+#   - On regex mismatch, fails immediately with a HARD gate failure.
+
+---
+# Path to the active kubeconfig (defaults to playbook_dir/.kubeconfig)
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+
+# Target cluster name (used for logging and failure messages)
+cluster_name: ""
+
+# Regular expression pattern to validate the API server URL
+# Sourced from vars/api_regex.yml if not explicitly passed
+desired_cluster_api_regex: "{{ api_regex | default('^https://api\\.[a-zA-Z0-9-]+\\.[a-zA-Z0-9.-]+:[0-9]+$') }}"
+
+# Metadata for health_summary reporting
+api_check_id: "01"
+api_check_name: "API Server Context Validation"
+api_check_gate: "HARD"

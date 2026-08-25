@@ -1,0 +1,383 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (shell, command, set_fact, debug, fail,
+#                 include_role, pause) work on both versions.
+#                 | default('') guards are applied on all optional variables.
+#                 No `warn:` parameter is used on any task.
+#
+# monitor/tasks/poll_iteration.yml — Single polling iteration.
+#
+# Called from main.yml via include_tasks + loop.
+# Each iteration:
+#   1. Query CV, MCP, nodes via oc + jq (changed_when: false)
+#   2. Compute progress %, elapsed, current working node, degraded nodes
+#   3. Detect state change vs previous poll → immediate email
+#   4. Check heartbeat interval → heartbeat email
+#   5. Check MCP completion → break signal
+#   6. Check timeout → fail: if stalled
+#   7. Pause for poll_interval_minutes (skip if complete)
+#
+# Dependencies:
+#   - Unit 05 (sendmail), Unit 04 (progress-mail.j2)
+#   - Units 10/11 (mcp/node jq patterns reused)
+#   - oc, jq
+
+---
+# ==============================================================================
+# STEP 1: Compute elapsed time
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — compute elapsed time"
+  set_fact:
+    monitor_elapsed_seconds: "{{ (ansible_date_time.epoch | int) - (monitor_start_epoch | int) }}"
+    monitor_elapsed_minutes: "{{ ((ansible_date_time.epoch | int) - (monitor_start_epoch | int)) / 60 }}"
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — format elapsed display"
+  set_fact:
+    monitor_elapsed_display: "{{ (monitor_elapsed_minutes | float | round(0) | int) }}m"
+
+# ==============================================================================
+# STEP 2: Query ClusterVersion
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — query ClusterVersion"
+  command: oc get clusterversion version -o json --kubeconfig {{ kubeconfig_path }}
+  register: monitor_cv_raw
+  changed_when: false
+  failed_when: monitor_cv_raw.rc != 0
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — parse ClusterVersion"
+  set_fact:
+    monitor_cv_version: "{{ (monitor_cv_raw.stdout | from_json).status.desired.version | default('unknown') }}"
+    monitor_cv_progressing: "{{ ((monitor_cv_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first) | default('Unknown') }}"
+    monitor_cv_progressing_msg: "{{ ((monitor_cv_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='message') | list | first) | default('') }}"
+    monitor_cv_available: "{{ ((monitor_cv_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first) | default('Unknown') }}"
+
+# ==============================================================================
+# STEP 3: Query MachineConfigPools
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — query MachineConfigPools"
+  shell: >-
+    oc get mcp -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      [.items[]? | {
+        "name": .metadata.name,
+        "machine_count": (.status.machineCount // 0),
+        "ready_machine_count": (.status.readyMachineCount // 0),
+        "updated_machine_count": (.status.updatedMachineCount // 0),
+        "degraded_machine_count": (.status.degradedMachineCount // 0),
+        "updated": ([.status.conditions[]? | select(.type=="Updated") | .status][0] // "Unknown"),
+        "updating": ([.status.conditions[]? | select(.type=="Updating") | .status][0] // "Unknown"),
+        "degraded": ([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "Unknown")
+      }]
+    '
+  register: monitor_mcp_raw
+  changed_when: false
+  failed_when: false
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — parse MCP data"
+  set_fact:
+    monitor_mcp_pools: "{{ monitor_mcp_raw.stdout | default('[]') | from_json }}"
+    monitor_mcp_access_error: ""
+  when: (monitor_mcp_raw.rc | default(1) == 0) and (monitor_mcp_raw.stdout | default('') | trim != '')
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — fallback MCP data & check access"
+  set_fact:
+    monitor_mcp_pools: []
+    monitor_mcp_access_error: >-
+      {{
+        (monitor_mcp_raw.stderr | trim)
+        if ((monitor_mcp_raw.rc | default(0) != 0) and
+            ((monitor_mcp_raw.stderr | default('') | lower is search('forbidden')) or
+             (monitor_mcp_raw.stderr | default('') | lower is search('cannot get')) or
+             (monitor_mcp_raw.stderr | default('') | lower is search('unauthorized'))))
+        else ''
+      }}
+  when: (monitor_mcp_raw.rc | default(1) != 0) or (monitor_mcp_raw.stdout | default('') | trim == '')
+
+# ==============================================================================
+# STEP 4: Query Nodes
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — query nodes"
+  shell: >-
+    oc get nodes -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      [.items[]? | {
+        "name": .metadata.name,
+        "ready": ([.status.conditions[]? | select(.type=="Ready") | .status][0] // "Unknown"),
+        "unschedulable": (.spec.unschedulable // false),
+        "roles": ([.metadata.labels | to_entries[] | select(.key | startswith("node-role.kubernetes.io/")) | .key | ltrimstr("node-role.kubernetes.io/")] | join(",")),
+        "kubelet_version": (.status.nodeInfo.kubeletVersion // "unknown")
+      }]
+    '
+  register: monitor_nodes_raw
+  changed_when: false
+  failed_when: false
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — parse node data"
+  set_fact:
+    monitor_all_nodes: "{{ monitor_nodes_raw.stdout | default('[]') | from_json }}"
+  when: (monitor_nodes_raw.rc | default(1) == 0) and (monitor_nodes_raw.stdout | default('') | trim != '')
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — fallback node data"
+  set_fact:
+    monitor_all_nodes: []
+  when: (monitor_nodes_raw.rc | default(1) != 0) or (monitor_nodes_raw.stdout | default('') | trim == '')
+
+# ==============================================================================
+# STEP 5: Compute progress, working node, degraded nodes
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — compute MCP progress"
+  set_fact:
+    monitor_mcp_total_machines: "{{ monitor_mcp_pools | map(attribute='machine_count') | map('int') | sum }}"
+    monitor_mcp_ready_machines: "{{ monitor_mcp_pools | map(attribute='ready_machine_count') | map('int') | sum }}"
+    monitor_mcp_updated_machines: "{{ monitor_mcp_pools | map(attribute='updated_machine_count') | map('int') | sum }}"
+    monitor_mcp_all_updated: "{{ (monitor_mcp_pools | selectattr('updated', 'equalto', 'True') | list | length) == (monitor_mcp_pools | length) if (monitor_mcp_pools | length > 0) else false }}"
+    monitor_mcp_any_degraded: "{{ (monitor_mcp_pools | selectattr('degraded', 'equalto', 'True') | list | length) > 0 }}"
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — compute percent complete"
+  set_fact:
+    monitor_percent_complete: "{{ ((monitor_mcp_updated_machines | int * 100) / (monitor_mcp_total_machines | int)) | round(0) | int if (monitor_mcp_total_machines | int > 0) else 0 }}%"
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — identify current working node (draining/rebooting)"
+  set_fact:
+    monitor_working_node: "{{ (monitor_all_nodes | selectattr('unschedulable', 'equalto', true) | list | first) | default({}) }}"
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — identify degraded/NotReady nodes"
+  set_fact:
+    monitor_degraded_nodes: "{{ monitor_all_nodes | selectattr('ready', 'ne', 'True') | list }}"
+
+# ==============================================================================
+# STEP 6: Query ClusterOperators for state snapshot
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — query ClusterOperators summary"
+  shell: >-
+    oc get clusteroperators -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      [.items[]? | select(
+        ([.status.conditions[]? | select(.type=="Available") | .status][0] // "True") != "True" or
+        ([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "False") == "True"
+      ) | .metadata.name]
+    '
+  register: monitor_co_degraded_raw
+  changed_when: false
+  failed_when: false
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — parse degraded operators"
+  set_fact:
+    monitor_degraded_operators: "{{ monitor_co_degraded_raw.stdout | default('[]') | from_json }}"
+  when: (monitor_co_degraded_raw.rc | default(1) == 0) and (monitor_co_degraded_raw.stdout | default('') | trim != '')
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — fallback degraded operators"
+  set_fact:
+    monitor_degraded_operators: []
+  when: (monitor_co_degraded_raw.rc | default(1) != 0) or (monitor_co_degraded_raw.stdout | default('') | trim == '')
+
+# ==============================================================================
+# STEP 7: Build state fingerprint for change detection
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — build current state fingerprint"
+  set_fact:
+    monitor_current_state: "cv={{ monitor_cv_version }}|prog={{ monitor_cv_progressing }}|mcp_upd={{ monitor_mcp_all_updated }}|mcp_deg={{ monitor_mcp_any_degraded }}|ready={{ monitor_mcp_ready_machines }}/{{ monitor_mcp_total_machines }}|nodes_deg={{ monitor_degraded_nodes | length }}|working={{ (monitor_working_node.name | default('none')) }}|co_deg={{ monitor_degraded_operators | length }}"
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — detect state change"
+  set_fact:
+    monitor_state_changed: "{{ monitor_current_state != monitor_prev_state }}"
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — display poll status"
+  debug:
+    msg:
+      - "Poll {{ poll_iter | default(0) + 1 }}/{{ max_poll_iterations }} — Hop {{ hop_label | default('?/?') }} → {{ hop_target_version | default('') }}"
+      - "CV Version:       {{ monitor_cv_version }} (Progressing: {{ monitor_cv_progressing }})"
+      - "MCP Progress:     {{ monitor_percent_complete }} ({{ monitor_mcp_updated_machines }}/{{ monitor_mcp_total_machines }} machines updated)"
+      - "MCP All Updated:  {{ monitor_mcp_all_updated }}"
+      - "Working Node:     {{ monitor_working_node.name | default('none') }}"
+      - "Degraded Nodes:   {{ monitor_degraded_nodes | length }}"
+      - "Degraded COs:     {{ monitor_degraded_operators | join(', ') if monitor_degraded_operators | length > 0 else 'none' }}"
+      - "Elapsed:          {{ monitor_elapsed_display }}"
+      - "State Changed:    {{ monitor_state_changed }}"
+
+# ==============================================================================
+# STEP 8: Send immediate state-change email
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — check heartbeat interval"
+  set_fact:
+    monitor_heartbeat_due: "{{ ((monitor_elapsed_seconds | int) - (monitor_last_heartbeat_epoch | int)) >= ((heartbeat_minutes | default(20) | int) * 60) }}"
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — prepare email context for state change"
+  set_fact:
+    monitor_email_type: "{{ 'STATE_CHANGE' if (monitor_state_changed | bool) else ('HEARTBEAT' if (monitor_heartbeat_due | bool) else 'NONE') }}"
+
+# --- Build MCP list for progress-mail.j2 template ---
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — build MCP display list for email"
+  set_fact:
+    monitor_mcp_display_list: "{{ monitor_mcp_display_json | from_json }}"
+  vars:
+    monitor_mcp_display_json: >-
+      [
+        {% for pool in monitor_mcp_pools %}
+        {
+          "name": "{{ pool.name | default('unknown') }}",
+          "machine_count": {{ pool.machine_count | default(0) | int }},
+          "ready_machine_count": {{ pool.ready_machine_count | default(0) | int }},
+          "updated_machine_count": {{ pool.updated_machine_count | default(0) | int }},
+          "updating_machine_count": {{ pool.updating_machine_count | default(0) | int }},
+          "degraded_machine_count": {{ pool.degraded_machine_count | default(0) | int }},
+          "updated": "{{ pool.updated | default('Unknown') }}",
+          "updating": "{{ pool.updating | default('Unknown') }}",
+          "degraded": "{{ pool.degraded | default('False') }}",
+          {% if pool.updated | default('Unknown') == 'True' %}
+          "row_bg": "#ffffff",
+          "status_color": "#1a7f37", "status_bg": "#e6f4ea", "status_border": "#b7eb8f",
+          "status_text": "UPDATED ✔"
+          {% elif (pool.degraded | default('False') == 'True') or (pool.degraded_machine_count | default(0) | int > 0) %}
+          "row_bg": "#fff8f8",
+          "status_color": "#b42318", "status_bg": "#fdecea", "status_border": "#ffa39e",
+          "status_text": "DEGRADED ✖"
+          {% else %}
+          "row_bg": "#fffbf0",
+          "status_color": "#9a6700", "status_bg": "#fff8e1", "status_border": "#ffe58f",
+          "status_text": "UPDATING ⟳"
+          {% endif %}
+        }{{ '' if loop.last else ',' }}
+        {% endfor %}
+      ]
+  when: (monitor_mcp_pools | default([]) | length > 0)
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — fallback empty MCP display list"
+  set_fact:
+    monitor_mcp_display_list: []
+  when: (monitor_mcp_pools | default([]) | length == 0)
+
+# --- Build degraded node list for progress-mail.j2 ---
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — build degraded node display list"
+  set_fact:
+    monitor_degraded_display_list: "{{ monitor_degraded_display_json | from_json }}"
+  vars:
+    monitor_degraded_display_json: >-
+      [
+        {% for dnode in monitor_degraded_nodes %}
+        {
+          "name": "{{ dnode.name | default('unknown') }}",
+          "role": "{{ dnode.roles | default('worker') }}",
+          "reason": "{{ 'NotReady' if dnode.ready | default('True') != 'True' else 'SchedulingDisabled' }}",
+          "status": "{{ 'NOT READY' if dnode.ready | default('True') != 'True' else 'CORDONED' }}"
+        }{{ '' if loop.last else ',' }}
+        {% endfor %}
+      ]
+  when: (monitor_degraded_nodes | default([]) | length > 0)
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — fallback empty degraded node display list"
+  set_fact:
+    monitor_degraded_display_list: []
+  when: (monitor_degraded_nodes | default([]) | length == 0)
+
+# --- Build working node display for progress-mail.j2 ---
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — build working node display"
+  set_fact:
+    monitor_working_node_display:
+      name: "{{ monitor_working_node.name | default('') }}"
+      role: "{{ monitor_working_node.roles | default('worker') }}"
+      activity: "{{ 'Draining / Rebooting' if (monitor_working_node.ready | default('True') != 'True') else 'Cordoned (draining)' }}"
+      state: "{{ 'REBOOTING' if (monitor_working_node.ready | default('True') != 'True') else 'DRAINING' }}"
+  when: (monitor_working_node.name | default('') != '')
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — clear working node display when none"
+  set_fact:
+    monitor_working_node_display: {}
+  when: (monitor_working_node.name | default('') == '')
+
+# --- Determine email subject ---
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — compose email subject"
+  set_fact:
+    monitor_mail_subject: >-
+      {% if monitor_email_type == 'STATE_CHANGE' %}{{ alert_subject_prefix | default('[ARO Upgrade] STATE CHANGE') }} — Hop {{ hop_label | default('?/?') }} {{ hop_target_version | default('') }} — {{ monitor_percent_complete }} — {{ cluster_name | default('UNKNOWN') }}{% else %}{{ heartbeat_subject_prefix | default('[ARO Upgrade] Heartbeat') }} — Hop {{ hop_label | default('?/?') }} {{ hop_target_version | default('') }} — {{ monitor_percent_complete }} — {{ cluster_name | default('UNKNOWN') }}{% endif %}
+  when: monitor_email_type != 'NONE'
+
+# --- Determine status pill colours ---
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — set status pill for email"
+  set_fact:
+    monitor_status_pill_text: "{{ 'STATE CHANGE ⚡' if monitor_email_type == 'STATE_CHANGE' else 'IN PROGRESS ⟳' }}"
+    monitor_status_pill_color: "{{ '#b42318' if (monitor_mcp_any_degraded | bool) else '#9a6700' }}"
+    monitor_status_pill_bg: "{{ '#fdecea' if (monitor_mcp_any_degraded | bool) else '#fff8e1' }}"
+    monitor_status_pill_border: "{{ '#ffa39e' if (monitor_mcp_any_degraded | bool) else '#ffe58f' }}"
+  when: monitor_email_type != 'NONE'
+
+# --- Send the email ---
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — send {{ monitor_email_type | default('') }} email"
+  include_role:
+    name: sendmail
+  vars:
+    mail_subject: "{{ monitor_mail_subject }}"
+    mail_template: "progress-mail.j2"
+    current_hop: "{{ hop_number | default('1') }}"
+    total_hops: "{{ hop_total | default('1') }}"
+    target_version: "{{ hop_target_version | default('') }}"
+    percent_complete: "{{ monitor_percent_complete }}"
+    elapsed_time: "{{ monitor_elapsed_display }}"
+    mcp_list: "{{ monitor_mcp_display_list | default([]) }}"
+    mcp_access_error: "{{ monitor_mcp_access_error | default('') }}"
+    current_working_node: "{{ monitor_working_node_display | default({}) }}"
+    degraded_nodes: "{{ monitor_degraded_display_list | default([]) }}"
+    degraded_operators: "{{ monitor_degraded_operators | default([]) }}"
+    cluster_version_status: "{{ 'Progressing towards ' ~ hop_target_version | default('target') if monitor_cv_progressing | default('False') == 'True' else 'At ' ~ monitor_cv_version | default('unknown') }}"
+    status_pill_text: "{{ monitor_status_pill_text | default('IN PROGRESS ⟳') }}"
+    status_pill_color: "{{ monitor_status_pill_color | default('#9a6700') }}"
+    status_pill_bg: "{{ monitor_status_pill_bg | default('#fff8e1') }}"
+    status_pill_border: "{{ monitor_status_pill_border | default('#ffe58f') }}"
+    next_update_note: "Next update in {{ heartbeat_minutes | default(20) }}m or on state change"
+    run_id: "{{ ansible_date_time.iso8601 | default('N/A') }}"
+    timestamp: "{{ ansible_date_time.iso8601 | default('N/A') }}"
+    log_path: "{{ log_dir | default('logs/') }}"
+  when: monitor_email_type != 'NONE'
+
+# --- Update heartbeat epoch after sending heartbeat ---
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — update heartbeat timestamp"
+  set_fact:
+    monitor_last_heartbeat_epoch: "{{ monitor_elapsed_seconds }}"
+  when: monitor_heartbeat_due | default(false) | bool
+
+# ==============================================================================
+# STEP 9: Update previous state for next iteration
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — save current state as previous"
+  set_fact:
+    monitor_prev_state: "{{ monitor_current_state }}"
+
+# ==============================================================================
+# STEP 10: Check MCP completion — signal loop break
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — check MCP completion"
+  set_fact:
+    monitor_mcp_complete: true
+  when:
+    - monitor_mcp_all_updated | default(false) | bool
+    - monitor_cv_version == hop_target_version
+
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — MCP complete notification"
+  debug:
+    msg: >-
+      ✔ MCP rollout complete for hop {{ hop_label | default('?/?') }} → {{ hop_target_version }}.
+      All {{ monitor_mcp_total_machines }} machines updated.
+      Elapsed: {{ monitor_elapsed_display }}.
+      Proceeding to settle-gate.
+  when: monitor_mcp_complete | default(false) | bool
+
+# ==============================================================================
+# STEP 11: Timeout guard — fail if stalled past hop_timeout_minutes
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — enforce timeout guard"
+  fail:
+    msg: >-
+      TIMEOUT STALL FAILURE: Hop {{ hop_label | default('?/?') }} → {{ hop_target_version }}
+      on cluster '{{ cluster_name | default('UNKNOWN') }}' has exceeded the
+      {{ hop_timeout_minutes | default(90) }}-minute timeout.
+      MCP progress: {{ monitor_percent_complete }} ({{ monitor_mcp_updated_machines }}/{{ monitor_mcp_total_machines }}).
+      CV Progressing: {{ monitor_cv_progressing }}.
+      Elapsed: {{ monitor_elapsed_display }}.
+      Upgrade appears stalled — triggering alert and logout.
+  when:
+    - not (monitor_mcp_complete | default(false) | bool)
+    - (monitor_elapsed_minutes | float) >= (hop_timeout_minutes | default(90) | float)
+
+# ==============================================================================
+# STEP 12: Pause before next poll (skip if complete)
+# ==============================================================================
+- name: "Monitor poll {{ poll_iter | default(0) + 1 }} — pause {{ poll_interval_minutes | default(2) }}m before next poll"
+  pause:
+    seconds: "{{ (poll_interval_minutes | default(2) | int) * 60 }}"
+  when: not (monitor_mcp_complete | default(false) | bool)

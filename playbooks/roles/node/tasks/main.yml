@@ -1,0 +1,148 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (shell, command, fail, set_fact, debug)
+#                 work on both versions. Replace with FQCN only if adopting the
+#                 ansible.builtin.* convention project-wide.
+#                 | default('') guards are applied on all optional variables.
+#
+# node role — validates Node health, readiness, and schedulability (HARD gate).
+#
+# Contract:
+#   - Queries `oc get nodes -o json` piped to `jq`.
+#   - Read-only operation; changed_when: false.
+#   - Asserts every Node is Ready=True and not SchedulingDisabled (spec.unschedulable=false).
+#   - Respects optional allowed_unschedulable_nodes list for permitted cordoned nodes.
+#   - NotReady nodes are NEVER permitted, even if in allowed_unschedulable_nodes.
+#   - HARD gate: fails with explicit error naming cluster and failing nodes.
+#   - Exposes per-node Ready status and kubelet versions as reusable facts
+#     (node_all_nodes, node_kubelet_versions, node_readiness_status) for downstream
+#     consumption by Phase 04 (monitor) and Phase 05 (postvalidation check 4).
+#   - Records a structured PASS entry into `health_summary` list via set_fact.
+
+---
+# Shell module chosen to pipe oc get nodes JSON output to jq (v1.5 compatible)
+- name: Query Nodes and evaluate health conditions — oc get nodes
+  shell: >-
+    oc get nodes -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      .items // [] | {
+        "nodes": [
+          .[] | {
+            "name": .metadata.name,
+            "ready": ([.status.conditions[]? | select(.type=="Ready") | .status][0] // "Unknown"),
+            "unschedulable": (.spec.unschedulable // false),
+            "kubelet_version": (.status.nodeInfo.kubeletVersion // "unknown"),
+            "kernel_version": (.status.nodeInfo.kernelVersion // "unknown"),
+            "os_image": (.status.nodeInfo.osImage // "unknown"),
+            "roles": ([.metadata.labels // {} | to_entries[]? | select(.key | startswith("node-role.kubernetes.io/")) | .key | split("/")[1]] // [])
+          }
+        ],
+        "offenders": [
+          .[] | {
+            "name": .metadata.name,
+            "ready": ([.status.conditions[]? | select(.type=="Ready") | .status][0] // "Unknown"),
+            "unschedulable": (.spec.unschedulable // false),
+            "kubelet_version": (.status.nodeInfo.kubeletVersion // "unknown"),
+            "kernel_version": (.status.nodeInfo.kernelVersion // "unknown"),
+            "os_image": (.status.nodeInfo.osImage // "unknown"),
+            "roles": ([.metadata.labels // {} | to_entries[]? | select(.key | startswith("node-role.kubernetes.io/")) | .key | split("/")[1]] // [])
+          } | select(.ready != "True" or .unschedulable == true)
+        ]
+      }
+    '
+  register: node_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Evaluate Nodes query execution
+  fail:
+    msg: >-
+      Failed to query Nodes for cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Command exited with code {{ node_raw_query.rc | default(1) }}.
+      Error: {{ node_raw_query.stderr | default(node_raw_query.stdout | default('No output')) | trim }}.
+      Check kubeconfig path ({{ kubeconfig_path }}) and cluster reachability.
+  when: (node_raw_query.rc | default(1) != 0) or (node_raw_query.stdout | default('') | trim == '')
+
+- name: Parse Nodes JSON payload
+  set_fact:
+    node_parsed_data: "{{ node_raw_query.stdout | from_json }}"
+
+- name: Extract all nodes list
+  set_fact:
+    node_all_nodes: "{{ node_parsed_data.nodes | default([]) }}"
+
+- name: Validate at least one node was discovered
+  fail:
+    msg: >-
+      Node check FAILED (HARD gate) for cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      No nodes found in cluster response.
+  when: (node_all_nodes | length) == 0
+
+- name: Assemble reusable per-node facts for monitor and postvalidation
+  set_fact:
+    node_kubelet_versions: >-
+      {
+        {% for n in node_all_nodes %}
+        "{{ n.name }}": "{{ n.kubelet_version | default('unknown') }}"{{ '' if loop.last else ',' }}
+        {% endfor %}
+      }
+    node_readiness_status: >-
+      {
+        {% for n in node_all_nodes %}
+        "{{ n.name }}": {
+          "ready": "{{ n.ready | default('Unknown') }}",
+          "unschedulable": {{ (n.unschedulable | default(false)) | to_json }},
+          "kubelet_version": "{{ n.kubelet_version | default('unknown') }}",
+          "kernel_version": "{{ n.kernel_version | default('unknown') }}",
+          "os_image": "{{ n.os_image | default('unknown') }}",
+          "roles": {{ (n.roles | default([])) | to_json }}
+        }{{ '' if loop.last else ',' }}
+        {% endfor %}
+      }
+
+- name: Initialize offending nodes list
+  set_fact:
+    node_offending_nodes: []
+
+- name: Filter offending nodes against allowed_unschedulable_nodes
+  set_fact:
+    node_offending_nodes: "{{ node_offending_nodes + [item] }}"
+  loop: "{{ node_parsed_data.offenders | default([]) }}"
+  when: >-
+    (item.ready | default('Unknown') != 'True') or
+    (item.unschedulable | default(false) and (item.name not in (allowed_unschedulable_nodes | default([]))))
+
+- name: Display Nodes inspection summary
+  debug:
+    msg: >-
+      Cluster '{{ cluster_name | default('UNKNOWN') }}': Scanned {{ node_all_nodes | length }} node(s).
+      Found {{ node_offending_nodes | length }} failing node(s)
+      (Allow-listed unschedulable: {{ allowed_unschedulable_nodes | default([]) | length }}).
+
+- name: Enforce HARD gate on Nodes health
+  fail:
+    msg: >-
+      Node check FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Found {{ node_offending_nodes | length }} unhealthy / unschedulable node(s):
+      {% for node in node_offending_nodes %}
+        - {{ node.name }}: Ready={{ node.ready | default('Unknown') }}, SchedulingDisabled={{ node.unschedulable | default(false) }}, Kubelet={{ node.kubelet_version | default('unknown') }}, Roles={{ node.roles | default([]) | join(',') }}
+      {% endfor %}
+      All nodes must be Ready=True and schedulable (unless permitted in allowed_unschedulable_nodes) before upgrade operations can proceed.
+  when: (node_offending_nodes | length) > 0
+
+- name: Record node PASS in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [node_summary_entry] }}"
+  vars:
+    node_summary_entry:
+      id: "{{ node_id | default('05') }}"
+      name: "{{ node_name | default('Node Health and Readiness') }}"
+      gate: "{{ node_gate | default('HARD') }}"
+      status: "PASS"
+      observed: "All {{ node_all_nodes | length }} nodes are Ready and schedulable (Allow-listed unschedulable: {{ allowed_unschedulable_nodes | default([]) | length }})"
+      details: "Verified {{ node_all_nodes | length }} nodes on cluster {{ cluster_name | default('cluster') }}"
+      raw_output: "{{ node_all_nodes | to_json }}"
+
+- name: Confirm Node health passed
+  debug:
+    msg: >-
+      ✔ PASS [Check {{ node_id | default('05') }} - {{ node_name | default('Node Health and Readiness') }}] —
+      All {{ node_all_nodes | length }} nodes are Ready and schedulable.
