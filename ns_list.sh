@@ -10,22 +10,32 @@
 #
 #   Example CSV:
 #     "Cluster","App ID","Namespace Count","Namespaces"
-#     "arop05","APP00007051","2","app00007051-mcp-api"
-#     "arop05","APP00007051","2","app00007051-member-contact-preferences-api"
+#     "arop05","app00007051","2","app00007051-mcp-api"
+#     "arop05","app00007051","2","app00007051-member-contact-preferences-api"
 #
-# APP ID RESOLUTION (APP_ID_SOURCE=auto  -> DEFAULT, tries in order):
-#   1. .project.labels["hcsc/application-id"]
-#   2. .project.annotations["hcsc/application-id"]
-#   3. RECURSIVE search: the "hcsc/application-id" key ANYWHERE in the file
-#   4. Regex fallback on the namespace name  ->  ^(app[0-9]+)-
-#   This makes the script schema-tolerant instead of failing silently.
+# CONFIRMED SCHEMA (verified via DIAGNOSE on the real repo):
+#   values.yaml
+#     project:
+#       name: app00000061-blueaccess-producer-portal      <- namespace name
+#       labels:
+#         kubernetes.io/metadata.name: ...
+#         hcsc/application-metallic-tier: tier-2
+#       annotations:
+#         hcsc/application-id: app00000061                 <- APP ID (here!)
 #
-# DIAGNOSTICS
-#   DIAGNOSE=1 ./find_duplicate_appid_namespaces.sh
-#       -> dumps the structure of the first few values.yaml files and shows
-#          exactly what each resolution strategy returns, then exits.
-#   DEBUG=1 ./find_duplicate_appid_namespaces.sh
-#       -> logs every namespace -> cluster -> app-id mapping.
+#   clusters.yaml  (same folder)
+#     clusters:
+#       - name: arod05
+#       - name: arot05
+#
+# HOW TO RUN  (script lives in, and is run from, the 'namespaces' folder)
+#   ./find_duplicate_appid_namespaces.sh              # normal scan -> writes CSV
+#   DEBUG=1    ./find_duplicate_appid_namespaces.sh   # + per-namespace mapping
+#   DIAGNOSE=1 ./find_duplicate_appid_namespaces.sh   # schema inspection ONLY
+#
+#   NOTE: DIAGNOSE=1 inspects the first few files and EXITS WITHOUT SCANNING.
+#         It intentionally does NOT produce the CSV. Run without DIAGNOSE=1
+#         to actually generate the report.
 #
 # REQUIREMENTS
 #   bash 4+, yq (mikefarah) v4+, find, sort
@@ -42,22 +52,26 @@ set -o pipefail
 # CONFIGURATION  (all overridable via environment variables)
 ###############################################################################
 
-NAMESPACES_ROOT="${NAMESPACES_ROOT:-../namespaces}"
+# Root folder holding the per-namespace directories.
+# The script sits INSIDE 'namespaces/', and each namespace is a sibling folder,
+# so '.' is the correct default. ('../namespaces' also works from here.)
+NAMESPACES_ROOT="${NAMESPACES_ROOT:-.}"
 
 # Namespace NAME lookup inside values.yaml
 NAME_YAML_PATH="${NAME_YAML_PATH:-.project.name}"
 FALLBACK_TO_FOLDER_NAME="${FALLBACK_TO_FOLDER_NAME:-true}"
 
-# App ID resolution mode: auto | annotation | label | recursive | name_regex
-APP_ID_SOURCE="${APP_ID_SOURCE:-auto}"
+# App ID resolution mode: annotation | label | recursive | name_regex | auto
+# CONFIRMED: the App ID lives under .project.annotations -> default 'annotation'.
+APP_ID_SOURCE="${APP_ID_SOURCE:-annotation}"
 
-# The bare key name used for the App ID (used by label/annotation/recursive).
+# The bare key name used for the App ID.
 APP_ID_KEY="${APP_ID_KEY:-hcsc/application-id}"
 
 # Regex fallback: first capture group = App ID.
 APP_ID_REGEX="${APP_ID_REGEX:-^(app[0-9]+)-}"
 
-# Treat App IDs case-insensitively (APP00007051 == app00007051) when grouping.
+# Treat App IDs case-insensitively when grouping (APP00007051 == app00007051).
 NORMALIZE_APPID_CASE="${NORMALIZE_APPID_CASE:-true}"
 
 # ---- Cluster resolution -----------------------------------------------------
@@ -65,8 +79,10 @@ CLUSTERS_YAML_NAME="${CLUSTERS_YAML_NAME:-clusters.yaml}"
 CLUSTERS_YAML_PATH="${CLUSTERS_YAML_PATH:-.clusters[].name}"
 NO_CLUSTER_LABEL="${NO_CLUSTER_LABEL:-(unknown-cluster)}"
 
+# Minimum namespaces an App ID must own (per cluster) to be reported.
 MIN_COUNT="${MIN_COUNT:-2}"
 
+# Namespaces to EXCLUDE (exact match against the resolved namespace name).
 EXCLUDE_NAMESPACES=(
     "default" "openshift" "openshift-infra"
     "kube-system" "kube-public" "kube-node-lease"
@@ -84,11 +100,11 @@ die()   { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 csv_wrap() { local v="${1:-}"; printf '"%s"' "${v//\"/\"\"}"; }
 
-# Clean a yq result: strip CR (Windows/Git-Bash CRLF files), trim spaces,
+# Clean a yq result: strip CR (Git-Bash/Windows CRLF files), trim whitespace,
 # and convert yq's literal "null" into an empty string.
 clean() {
     local v="${1:-}"
-    v="${v//$'\r'/}"                      # <-- critical on MINGW64 / Windows repos
+    v="${v//$'\r'/}"                      # critical on MINGW64 / Windows repos
     v="${v#"${v%%[![:space:]]*}"}"        # ltrim
     v="${v%"${v##*[![:space:]]}"}"        # rtrim
     [[ "$v" == "null" ]] && v=""
@@ -112,19 +128,18 @@ get_recursive() {
     clean "$(yq e "[.. | select(tag == \"!!map\") | select(has(\"$APP_ID_KEY\")) | .[\"$APP_ID_KEY\"]] | .[0] // \"\"" "$1" 2>/dev/null || true)"
 }
 
-# Resolve the App ID for a file, honouring APP_ID_SOURCE.
 resolve_appid() {
     local file="$1" ns="$2" v=""
     case "$APP_ID_SOURCE" in
-        label)      v="$(get_from_label "$file")" ;;
         annotation) v="$(get_from_annotation "$file")" ;;
+        label)      v="$(get_from_label "$file")" ;;
         recursive)  v="$(get_recursive "$file")" ;;
-        name_regex) [[ "$ns" =~ $APP_ID_REGEX ]] && v="${BASH_REMATCH[1]}" ;;
+        name_regex) [[ "$ns" =~ $APP_ID_REGEX ]] && v="${BASH_REMATCH[1]}" || v="" ;;
         auto)
-            v="$(get_from_label "$file")"
-            [[ -z "$v" ]] && v="$(get_from_annotation "$file")"
+            v="$(get_from_annotation "$file")"
+            [[ -z "$v" ]] && v="$(get_from_label "$file")"
             [[ -z "$v" ]] && v="$(get_recursive "$file")"
-            [[ -z "$v" && "$ns" =~ $APP_ID_REGEX ]] && v="${BASH_REMATCH[1]}"
+            if [[ -z "$v" && "$ns" =~ $APP_ID_REGEX ]]; then v="${BASH_REMATCH[1]}"; fi
             ;;
     esac
     printf '%s' "$v"
@@ -144,10 +159,11 @@ case "$APP_ID_SOURCE" in
 esac
 
 ###############################################################################
-# DIAGNOSE MODE — figure out the real schema, then exit
+# DIAGNOSE MODE — inspect schema, then EXIT (does NOT produce the CSV)
 ###############################################################################
 if [[ "${DIAGNOSE:-0}" == "1" ]]; then
     log "=== DIAGNOSE MODE : inspecting the first 3 values.yaml files ==="
+    log "    (this mode does NOT scan or write the CSV — run without DIAGNOSE=1)"
     n=0
     while IFS= read -r f; do
         n=$((n+1)); (( n > 3 )) && break
@@ -174,7 +190,7 @@ if [[ "${DIAGNOSE:-0}" == "1" ]]; then
         fi
     done < <(find "$NAMESPACES_ROOT" -type f -name "values.yaml" | sort)
     log ""
-    log "=== END DIAGNOSE ==="
+    log "=== END DIAGNOSE (no CSV written) ==="
     exit 0
 fi
 
@@ -199,17 +215,14 @@ log "  Cluster source  : $CLUSTERS_YAML_NAME -> yq '$CLUSTERS_YAML_PATH'"
 log "  Min. count      : $MIN_COUNT"
 log "----------------------------------------------------------------------"
 
-declare -A appid_count=()
-declare -A appid_list=()
-declare -A appid_display=()     # normalized id -> original-cased id for output
+declare -A appid_count=()       # cluster|appid -> namespace count
+declare -A appid_list=()        # cluster|appid -> ';'-joined namespace names
+declare -A appid_display=()     # normalized id -> original-cased id
 
-scanned=0
-skipped=0
-no_name=0
-no_appid=0
-no_cluster=0
+scanned=0; skipped=0; no_name=0; no_appid=0; no_cluster=0; files_found=0
 
 while IFS= read -r file; do
+    files_found=$((files_found+1))
     dir="$(dirname "$file")"
 
     # ---- namespace NAME -----------------------------------------------------
@@ -233,13 +246,12 @@ while IFS= read -r file; do
         no_appid=$((no_appid+1)); skipped=$((skipped+1)); continue
     fi
 
-    # normalize for grouping, but remember a display form
     if [[ "$NORMALIZE_APPID_CASE" == "true" ]]; then
-        appid_key_id="$(printf '%s' "$appid" | tr '[:upper:]' '[:lower:]')"
+        idkey="$(printf '%s' "$appid" | tr '[:upper:]' '[:lower:]')"
     else
-        appid_key_id="$appid"
+        idkey="$appid"
     fi
-    appid_display["$appid_key_id"]="$appid"
+    appid_display["$idkey"]="$appid"
 
     # ---- cluster(s) ---------------------------------------------------------
     cluster_file="$dir/$CLUSTERS_YAML_NAME"
@@ -257,7 +269,7 @@ while IFS= read -r file; do
 
     # ---- bucket -------------------------------------------------------------
     for cl in "${clusters[@]}"; do
-        key="${cl}|${appid_key_id}"
+        key="${cl}|${idkey}"
         appid_count["$key"]=$(( ${appid_count["$key"]:-0} + 1 ))
         if [[ -z "${appid_list["$key"]:-}" ]]; then
             appid_list["$key"]="$ns"
@@ -271,7 +283,7 @@ while IFS= read -r file; do
 done < <(find "$NAMESPACES_ROOT" -type f -name "values.yaml" | sort)
 
 ###############################################################################
-# EMIT RESULTS
+# EMIT RESULTS — one row per namespace
 ###############################################################################
 
 dup_total=0
@@ -301,22 +313,17 @@ fi
 ###############################################################################
 
 log "----------------------------------------------------------------------"
-log "Namespaces processed : $scanned"
-log "Namespaces skipped   : $skipped"
-log "  - no name          : $no_name"
-log "  - no app-id        : $no_appid"
-log "Namespaces w/o cluster: $no_cluster  (reported as $NO_CLUSTER_LABEL)"
+log "values.yaml files found : $files_found"
+log "Namespaces processed    : $scanned"
+log "Namespaces skipped      : $skipped   (no name: $no_name, no app-id: $no_appid)"
+log "Namespaces w/o cluster  : $no_cluster  (reported as $NO_CLUSTER_LABEL)"
 if (( dup_total == 0 )); then
-    log "Result               : no duplicate app-ids found."
-    if (( scanned == 0 )); then
-        log ""
-        log "HINT: 0 namespaces were processed. Run the diagnostic to find the"
-        log "      real schema:   DIAGNOSE=1 $0"
-    fi
+    log "Result                  : no duplicate app-ids found."
+    (( scanned == 0 )) && log "HINT: try  DIAGNOSE=1 $0   to inspect the schema."
 else
-    log "Result               : $dup_total duplicate app-id group(s)."
+    log "Result                  : $dup_total duplicate app-id group(s)."
 fi
-log "Output               : $OUTPUT_FILE"
+log "Output                  : $OUTPUT_FILE"
 log "----------------------------------------------------------------------"
 
 exit 0
