@@ -1,0 +1,22 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: No changes required — pure variable definitions.
+#                 | default('') guards are already in place for Jinja2 strictness.
+#
+# Default variables for the snapshot role.
+# Captures clusterversion, clusteroperators, nodes, and routes into a
+# single baseline JSON snapshot file under snapshot_dir.
+#
+# Contract:
+#   - Writes to snapshots/<cluster>_<timestamp>_baseline.json
+#   - Baseline JSON snapshot is the ONLY sanctioned cross-phase persistence.
+#   - Read later only by Phase 05 for baseline diffing.
+
+---
+# --- Directory & kubeconfig paths (derived from playbook_dir) -----------------
+snapshot_dir: "{{ playbook_dir }}/snapshots"
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+
+# --- Target cluster identifiers -----------------------------------------------
+cluster_name: ""
+snapshot_timestamp: ""
+snapshot_file: ""

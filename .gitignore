@@ -1,0 +1,37 @@
+# ARO Cluster Upgrade Automation — .gitignore
+
+# Runtime outputs and generated logs
+playbooks/logs/*
+!playbooks/logs/.gitkeep
+
+playbooks/output/*
+!playbooks/output/.gitkeep
+
+playbooks/snapshots/*
+!playbooks/snapshots/.gitkeep
+
+# Kubeconfig and session credentials (never track credentials or session configs)
+playbooks/kubeconfig*
+*.kubeconfig
+*.kubeconfig.*
+
+# Ansible runtime artifacts
+*.retry
+.ansible/
+.ansible-deps/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# OS and Editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+*.tmp
+*.bak

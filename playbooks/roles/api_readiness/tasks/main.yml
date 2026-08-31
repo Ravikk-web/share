@@ -1,0 +1,60 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (command, fail, set_fact, debug) work
+#                 on both versions. Replace with FQCN only if adopting the
+#                 ansible.builtin.* convention project-wide.
+#                 | default('') is already applied on all optional variables.
+#
+# api_readiness role — validates API server responsiveness and readiness.
+#
+# Contract:
+#   - Queries `oc get --raw='/readyz' --kubeconfig {{ kubeconfig_path }}`.
+#   - Read-only operation; changed_when: false.
+#   - Asserts healthy response ('ok').
+#   - HARD gate: fails if /readyz returns non-zero rc or non-ok body.
+#   - Records a structured entry in `health_summary` list via set_fact.
+
+---
+- name: Query API server readiness endpoint — oc get --raw={{ api_readiness_endpoint | default('/readyz') }}
+  command: >-
+    oc get --raw={{ api_readiness_endpoint | default('/readyz') }}
+    --kubeconfig {{ kubeconfig_path }}
+  register: api_readiness_result
+  changed_when: false
+  failed_when: false
+
+- name: Evaluate API server readiness endpoint response
+  fail:
+    msg: >-
+      API readiness check FAILED (HARD gate) for cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Endpoint: '{{ api_readiness_endpoint | default('/readyz') }}'.
+      Exit code: {{ api_readiness_result.rc | default(1) }}.
+      Response: '{{ api_readiness_result.stdout | default('') | trim }}'.
+      Error: '{{ api_readiness_result.stderr | default('') | trim }}'.
+      Expected response: '{{ api_readiness_expected_response | default('ok') }}'.
+      The API server is not ready to process upgrade operations.
+  when: >
+    (api_readiness_result.rc | default(1) != 0) or
+    (api_readiness_result.stdout | default('') | trim != (api_readiness_expected_response | default('ok')))
+
+- name: Store API server readiness status
+  set_fact:
+    api_readiness_status: "{{ api_readiness_result.stdout | trim }}"
+
+- name: Record api_readiness PASS in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [api_readiness_summary_entry] }}"
+  vars:
+    api_readiness_summary_entry:
+      id: "{{ api_readiness_id | default('02') }}"
+      name: "{{ api_readiness_name | default('API Server Readiness (/readyz)') }}"
+      gate: "{{ api_readiness_gate | default('HARD') }}"
+      status: "PASS"
+      observed: "Endpoint {{ api_readiness_endpoint | default('/readyz') }} responded with '{{ api_readiness_status }}'"
+      details: "API server is healthy and responding with ok on {{ cluster_name | default('cluster') }}"
+      raw_output: "{{ api_readiness_result.stdout | trim | default('') }}"
+
+- name: Confirm api_readiness passed
+  debug:
+    msg: >-
+      ✔ PASS [Check {{ api_readiness_id | default('02') }} - {{ api_readiness_name | default('API Server Readiness (/readyz)') }}] —
+      API server endpoint '{{ api_readiness_endpoint | default('/readyz') }}' is ready ('{{ api_readiness_status }}').

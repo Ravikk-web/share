@@ -1,0 +1,86 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Replace short module names with FQCN if adopting the
+#                 ansible.builtin.* convention. Short names work on both versions.
+#                 import_playbook has no FQCN equivalent — it stays as-is.
+#
+# Master orchestrator — chains all phases in fixed order.
+# Invoked by 00_Run.sh with extra-vars: cluster_name, upgrade_path, [dry_run].
+#
+# Phase ordering (fixed, do not reorder without explicit instruction):
+#   01_Policy_Check.yaml           → login + baseline snapshot + edge validation
+#   02_Pre_upgrade_check.yaml      → 13-check prevalidation hard gate
+#   03_Initiate_upgrade.yaml       → per-hop upgrade loop (include_tasks + loop)
+#   04_Live_monitoring_upgrade.yaml → polling + settle-gate + heartbeat
+#   05_post_Upgrade_Checks.yaml    → 10-check postvalidation + baseline diff
+#
+# NOTE: Phase imports are added by later units as each phase playbook is built.
+#       This skeleton validates the structure and prints a start banner only.
+
+---
+- name: ARO Cluster Upgrade — Start
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars_files:
+    - vars/upgrade.yml
+    - vars/paths.yml
+    - vars/secrets.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+
+  tasks:
+    - name: Print start banner
+      debug:
+        msg: >-
+          ═══════════════════════════════════════════════════════════
+          ARO Cluster Upgrade Automation — Starting
+          Cluster: {{ cluster_name | default('UNSET') }}
+          Upgrade path: {{ upgrade_path | default([]) }}
+          Dry run: {{ dry_run | default(false) }}
+          Ansible: {{ ansible_version.full | default('unknown') }}
+          Timestamp: {{ ansible_date_time.iso8601 | default('unknown') }}
+          ═══════════════════════════════════════════════════════════
+
+    - name: Validate cluster_name is provided
+      fail:
+        msg: "cluster_name must be defined in vars/upgrade.yml or provided via --extra-vars. Aborting."
+      when: cluster_name | default('') == ''
+
+    - name: Resolve cluster-specific upgrade path if configured
+      set_fact:
+        upgrade_path: "{{ cluster_upgrade_paths[cluster_name] }}"
+      when:
+        - cluster_upgrade_paths is defined
+        - cluster_name in (cluster_upgrade_paths | default({}))
+        - (cluster_upgrade_paths[cluster_name] | default([])) | length > 0
+
+    - name: Validate upgrade_path is a non-empty list
+      fail:
+        msg: >-
+          upgrade_path must be a non-empty list of target versions
+          (e.g. ["4.14.40","4.15.35"]). Please define it in vars/upgrade.yml
+          or provide via --path. Aborting.
+      when: upgrade_path | default([]) | length == 0
+
+    - name: Display validated run parameters
+      debug:
+        msg:
+          - "Cluster:       {{ cluster_name }}"
+          - "Upgrade path:  {{ upgrade_path | join(' → ') }}"
+          - "Total hops:    {{ upgrade_path | length }}"
+          - "Dry run:       {{ dry_run | default(false) }}"
+          - "Log dir:       {{ log_dir | default('') }}"
+          - "Output dir:    {{ output_dir | default('') }}"
+          - "Snapshot dir:  {{ snapshot_dir | default('') }}"
+
+# --- Master Phase Execution Chain (Fixed Order: 01 → 02 → 03/04 looped → 05) ---
+- import_playbook: 01_Policy_Check.yaml
+- import_playbook: 02_Pre_upgrade_check.yaml
+- import_playbook: 03_Initiate_upgrade.yaml
+# (Phase 03 loops tasks/hop.yml internally, which calls 04_Live_monitoring_upgrade.yaml per hop)
+- import_playbook: 05_post_Upgrade_Checks.yaml
+- import_playbook: 08_operator_upgrade.yml
+
+

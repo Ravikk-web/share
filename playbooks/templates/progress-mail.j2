@@ -1,0 +1,235 @@
+{#- Targets Ansible 2.7.17.
+    MIGRATION 2.14: No changes required — Jinja2 template is compatible with both versions.
+    
+    progress-mail.j2 — Heartbeat & State-Change Progress Email Template (Concise)
+    Presentation-only: Renders short, colour-coded HTML for live upgrade monitoring.
+    MCP status is always shown; current working node and degraded-only nodes surfaced.
+    All status colours and gate verdicts are driven by passed-in variables.
+-#}
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ report_title | default('ARO Cluster Upgrade') }} — Progress Update</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f8f9fb; font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.4; color: #344054; -webkit-font-smoothing: antialiased;">
+
+  <!-- Outer Background Container -->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #f8f9fb; padding: 16px 8px;">
+    <tr>
+      <td align="center">
+
+        <!-- Main Card Container (max-width 580px) -->
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width: 580px; margin: 0 auto; background-color: #ffffff; border: 1px solid #e4e7ec; border-radius: 8px; overflow: hidden; border-collapse: separate;">
+
+          <!-- Header Band -->
+          <tr>
+            <td style="background-color: #ffffff; padding: 14px 18px; border-bottom: 2px solid #e6f4ea;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td valign="middle" style="text-align: left;">
+                    <div style="font-size: 11px; font-weight: 700; color: #1a7f37; text-transform: uppercase; letter-spacing: 0.6px;">
+                      {{ report_org | default('ARO Automation') }} &bull; Upgrade Progress
+                    </div>
+                    <div style="font-size: 17px; font-weight: 700; color: #101828; margin-top: 2px;">
+                      Cluster: <span style="font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;">{{ cluster_name | default('N/A') }}</span>
+                    </div>
+                  </td>
+                  <td valign="middle" align="right" style="text-align: right; width: 130px;">
+                    <!-- Overall Status Pill -->
+                    <span style="display: inline-block; padding: 4px 10px; font-size: 11px; font-weight: 700; color: {{ status_pill_color | default('#9a6700') }}; background-color: {{ status_pill_bg | default('#fff8e1') }}; border: 1px solid {{ status_pill_border | default('#ffe58f') }}; border-radius: 12px; text-transform: uppercase;">
+                      {{ status_pill_text | default('IN PROGRESS ⟳') }}
+                    </span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Progress Strip / Cadence Note -->
+          <tr>
+            <td style="background-color: #f8f9fb; padding: 6px 18px; border-bottom: 1px solid #e4e7ec; font-size: 11px; color: #667085;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="text-align: left;">
+                    <strong>Cadence:</strong> {{ next_update_note | default('Next update in 20m or on state change') }}
+                  </td>
+                  <td style="text-align: right;">
+                    <strong>Time:</strong> {{ timestamp | default(run_id | default('N/A')) }}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Body Content -->
+          <tr>
+            <td style="padding: 16px 18px;">
+
+              <!-- Summary Metrics Grid (4 Compact Tiles) -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 14px;">
+                <tr>
+                  <!-- Hop Tile -->
+                  <td width="25%" style="padding: 0 3px 0 0;">
+                    <div style="background-color: #f8f9fb; border: 1px solid #e4e7ec; border-radius: 4px; padding: 6px 4px; text-align: center;">
+                      <div style="font-size: 10px; font-weight: 600; color: #667085; text-transform: uppercase;">Hop</div>
+                      <div style="font-size: 14px; font-weight: 700; color: #101828;">
+                        {{ current_hop | default('1') }} / {{ total_hops | default('1') }}
+                      </div>
+                    </div>
+                  </td>
+                  <!-- Target Version Tile -->
+                  <td width="25%" style="padding: 0 2px;">
+                    <div style="background-color: #f8f9fb; border: 1px solid #e4e7ec; border-radius: 4px; padding: 6px 4px; text-align: center;">
+                      <div style="font-size: 10px; font-weight: 600; color: #667085; text-transform: uppercase;">Target</div>
+                      <div style="font-size: 12px; font-weight: 700; font-family: 'SFMono-Regular', Consolas, monospace; color: #101828;">
+                        {{ target_version | default('N/A') }}
+                      </div>
+                    </div>
+                  </td>
+                  <!-- Progress % Tile -->
+                  <td width="25%" style="padding: 0 2px;">
+                    <div style="background-color: #f8f9fb; border: 1px solid #e4e7ec; border-radius: 4px; padding: 6px 4px; text-align: center;">
+                      <div style="font-size: 10px; font-weight: 600; color: #667085; text-transform: uppercase;">Progress</div>
+                      <div style="font-size: 14px; font-weight: 700; color: #1a7f37;">
+                        {{ percent_complete | default('0%') }}
+                      </div>
+                    </div>
+                  </td>
+                  <!-- Elapsed Time Tile -->
+                  <td width="25%" style="padding: 0 0 0 3px;">
+                    <div style="background-color: #f8f9fb; border: 1px solid #e4e7ec; border-radius: 4px; padding: 6px 4px; text-align: center;">
+                      <div style="font-size: 10px; font-weight: 600; color: #667085; text-transform: uppercase;">Elapsed</div>
+                      <div style="font-size: 14px; font-weight: 700; color: #101828;">
+                        {{ elapsed_time | default('0m') }}
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- Section 1: Machine Config Pool (MCP) Status -->
+              <div style="font-size: 11px; font-weight: 700; color: #101828; text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 6px 0; padding-bottom: 3px; border-bottom: 1px solid #e4e7ec;">
+                Machine Config Pool (MCP) Status
+              </div>
+
+              {% if mcp_access_error is defined and (mcp_access_error | length > 0) %}
+                <!-- Service Account MCP Permission Warning -->
+                <div style="background-color: #fff8e1; border: 1px solid #ffe58f; border-left: 3px solid #9a6700; border-radius: 4px; padding: 8px 10px; margin-bottom: 14px; font-size: 11px; color: #344054;">
+                  <strong>⚠️ Service Account Access Notice:</strong> Service account lacks permission to query <code style="font-family: 'SFMono-Regular', Consolas, monospace; color: #9a6700;">machineconfigpools</code>.
+                  <div style="font-size: 10px; color: #667085; margin-top: 2px;">{{ mcp_access_error }}</div>
+                </div>
+              {% elif mcp_list is defined and mcp_list | length > 0 %}
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; margin-bottom: 14px; border: 1px solid #e4e7ec; border-radius: 4px; font-size: 11px;">
+                  <thead>
+                    <tr style="background-color: #f8f9fb;">
+                      <th style="padding: 5px 8px; font-weight: 600; color: #344054; border-bottom: 1px solid #e4e7ec; text-align: left;">Pool Name</th>
+                      <th style="padding: 5px 8px; font-weight: 600; color: #344054; border-bottom: 1px solid #e4e7ec; text-align: center;">Machines</th>
+                      <th style="padding: 5px 8px; font-weight: 600; color: #344054; border-bottom: 1px solid #e4e7ec; text-align: center;">Updated</th>
+                      <th style="padding: 5px 8px; font-weight: 600; color: #344054; border-bottom: 1px solid #e4e7ec; text-align: center;">Updating</th>
+                      <th style="padding: 5px 8px; font-weight: 600; color: #344054; border-bottom: 1px solid #e4e7ec; text-align: center;">Degraded</th>
+                      <th style="padding: 5px 8px; font-weight: 600; color: #344054; border-bottom: 1px solid #e4e7ec; text-align: center;">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for pool in mcp_list %}
+                    <tr style="background-color: {{ pool.row_bg | default('#ffffff') }};">
+                      <td style="padding: 5px 8px; font-weight: 600; color: #101828; border-bottom: 1px solid #e4e7ec;">
+                        <code style="font-family: 'SFMono-Regular', Consolas, monospace; font-size: 11px;">{{ pool.name | default('unknown') }}</code>
+                      </td>
+                      <td style="padding: 5px 8px; color: #344054; text-align: center; border-bottom: 1px solid #e4e7ec;">
+                        {{ pool.ready_machine_count | default('?') }} / {{ pool.machine_count | default('?') }}
+                      </td>
+                      <td style="padding: 5px 8px; color: #344054; text-align: center; border-bottom: 1px solid #e4e7ec;">
+                        {{ pool.updated | default('Unknown') }}
+                      </td>
+                      <td style="padding: 5px 8px; color: #344054; text-align: center; border-bottom: 1px solid #e4e7ec;">
+                        {{ pool.updating | default('0') }}
+                      </td>
+                      <td style="padding: 5px 8px; text-align: center; border-bottom: 1px solid #e4e7ec;">
+                        {% if pool.degraded is defined and (pool.degraded == 'True' or pool.degraded == true or pool.degraded_machine_count | default(0) | int > 0) %}
+                          <span style="color: #b42318; font-weight: 700;">{{ pool.degraded | default('True') }}</span>
+                        {% else %}
+                          <span style="color: #1a7f37;">False</span>
+                        {% endif %}
+                      </td>
+                      <td style="padding: 5px 8px; text-align: center; border-bottom: 1px solid #e4e7ec;">
+                        <span style="display: inline-block; padding: 1px 6px; font-size: 10px; font-weight: 600; color: {{ pool.status_color | default('#1a7f37') }}; background-color: {{ pool.status_bg | default('#e6f4ea') }}; border: 1px solid {{ pool.status_border | default('#b7eb8f') }}; border-radius: 8px; text-transform: uppercase;">
+                          {{ pool.status_text | default('UPDATED ✔') }}
+                        </span>
+                      </td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              {% else %}
+                <div style="background-color: #f8f9fb; border: 1px solid #e4e7ec; border-radius: 4px; padding: 8px 10px; margin-bottom: 14px; font-size: 11px; color: #667085;">
+                  <em>MCP data synchronized (no active transitions).</em>
+                </div>
+              {% endif %}
+
+              <!-- Section 2: Active Working / Degraded Nodes (Shown only if active) -->
+              {% if (current_working_node is defined and current_working_node and current_working_node.name is defined and current_working_node.name | length > 0) or (degraded_nodes is defined and degraded_nodes | length > 0) %}
+              <div style="font-size: 11px; font-weight: 700; color: #101828; text-transform: uppercase; letter-spacing: 0.5px; margin: 10px 0 6px 0; padding-bottom: 3px; border-bottom: 1px solid #e4e7ec;">
+                Node Activity & Alerts
+              </div>
+              {% endif %}
+
+              {% if current_working_node is defined and current_working_node and current_working_node.name is defined and current_working_node.name | length > 0 %}
+                <div style="background-color: #fff8e1; border: 1px solid #ffe58f; border-left: 3px solid #9a6700; border-radius: 4px; padding: 7px 10px; margin-bottom: 8px; font-size: 11px;">
+                  <strong>Working Node:</strong> <code style="font-family: 'SFMono-Regular', Consolas, monospace; color: #101828;">{{ current_working_node.name }}</code> ({{ current_working_node.role | default('worker') }}) &bull; <span style="color: #9a6700; font-weight: 600;">{{ current_working_node.activity | default('Draining / Rebooting') }}</span>
+                </div>
+              {% endif %}
+
+              {% if degraded_nodes is defined and degraded_nodes | length > 0 %}
+                <div style="background-color: #fdecea; border: 1px solid #ffa39e; border-left: 3px solid #b42318; border-radius: 4px; padding: 7px 10px; margin-bottom: 8px; font-size: 11px;">
+                  <strong>Degraded Node(s):</strong>
+                  {% for dnode in degraded_nodes %}
+                    <span style="color: #b42318; font-weight: 600;">{{ dnode.name | default(dnode) }} ({{ dnode.reason | default('NotReady') }})</span>{{ ', ' if not loop.last else '' }}
+                  {% endfor %}
+                </div>
+              {% endif %}
+
+              <!-- Section 3: Cluster Version & Operators Summary -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; border: 1px solid #e4e7ec; border-radius: 4px; font-size: 11px; margin-top: 6px;">
+                <tr>
+                  <td style="padding: 6px 10px; background-color: #f8f9fb; border-bottom: 1px solid #e4e7ec; font-weight: 600; color: #344054; width: 120px;">
+                    ClusterVersion:
+                  </td>
+                  <td style="padding: 6px 10px; background-color: #ffffff; border-bottom: 1px solid #e4e7ec; color: #344054;">
+                    {{ cluster_version_status | default('Progressing towards target version') }}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 6px 10px; background-color: #f8f9fb; font-weight: 600; color: #344054;">
+                    ClusterOperators:
+                  </td>
+                  <td style="padding: 6px 10px; background-color: #ffffff; color: #344054;">
+                    {% if degraded_operators is defined and degraded_operators | length > 0 %}
+                      <span style="color: #b42318; font-weight: 600;">{{ (status_glyphs | default({})).fail | default('✖') }} Degraded: {{ degraded_operators | join(', ') }}</span>
+                    {% else %}
+                      <span style="color: #1a7f37; font-weight: 600;">{{ (status_glyphs | default({})).pass | default('✔') }} All operators healthy</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              </table>
+
+            </td>
+          </tr>
+
+          <!-- Footer Band -->
+          <tr>
+            <td style="background-color: #f8f9fb; padding: 8px 18px; border-top: 1px solid #e4e7ec; text-align: center; font-size: 11px; color: #667085;">
+              {{ report_footer | default('Generated by ARO Cluster Upgrade Automation') }} &bull; Run ID: <code style="font-family: 'SFMono-Regular', Consolas, monospace;">{{ run_id | default('N/A') }}</code>
+            </td>
+          </tr>
+
+        </table>
+
+      </td>
+    </tr>
+  </table>
+
+</body>
+</html>

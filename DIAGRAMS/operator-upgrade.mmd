@@ -1,0 +1,27 @@
+graph TD
+    classDef default fill:#f8f9fb,stroke:#e4e7ec,stroke-width:2px;
+    classDef step fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#101828;
+    classDef decision fill:#fff8e1,stroke:#d97706,stroke-width:2px,color:#101828,shape:diamond;
+    classDef action fill:#e6f4ea,stroke:#16a34a,stroke-width:2px,color:#101828;
+    classDef fail fill:#fdecea,stroke:#dc2626,stroke-width:2px,color:#101828;
+
+    A([Start Unit 20]) --> B[Compatibility Scan]:::step
+    B --> C[Find Upgradeable Operators]:::step
+    
+    C --> D{Pending InstallPlan?}:::decision
+    D -- Yes --> E[Approve InstallPlan]:::action
+    D -- No --> F{Upgrade Available?}:::decision
+    
+    F -- Yes --> E
+    F -- No --> G[Skip: Already Current]:::action
+    
+    E --> H[Wait for CSV Phase: Succeeded]:::step
+    
+    H --> I{Succeeded?}:::decision
+    I -- Yes --> J[Validate Final State]:::action
+    I -- No --> K[Timeout: Alert Operator]:::fail
+    
+    J --> L[Render HTML Report]:::step
+    K --> L
+    
+    L --> M([Finish])

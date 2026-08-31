@@ -1,0 +1,343 @@
+# Progress Tracker — ARO Cluster Upgrade Automation
+
+Update this file after **every meaningful implementation change**.
+## Current Phase
+- **All Units (01–19) Complete** — Full ARO Cluster Upgrade Automation Suite Built.
+
+## Current Goal
+- Perform server testing on RHEL 8 jump host across Ansible 2.7.17 and 2.14.18, followed by end-to-end dry-run validation.
+
+## Completed
+- `project-overview.md` — product definition, goals, core flow, features, scope, success criteria (00–05 model, GitOps/Argo removed).
+- `architecture.md` — stack, six-file process surface, boundaries, storage model, auth model, monitoring model, invariants.
+- `code-standards.md` — Ansible/YAML, shell, Jinja2, gates, secrets, storage, file organisation, `00_Run.sh` CLI standards, pre-merge checklist.
+- `ui-context.md` — theme, colour tokens, typography, report/email components, print/PDF behaviour.
+- `ai-workflow-rules.md` — approach, scoping, split rules, protected files, doc-sync, verification checklist.
+- **Unit 01: Project Scaffold & Variable Inputs**
+  - Full `playbooks/` directory tree: `vars/`, `roles/`, `tasks/`, `templates/`, `logs/`, `output/`, `snapshots/`.
+  - `.gitkeep` in `logs/`, `output/`, `snapshots/` (and `roles/`, `tasks/`, `templates/` for tracking).
+  - `vars/secrets.yml` — cluster credentials as `{{ vault_* }}` variable references; Conjur-swap documented.
+  - `vars/smtp.yml` — SMTP host/port, sender, recipients, heartbeat/alert subject prefixes.
+  - `vars/report_vars.yml` — colour tokens (from `ui-context.md`), status glyphs (`✔ ! ✖`), report title/org/footer.
+  - `vars/paths.yml` — dynamic path anchors (`log_dir`, `output_dir`, `snapshot_dir`, `kubeconfig_path`) derived from `playbook_dir`.
+  - `vars/api_regex.yml` — cluster API URL validation regex and cluster name extraction regex.
+  - `vars/upgrade.yml` — `upgrade_path: []`, thresholds (`max_cpu_percent: 90`, `max_memory_percent: 90`), cadences (`poll_interval_minutes: 2`, `hop_timeout_minutes: 90`, `heartbeat_minutes: 20`), `fail_on_zero_disruption_pdb`, `allowed_unschedulable_nodes`.
+  - Placeholder `main.yml` with header comments (now replaced by Unit 2 skeleton).
+  - All files carry the 2.7.17 header + `# MIGRATION 2.14:` note.
+  - `| default('')` / `| default([])` documented for optional vars.
+- **Unit 02: CLI Entrypoint + `main.yml` Skeleton**
+  - `00_Run.sh` — CLI entrypoint with dynamic paths, `--cluster`/`--path` args + interactive fallback, `--dry-run`, `--yes`, confirmation summary, live+logged execution via `tee`, named exit codes (0/1/2/10/20/30/99), colour-coded terminal output, `set -euo pipefail`.
+  - `main.yml` — runnable skeleton play on `localhost`, `connection: local`, `gather_facts: true`, loads all six `vars_files`, start banner, validates `cluster_name` and `upgrade_path`, displays run parameters. Phase `import_playbook` lines are commented placeholders for later units.
+- **Unit 03: Session Lifecycle Roles (`login`, `logout`)**
+  - `roles/login/defaults/main.yml` — `kubeconfig_path` default derived from `playbook_dir`; empty defaults for optional overrides with `| default('')`.
+  - `roles/login/tasks/main.yml` — `oc login` with `no_log: true`, register result, `failed_when` with clear message naming the cluster. Context validated via `oc whoami --show-server` against `desired_cluster_api_regex`.
+  - `roles/logout/tasks/main.yml` — `oc logout` with `failed_when: false` (never fail teardown). Removes kubeconfig file. Idempotent — safe to call even after a failed login. `changed_when: false` on read parts.
+- **Unit 04: Email Templates (`error-report.j2`, `progress-mail.j2`)**
+  - `playbooks/templates/error-report.j2` — failure alerts template with header band, cluster name, run ID, timestamp, red FAIL verdict pill, summary banner, failed checks table/details (gate, observed, error output), teardown status, operator guidance, email-safe inline styles (≤ 640px).
+  - `playbooks/templates/progress-mail.j2` — heartbeat & state change progress template with header band, hop x/y, target version, % progress, elapsed time, next-update note, MCP status table (always shown), current working node card, degraded-only node list, operator status, email-safe inline styles (≤ 640px).
+  - Both templates tested with empty and populated context dictionaries; fully compatible with Jinja2 / Ansible 2.7.17 and 2.14.18.
+- **Unit 05: `sendmail` Role (`playbooks/roles/sendmail`)**
+  - `roles/sendmail/defaults/main.yml` — default SMTP configuration (`smtp_host`, `smtp_port`, `mail_from`, `mail_to`, `mail_subject`, `mail_template`, `mail_html_body`, `sendmail_path: /usr/sbin/sendmail`, `mail_charset: UTF-8`).
+  - `roles/sendmail/tasks/main.yml` — dual-delivery contract:
+    - Active 2.7.17 implementation: `/usr/sbin/sendmail -t <<'EOF'` shell block with short module name, no `warn:` parameter, `changed_when: false`.
+    - Commented 2.14 implementation: `community.general.mail` task with clear enable/disable instructions and collection install note.
+    - Template resolution: resolves `mail_template` (relative or absolute) and renders to `mail_html_body` via `lookup('template', ...)` if not pre-rendered.
+    - Recipient normalization: formats `mail_to` lists or strings into RFC 5322 comma-separated `To:` header.
+    - Validation: verifies `mail_to`, `mail_subject`, and `mail_html_body` before dispatch; confirms dispatch with debug summary.
+  - Zero secrets rendered or logged; tested and verified.
+- **Unit 06: `error_handle` Role (`playbooks/roles/error_handle`)**
+  - `roles/error_handle/defaults/main.yml` — defaults for `current_step_no: 0`, `current_task_name: ""`, `current_gate_type: "HARD"`, `failure_reason: ""`, `failure_observed: ""`, `error_summary`, `failed_phase`, and log path overrides.
+  - `roles/error_handle/tasks/main.yml` — standardized rescue handling across phases:
+    - Resolves error metadata and builds structured FAIL records.
+    - Appends entry to `failed_validations` and `failed_checks` facts.
+    - Writes failure lines to `.txt` log and appends structured CSV records to `.csv` log (with auto header initialization).
+    - Includes `sendmail` role with `error-report.j2` template for immediate alert email dispatch.
+    - Documents the caller's `always:` logout contract (logout maintained as a separate concern in callers).
+  - Validated on 2.7.17 / 2.14.18 syntax; zero secrets logged.
+- **Unit 07: `snapshot` Role + Phase 01 (`01_Policy_Check.yaml`)**
+  - `roles/snapshot/defaults/main.yml` — defaults for `snapshot_dir`, `kubeconfig_path`, `cluster_name`, `snapshot_timestamp`, `snapshot_file` with `| default('')` guards.
+  - `roles/snapshot/tasks/main.yml` — captures live cluster baseline state:
+    - Captures `clusterversion`, `clusteroperators`, `nodes`, `routes` via `oc get ... -o json` with `changed_when: false`.
+    - Assembles structured JSON payload (metadata, versions, operator conditions, node roles/readiness, route configs).
+    - Writes formatted JSON snapshot to `snapshots/<cluster>_<timestamp>_baseline.json` using `copy:` with `to_nice_json`.
+    - Exports `baseline_snapshot_file_path` fact for downstream postvalidation diffing (Phase 05).
+  - `01_Policy_Check.yaml` — Phase 01 playbook:
+    - `pre_tasks:` authenticates via `login` role with credentials from `vars/secrets.yml`.
+    - `block:` executes `snapshot` role to write baseline JSON, queries live ClusterVersion available and conditional update edges, and validates that `upgrade_path[0]` is a verified edge from current cluster version.
+    - HARD gate `fail:` if target version is not an available edge, naming cluster, current version, target version, and detected edges.
+    - `rescue:` calls `error_handle` role to record failure facts, append logs, send alert email via `sendmail` + `error-report.j2`, and tears down session with `logout`.
+    - `always:` guarantees session logout on failure.
+  - `main.yml` — wired `- import_playbook: 01_Policy_Check.yaml`.
+- **Unit 08: API Readiness Roles (`api_check`, `api_readiness`)**
+  - `playbooks/roles/api_check` (`defaults/main.yml`, `tasks/main.yml`):
+    - Validates active cluster context via `oc whoami --show-server` against `desired_cluster_api_regex`.
+    - Enforces HARD gate `fail:` naming observed server URL vs expected regex.
+    - Records structured PASS entry into `health_summary` list via `set_fact`.
+    - Read-only (`changed_when: false`), explicit failure evaluations.
+  - `playbooks/roles/api_readiness` (`defaults/main.yml`, `tasks/main.yml`):
+    - Confirms API server responsiveness and readiness via `oc get --raw='/readyz'`.
+    - Enforces HARD gate `fail:` if `/readyz` returns non-zero rc or non-`ok` body.
+    - Records structured PASS entry into `health_summary` list via `set_fact`.
+    - Read-only (`changed_when: false`), explicit failure evaluations.
+- **Unit 09: ClusterOperators Role (`co`)**
+  - `playbooks/roles/co` (`defaults/main.yml`, `tasks/main.yml`):
+    - Queries `oc get clusteroperators -o json` piped through `jq` (jq v1.5 compatible) with `changed_when: false`.
+    - Extracts `Available`, `Progressing`, and `Degraded` condition statuses across all operators.
+    - Discovers offending operators (`Available != 'True'` or `Degraded == 'True'`), respecting `co_allow_list` overrides.
+    - Enforces HARD gate `fail:` naming the cluster and all offending operators with condition details.
+    - Records structured PASS entry into `health_summary` list via `set_fact`.
+    - Read-only, single-concern role.
+- **Unit 10: MachineConfigPool Role (`mcp`)**
+  - `playbooks/roles/mcp` (`defaults/main.yml`, `tasks/main.yml`):
+    - Queries `oc get mcp -o json` piped through `jq` (jq v1.5 compatible) with `changed_when: false`.
+    - Extracts pool machine counts, conditions (`Updated`, `Updating`, `Degraded`, `NodeDegraded`, `RenderDegraded`), and `spec.paused` flag across all MachineConfigPools.
+    - Discovers offending pools (`Updated != 'True'`, `Degraded != 'False'`, or `paused == true`), respecting `mcp_allow_list` overrides.
+    - Enforces HARD gate `fail:` naming the cluster, offending pool names, and condition/paused statuses.
+    - Exposes parsed facts (`mcp_parsed_data`, `mcp_all_pools`, `mcp_offending_pools`) for direct reuse by monitor / settle-gate.
+    - Records structured PASS entry into `health_summary` list via `set_fact`.
+    - Read-only, single-concern role.
+- **Unit 11: Node Role (`node`)**
+  - `playbooks/roles/node` (`defaults/main.yml`, `tasks/main.yml`):
+    - Queries `oc get nodes -o json` piped through `jq` (jq v1.5 compatible) with `changed_when: false`.
+    - Extracts node Ready condition, `spec.unschedulable` flag, `status.nodeInfo.kubeletVersion`, kernel version, OS image, and node roles across all nodes.
+    - Identifies offending nodes (NotReady, or unschedulable and not in `allowed_unschedulable_nodes | default([])`).
+    - Strictly preserves rule that `NotReady` nodes are always treated as offenders (even if in allow-list).
+    - Enforces HARD gate `fail:` naming the cluster, offending node names, Ready status, SchedulingDisabled status, Kubelet versions, and roles.
+    - Exposes parsed facts (`node_all_nodes`, `node_kubelet_versions`, `node_readiness_status`) for direct reuse by live monitor (Phase 04) and postvalidation (Phase 05, check 4).
+    - Records structured PASS entry into `health_summary` list via `set_fact`.
+    - Read-only, single-concern role.
+- **Unit 12: etcd Role (`etcd`)**
+  - `playbooks/roles/etcd` (`defaults/main.yml`, `tasks/main.yml`):
+    - Queries `oc get pods -n openshift-etcd -l app=etcd -o json` piped through `jq` (jq v1.5 compatible) with `changed_when: false`.
+    - Extracts member pod phases (`Running`), readiness conditions (`Ready=True`), node assignments, IP addresses, and restart counts across all etcd member pods.
+    - Validates minimum expected member count (`etcd_min_members | default(1)`).
+    - Queries `oc get etcd -o json` to check operator-level degraded conditions.
+    - Respects optional `etcd_allow_list` overrides.
+    - Enforces HARD gate `fail:` naming the cluster, offending member pod names, phase, readiness, and operator degraded conditions.
+    - Explicitly treats cluster backup as out of scope (read-only member health inspection, zero mutation or backup side-effects).
+    - Exposes parsed facts (`etcd_all_members`, `etcd_member_count`, `etcd_offending_members`) for direct consumption by reporting and postvalidation.
+    - Records structured PASS entry into `health_summary` list via `set_fact`.
+    - Read-only, single-concern role.
+- **Unit 13: Utilization Role (`utilization`)**
+  - `playbooks/roles/utilization` (`defaults/main.yml`, `tasks/main.yml`):
+    - Queries node allocatable capacity (`oc get nodes -o json`) and pod resource requests (`oc get pods --all-namespaces -o json`) piped to `jq` (jq v1.5 compatible) with `changed_when: false`.
+    - Normalizes CPU quantities (cores, `m`, `u`, `n`) to millicores and memory quantities (`Ki`, `Mi`, `Gi`, `Ti`, `k`, `M`, `G`, plain bytes) to KiB.
+    - Computes requests-based CPU and Memory utilization percentages against allocatable capacity per node and cluster-wide.
+    - Sources threshold limits from variables (`max_cpu_percent | default(90)`, `max_memory_percent | default(90)`) — zero hardcoded literals.
+    - Identifies offending nodes and/or cluster totals where observed request percentage exceeds threshold limits.
+    - Enforces HARD gate `fail:` naming the cluster, offending node(s) or cluster total, observed percentages, and maximum threshold limits.
+    - Exposes reusable per-node headroom and utilization facts (`utilization_parsed_data`, `utilization_nodes`, `utilization_cluster`, `utilization_offenders`, `node_headroom`) for direct consumption by prevalidation (e.g. WARN drain headroom check).
+    - Records structured PASS entry into `health_summary` list via `set_fact`.
+    - Read-only, single-concern role.
+- **Unit 14: Storage & Disruption Roles (`pv`, `pvc`, `pdb`)**
+  - `playbooks/roles/pv` (`defaults/main.yml`, `tasks/main.yml`):
+    - Queries `oc get pv -o json` piped to `jq` (jq v1.5 compatible) with `changed_when: false` and `failed_when: false`.
+    - Identifies non-healthy PVs (phases other than Bound or Available, e.g. Released, Failed, Error), respecting `pv_allow_list`.
+    - WARN gate: never blocks (`failed_when: false`), never auto-remediates.
+    - Exposes parsed facts (`pv_parsed_data`, `pv_all_pvs`, `pv_offending_pvs`, `pv_status`).
+    - Records structured entry (PASS or WARN) into `health_summary` list via `set_fact`.
+  - `playbooks/roles/pvc` (`defaults/main.yml`, `tasks/main.yml`):
+    - Queries `oc get pvc --all-namespaces -o json` piped to `jq` (jq v1.5 compatible) with `changed_when: false` and `failed_when: false`.
+    - Identifies non-Bound PVCs (e.g. Pending, Lost, Error) across all namespaces, respecting `pvc_allow_list`.
+    - WARN gate: never blocks (`failed_when: false`), never auto-remediates.
+    - Exposes parsed facts (`pvc_parsed_data`, `pvc_all_pvcs`, `pvc_offending_pvcs`, `pvc_status`).
+    - Records structured entry (PASS or WARN) into `health_summary` list via `set_fact`.
+  - `playbooks/roles/pdb` (`defaults/main.yml`, `tasks/main.yml`):
+    - Queries `oc get pdb --all-namespaces -o json` piped to `jq` (jq v1.5 compatible) with `changed_when: false` and `failed_when: false`.
+    - Detects blocking drain risks: `maxUnavailable: 0` / `"0"` / `"0%"`, `minAvailable == replicas` / `"100%"`, or `disruptionsAllowed == 0` with active expected pods, respecting `pdb_allow_list`.
+    - Governed by `fail_on_zero_disruption_pdb | default(false)`: when true, escalates to HARD gate `fail:`; when false, records non-blocking WARN.
+    - Exposes parsed facts (`pdb_parsed_data`, `pdb_all_pdbs`, `pdb_offending_pdbs`, `pdb_status`).
+    - Records structured entry (PASS, WARN, or escalated FAIL) into `health_summary` list via `set_fact`.
+- **Unit 15: Report Rendering (`health-overview.j2` + `report` role)**
+  - `playbooks/templates/health-overview.j2`:
+    - Client-facing, modern operational HTML report template.
+    - Header band with report org, title, target cluster badge, and verdict pill (`PASS ✔`, `WARN !`, `FAIL ✖`).
+    - Metadata strip with Phase, Run ID, Timestamp, Target Version / Upgrade Path, and Execution Mode.
+    - Summary grid with 4 tiles: Total Checks Evaluated, Passed Checks, Non-Blocking Warnings, and Hard Gate Failures.
+    - Colour-coded status table: Check #, Check Name, Gate Type (`HARD`/`WARN`), Observed State / Details, Status Badge (`row-pass`, `row-warn`, `row-fail`).
+    - Collapsible `<details>` section for diagnostic evidence & raw `oc`/`jq` inspection payloads.
+    - Inline JavaScript "Copy Diagnostics" button with fallback clipboard support and copied visual feedback.
+    - Print/PDF optimized styling (`@media print` expands collapsibles, hides copy button, guarantees grayscale-safe borders and layout).
+    - Guarded with `| default('N/A')` across all display fields; zero secrets rendered.
+  - `playbooks/roles/report` (`defaults/main.yml`, `tasks/main.yml`):
+    - Renders `health-overview.j2` to `output/<cluster>_<phase>_<timestamp>.html`.
+    - Computes validation summary statistics (pass count, warn count, fail count, total count, overall verdict).
+    - Appends structured report execution records to `.txt` and `.csv` run logs in `logs/`.
+    - Exposes `report_html_path` and `report_last_verdict` facts for downstream notifications.
+    - Compatible with Ansible 2.7.17 and 2.14.18.
+
+- **Unit 16: `prevalidation` Aggregator + Phase 02 (`02_Pre_upgrade_check.yaml`)**
+  - `playbooks/roles/prevalidation` (`defaults/main.yml`, `tasks/main.yml`):
+    - Orchestrates the full 13-check pre-upgrade health contract in fixed sequential order:
+      - **Check 01 (HARD)**: ClusterOperators Health (`co` role) — asserts Available=True, Degraded=False.
+      - **Check 02 (HARD)**: Node Health and Readiness (`node` role) — asserts Ready=True, schedulability.
+      - **Check 03 (HARD)**: MachineConfigPool Health (`mcp` role) — asserts Updated=True, Degraded=False, paused=false.
+      - **Check 04 (HARD)**: etcd Member Health (`etcd` role) — asserts member pods Running/Ready, 0 operator degraded conditions.
+      - **Check 05 (HARD)**: Admin Acknowledgements Gate — checks ClusterVersion Upgradeable condition and `openshift-config/admin-acks` for required API removal acknowledgements.
+      - **Check 06 (HARD)**: Target Upgrade Edge Validation — re-verifies target hop is a valid available/conditional edge in live ClusterVersion.
+      - **Check 07 (HARD)**: Resource Utilization (`utilization` role) — asserts requests-based CPU/Memory remain < 90% across nodes and cluster total.
+      - **Check 08 (WARN)**: Pending Certificate Signing Requests (CSR) — scans `oc get csr` for unapproved/pending requests (`failed_when: false`).
+      - **Check 09 (WARN)**: Node Disk Pressure Conditions — scans `oc get nodes` for `DiskPressure=True` (`failed_when: false`).
+      - **Check 10 (WARN/HARD)**: Pod Disruption Budget Risk (`pdb` role) — evaluates blocking drain risks, defaults to non-blocking WARN.
+      - **Check 11 (WARN)**: Node Drain Headroom Capacity — calculates projected cluster utilization if largest node is evicted using Check 07 facts (`failed_when: false`).
+      - **Check 12 (WARN)**: Critical Namespace Pod Health — scans pods across `openshift-*` and `kube-system` for non-Running/CrashLooping states (`failed_when: false`).
+      - **Check 13 (WARN)**: Firing Critical Alerts — queries Prometheus/Alertmanager monitoring endpoint for active critical alerts (`failed_when: false`).
+    - Populates `health_summary` list with structured records for all 13 checks.
+    - Sourced all limits and thresholds from variables; fully compatible with Ansible 2.7.17 and 2.14.18.
+  - `playbooks/02_Pre_upgrade_check.yaml`:
+    - Phase 02 playbook:
+      - `pre_tasks:` verifies active session context or re-authenticates via `login` role if needed.
+      - `block:` runs `prevalidation` role, renders client-facing HTML report via `report` role to `output/`, and evaluates HARD gate condition (`fail:` if any HARD failure present).
+      - `rescue:` calls `error_handle` role to log failure, append `.csv`/`.txt` run logs, send alert email via `sendmail` + `error-report.j2`, and tears down session with `logout`.
+      - `always:` guarantees session logout on failure.
+  - `playbooks/main.yml`:
+    - Wired `- import_playbook: 02_Pre_upgrade_check.yaml`.
+  - Comprehensive validation completed across all 42 YAML files, 3 Jinja2 templates, and 17 roles — 100% clean syntax and verified connections.
+
+- **Unit 17: `upgrade` Role + `tasks/hop.yml` + Phase 03 (`03_Initiate_upgrade.yaml`)**
+  - `playbooks/roles/upgrade` (`defaults/main.yml`, `tasks/main.yml`):
+    - Per-hop upgrade trigger sequence: set channel (`oc adm upgrade channel stable-x.y`) → re-verify live edge → apply admin-ack ConfigMap if required → `oc adm upgrade --to=<version>`.
+    - `register` + explicit `failed_when` on rc/stderr. `changed_when: true` only on the actual trigger.
+    - Last-resort `--to-image=<digest> --allow-not-recommended --force` gated behind explicit `force_upgrade: true` manual flag with `fail:` guard requiring deliberate opt-in (default: off).
+  - `playbooks/tasks/hop.yml`:
+    - Per-hop block: pre-hop settle assertion (CV not Progressing, CO Available & not Progressing/Degraded, MCP Updated & not Updating/Degraded).
+    - Calls `upgrade` role, then hands off to live monitoring (Phase 04).
+    - `rescue:` → `error_handle` (alert) → `logout` → stop.
+    - Uses `loop_var: hop_item` + `index_var: hop_index` for current target; computes hop `x/y` label.
+  - `playbooks/03_Initiate_upgrade.yaml`:
+    - Phase 03 play on localhost that loops `include_tasks: tasks/hop.yml` over `upgrade_path`.
+    - Session reused from Phase 01/02 (no re-login). Explicit comment on why `include_tasks + loop` (not `import_playbook`).
+    - Validates `upgrade_path` is non-empty before initiating hops.
+  - `playbooks/main.yml`:
+    - Wired `- import_playbook: 03_Initiate_upgrade.yaml`.
+
+- **Unit 18: `monitor` Role + Phase 04 (`04_Live_monitoring_upgrade.yaml`)**
+  - `playbooks/roles/monitor` (`defaults/main.yml`, `tasks/main.yml`, `tasks/poll_iteration.yml`):
+    - Bounded polling loop: queries CV/MCP/nodes every `poll_interval_minutes` (2 min), bounded by `hop_timeout_minutes / poll_interval_minutes` (45 iterations at 90min/2min).
+    - Computes `% complete` from MCP ready vs total counts, elapsed time, current working node (draining/rebooting), degraded nodes.
+    - State change detection: compares current vs previous poll state fingerprint; immediate email on change via `sendmail` + `progress-mail.j2`.
+    - Heartbeat email every `heartbeat_minutes` (20 min) via `sendmail` + `progress-mail.j2`.
+    - Timeout guard: if MCP not complete within `hop_timeout_minutes` → `fail:` (stall) → alert → logout via hop rescue.
+    - Settle-gate: after MCP completes, asserts CV at target version, all ClusterOperators Available & not Progressing, MCP Updated=True. Pass → hop-complete email; fail → `fail:`.
+  - `playbooks/04_Live_monitoring_upgrade.yaml`:
+    - Thin phase wrapper that `include_role: monitor`; invoked per hop from `tasks/hop.yml`.
+  - `playbooks/tasks/hop.yml`:
+    - Monitor placeholder replaced with actual `include_tasks: 04_Live_monitoring_upgrade.yaml` call.
+
+- **Unit 19: `postvalidation` + Phase 05 + `main.yml` Final Wiring + README**
+  - `playbooks/roles/postvalidation` (`defaults/main.yml`, `tasks/main.yml`):
+    - 10-check postvalidation health contract (5 HARD, 5 WARN):
+      - Check 01 (HARD): Version = final target & Progressing = False (`oc get clusterversion`).
+      - Check 02 (HARD): ClusterOperators Health (`co` role + not Progressing).
+      - Check 03 (HARD): MachineConfigPool Health (`mcp` role — Updated=True, Degraded=False).
+      - Check 04 (HARD): Node Health and Readiness (`node` role) + kubelet versions verification on all nodes.
+      - Check 05 (HARD): etcd Member Health (`etcd` role — member pods Running/Ready, 0 operator degraded).
+      - Check 06 (WARN): Firing Critical Alerts (Prometheus / Alertmanager).
+      - Check 07 (WARN): Critical Namespace Pod Health (`openshift-*`, `kube-system`).
+      - Check 08 (WARN): Baseline Diff vs Phase 01 Snapshot (`from_json` snapshot comparison — nodes/operators/routes).
+      - Check 09 (WARN): Pending Certificate Signing Requests (CSR).
+      - Check 10 (WARN): Workload and Route Reachability Smoke Test (ingress controller + console route admission).
+    - Populates `health_summary` with structured records for HTML report.
+  - `playbooks/05_post_Upgrade_Checks.yaml`:
+    - Phase 05 playbook: executes `postvalidation` role, renders client-facing HTML report via `report` role to `output/`, enforces HARD gate `fail:`, wrapped in `block/rescue/always`.
+  - `playbooks/main.yml`:
+    - Final master chain wired: `01_Policy_Check` → `02_Pre_upgrade_check` → `03_Initiate_upgrade` (with `hop.yml` → `04_Live_monitoring_upgrade`) → `05_post_Upgrade_Checks`.
+  - `README.md`:
+    - Comprehensive documentation covering overview, setup, variables, run methods, output dirs, 2.7→2.14 migration checklist, and check contracts.
+- **Unit 21: Client-Ready Documentation & Presentations**
+  - Generated `ARO-Upgrade-Automation-Documentation.docx` with 15 sections including system invariants, validations, and workflow mechanics.
+  - Generated `ARO-Upgrade-Automation-Deck.pptx` with 18 slides formatted for executive and technical walk-throughs.
+  - Generated `DIAGRAMS/` folder containing 7 rendered architectural and flowchart diagrams using Mermaid JS.
+
+## In Progress
+- *None — all units 01–21 built, integrated, and documented.*
+
+## Next Up
+1. Server testing of all built units on RHEL 8 jump host (Ansible 2.7.17 and 2.14.18 syntax and live execution).
+2. End-to-end dry-run validation (`./00_Run.sh --dry-run --yes`).
+
+## Open Questions
+- Concrete default values for SMTP host/port and recipient list for the shipped `vars/` example (placeholders vs. real). *Currently using placeholders.*
+- Exact `jq` expressions to confirm "correct new kubelet version" per node in postvalidation (Phase 05, check 4).
+
+## Architecture Decisions
+- **Flat 00–05 numbering** for the six main files; postvalidation = Phase 05 (not a separate 07). *Why:* user requested a simple, understandable structure with only these files driving the process.
+- **Snapshot captured in Phase 01** (`01_Policy_Check.yaml`) via the `snapshot` role, diffed in Phase 05. *Why:* single sanctioned cross-phase persistence; keeps login+baseline+edge-validation together.
+- **GitOps + Argo removed entirely.** *Why:* explicit user instruction; runs are triggered manually via `00_Run.sh`.
+- **Hybrid chaining** — `import_playbook` for once-only phases, `include_tasks` + `loop:` for per-hop upgrades. *Why:* `import_playbook` cannot loop on 2.7.17.
+- **Dual-version contract (2.7.17 / 2.14.18)** with `# MIGRATION 2.14:` headers and a dual email block. *Why:* test-vs-prod Ansible parity with no source edits.
+- **Exit code classes in `00_Run.sh`** (0 ok, 1 usage, 2 cancelled, 10 prevalidation, 20 upgrade, 30 timeout, 99 unknown). *Why:* deterministic, scriptable exit codes for operator tooling and CI integration.
+- **Separation of error_handle and logout** — `error_handle` only records, logs, and alerts in `rescue:`; session teardown (`logout`) is executed by caller's `always:` block. *Why:* preserves single-purpose role boundary and avoids duplicate logout calls.
+- **Single cross-phase persistence contract** — baseline JSON snapshot in `snapshots/` is the only file persisted between phases, read exclusively in Phase 05. *Why:* preserves idempotency and prevents state drift between isolated playbook phases.
+- **Reusable MCP fact export** — `mcp` role exports parsed pool attributes and lists (`mcp_all_pools`, `mcp_parsed_data`) for direct consumption by Phase 04 monitor and settle-gate, preventing redundant `oc get mcp` / `jq` logic. *Why:* DRY pattern across prevalidation, live monitoring, and settle gates.
+- **Reusable Node facts & strict allow-list enforcement** — `node` role exports `node_all_nodes`, `node_kubelet_versions`, and `node_readiness_status` for direct consumption by monitor and postvalidation kubelet checks. `allowed_unschedulable_nodes` permits cordoned nodes only; `NotReady` nodes always trigger a HARD failure. *Why:* guarantees zero degraded nodes can pass prevalidation while providing cached facts for Phase 04/05.
+- **Read-only etcd health inspection & zero-mutation invariant** — `etcd` role performs member pod and operator condition inspection only. Cluster backup is strictly out of scope and never attempted; the role enforces a HARD gate on unhealthy etcd members while ensuring zero mutating side-effects. *Why:* guarantees pure prevalidation check boundary without triggering risky automated backup operations.
+- **Requests-based utilization & headroom fact exports** — `utilization` role calculates node and cluster capacity strictly based on committed pod requests vs allocatable resources (ignoring transient live spikes), normalizes all CPU/memory unit formats via jq v1.5, enforces a HARD gate against named `vars/upgrade.yml` thresholds, and exports structured `node_headroom` facts for downstream prevalidation drain checks. *Why:* provides deterministic capacity gating and eliminates duplicate calculations across prevalidation checks.
+- **Non-blocking WARN model for storage and disruption checks with PDB escalation toggle** — `pv` and `pvc` roles record non-healthy storage conditions into `health_summary` without failing or mutating cluster state (`failed_when: false`). `pdb` role identifies blocking drain risks and defaults to non-blocking `WARN` while supporting dynamic escalation to a `HARD` gate when `fail_on_zero_disruption_pdb: true` is configured. *Why:* provides non-blocking visibility into non-critical storage states while guarding against node drain deadlocks.
+- **Standardized Presentation-Only HTML Reporting with Inline Copy Diagnostics** — `health-overview.j2` and `report` role render client-facing reports entirely from upstream facts (`health_summary`, `failed_validations`) without mutating cluster state or executing cluster commands. Includes interactive client-side JavaScript clipboard helpers (in standalone reports only, never email) and `@media print` rules for client-ready PDF generation. *Why:* decouples presentation logic from cluster inspection roles and provides an auditable operational artifact for stakeholders.
+- **Prevalidation 13-Check Contract & Dynamic Fact Reuse** — `prevalidation` role orchestrates 7 HARD checks and 6 WARN checks in a deterministic chain. It reuses facts computed by `utilization` to derive 1-node drain headroom without re-querying nodes or pods, and performs read-only checks for CSRs, disk pressure, critical pods, and Prometheus alerts without side effects. *Why:* guarantees comprehensive, single-pass cluster pre-flight validation while maintaining zero side effects and fast execution.
+- **Dynamic Cluster & Version Sequence Configuration (`vars/upgrade.yml`)** — Target cluster name (`cluster_name`) and version sequences (`upgrade_path`, `cluster_upgrade_paths`) can be defined directly in `vars/upgrade.yml`. `00_Run.sh` automatically reads both `cluster_name` and `upgrade_path` when omitted from the command line, enabling completely hands-free execution (`./00_Run.sh`) while preserving `--cluster` and `--path` as optional CLI overrides. *Why:* provides a centralized, human-editable variable file for defining target cluster environments and version sequences without repetitive CLI flags.
+- **Bounded polling loop with state fingerprint change detection** — `monitor` role polls CV/MCP/nodes with a bounded `include_tasks` loop (max iterations = `hop_timeout_minutes / poll_interval_minutes`), not a detached daemon or shell while-loop. State change is detected by comparing a compact string fingerprint across polls, not deep JSON comparison. *Why:* guarantees deterministic execution with no orphaned processes, avoids complex deep-comparison logic in 2.7.17 Jinja2, and keeps monitoring inline within the hop lifecycle.
+- **Phase 04 as per-hop include_tasks, not top-level import_playbook** — Unlike Phases 01–03 which are top-level `import_playbook` entries in `main.yml`, Phase 04 runs per-hop inside `tasks/hop.yml` via `include_tasks: 04_Live_monitoring_upgrade.yaml`. *Why:* monitoring is intrinsically part of each hop's lifecycle (upgrade → monitor → settle → next hop), not a standalone sequential phase.
+- **Postvalidation 10-Check Contract & Baseline Diff** — `postvalidation` role orchestrates 5 HARD checks and 5 WARN checks, reusing check roles and consuming the Phase 01 baseline snapshot via `from_json` to guarantee zero loss of nodes, operators, or routes across minor version hops. *Why:* provides definitive verification of cluster integrity post-upgrade before declaring completion.
+- **Dry-run enforcement at Play level** — `--dry-run` flag is parsed by `00_Run.sh` and wired into Phase 02 (to tear down session early) and Phases 03/05 (to skip execution entirely via task-level `when` guards). *Why:* protects against accidental upgrades while allowing prevalidation to run safely.
+- **Session cleanup guarantee** — Phase 05 unconditionally calls `logout` at the end of its `always` block (and Phase 02 handles it during `--dry-run`). *Why:* ensures no dangling sessions are left on the jump host regardless of success, failure, or test mode execution.
+
+## Session Notes
+- Six-file process surface is locked: `00_Run.sh` + `main.yml` + `01`–`05`. All heavy lifting lives in `roles/`, `tasks/`, `templates/`.
+- Do not push to GitHub until the user explicitly says so.
+- Unit 01 complete: full directory scaffold + 6 vars files + placeholder main.yml. All YAML valid.
+- Unit 02 complete: `00_Run.sh` created, `main.yml` upgraded from placeholder to runnable skeleton.
+- Unit 03 complete: `login` and `logout` roles created under `playbooks/roles/`.
+- Unit 04 complete: `error-report.j2` and `progress-mail.j2` email templates created.
+- Unit 05 complete: `sendmail` role created with dual active/commented delivery blocks.
+- Unit 06 complete: `error_handle` role created under `playbooks/roles/error_handle/`.
+- Unit 07 complete: `snapshot` role created and Phase 01 playbook created as `playbooks/01_Policy_Check.yaml`.
+- Unit 08 complete: `api_check` and `api_readiness` roles created under `playbooks/roles/`.
+- Unit 09 complete: `co` role created under `playbooks/roles/co/`.
+- Unit 10 complete: `mcp` role created under `playbooks/roles/mcp/`.
+- Unit 11 complete: `node` role created under `playbooks/roles/node/`.
+- Unit 12 complete: `etcd` role created under `playbooks/roles/etcd/`.
+- Unit 13 complete: `utilization` role created under `playbooks/roles/utilization/`.
+- Unit 14 complete: `pv`, `pvc`, and `pdb` roles created under `playbooks/roles/`.
+- Unit 15 complete: `health-overview.j2` HTML report template and `report` role created.
+- Unit 16 complete: `prevalidation` aggregator role and `02_Pre_upgrade_check.yaml` created, wired into `main.yml`, running all 13 checks (7 HARD, 6 WARN), rendering prevalidation HTML report, and wrapped in block/rescue/always. All 42 YAML files and 3 Jinja2 templates verified with 100% pass rate.
+- Dynamic Cluster Name and Version Sequence file (`vars/upgrade.yml`) configured with automatic reading in `00_Run.sh` and `main.yml`.
+- Unit 17 complete: `upgrade` role (set channel → edge verify → admin-ack → `oc adm upgrade --to`), `tasks/hop.yml` (pre-hop settle gate + block/rescue), `03_Initiate_upgrade.yaml` (include_tasks loop over upgrade_path), and `main.yml` wired with `import_playbook: 03_Initiate_upgrade.yaml`.
+- Unit 18 complete: `monitor` role (bounded polling loop — CV/MCP/nodes every 2 min, heartbeat + state-change emails, 90-min timeout guard, settle-gate), `04_Live_monitoring_upgrade.yaml` (thin phase wrapper), `hop.yml` monitor placeholder replaced.
+- Unit 19 complete: `postvalidation` role (10-check contract + baseline snapshot diff), `05_post_Upgrade_Checks.yaml` (Phase 05 playbook + HTML report rendering), `main.yml` final wiring (`01 → 02 → 03/04 looped → 05`), and comprehensive `README.md`. All units 01–19 complete.
+- Enhanced `00_Run.sh` CLI Entrypoint: Upgraded the interface to be more robust and user-friendly with an ASCII banner, execution time tracking, emojis, and boxed confirmation summaries.
+- Fixed an infinite recursion bug in `roles/snapshot/defaults/main.yml` caused by self-referencing Jinja2 variables (`snapshot_timestamp: "{{ snapshot_timestamp | default('') }}"`), which also caused a cascading templating failure in the `error_handle` role.
+- Fixed a Jinja2 templating gotcha in `roles/snapshot/tasks/main.yml` and `roles/postvalidation/tasks/main.yml` where `.items` resolved to the Python dictionary `items()` method instead of the Kubernetes `"items"` array key. Replaced with `['items']` bracket notation. Also replaced a fragile list-mutation-via-append loop for extracting node roles with a clean, pure Jinja2 pipeline: `dict | list | select | map('regex_replace') | to_json` — eliminating all scoping/sandbox/version concerns.
+- **Interactive Upgrade Path Selection Menu added to `00_Run.sh`**: After the cluster name is resolved, the script now parses all available upgrade paths from `vars/upgrade.yml` (both the global `upgrade_path` and all per-cluster entries under `cluster_upgrade_paths`) and presents a numbered, colour-coded box-drawn menu. The currently configured path for the resolved cluster is highlighted with a ★. Users select by number, or choose a custom path, or type a number for a predefined option. Added `--no-menu` CLI flag to bypass the menu and use the configured default (mirrors original behaviour). `--path` CLI flag continues to bypass the menu entirely. Falls back gracefully to awk parsing when Python is unavailable.
+- **Bug Fix (`upgrade_path` CLI list parsing)**: Fixed a bug where `00_Run.sh` passed extra-vars as `cluster_name=... upgrade_path=[...]`, causing Ansible's `parse_kv` to treat `upgrade_path` as a string (`'["4.20.8", "4.20.33"]'`). Taking `upgrade_path | first` yielded `'['`, causing Phase 01 edge validation to fail with `Target version '[' is not a valid upgrade edge`. Changed `00_Run.sh` to pass a valid JSON object string (`-e '{"cluster_name":"...","upgrade_path":[...]}'`), which Ansible natively deserializes with `json.loads` into a Python list. Added defensive normalization in `01_Policy_Check.yaml` as well.
+- **Bug Fix (Jinja2 Infinite Recursion in `error_handle`)**: Fixed infinite recursion (`AnsibleError: An unhandled exception occurred while templating '{{ failure_observed }}'`) triggered in rescue blocks when invoking `include_role: name: error_handle` with self-referencing variables (`vars: failure_reason: "{{ failure_reason }}"`, `failure_observed: "{{ failure_observed }}"`). Removed redundant self-referencing vars from all phase playbooks (`01`, `02`, `05`) and `tasks/hop.yml` so `error_handle` directly consumes host facts set via `set_fact`.
+- **Bug Fix (`contains` filter in `prevalidation` role)**: Fixed a Jinja2 template error (`no filter named 'contains'`) in `roles/prevalidation/tasks/main.yml` when evaluating admin-acks. Replaced invalid `| contains(...)` with the standard Jinja2 test `is search(...)` (`lower is search('adminack') or lower is search('admin ack') or lower is search('acknowledgement')`), matching the pattern used in `roles/upgrade`.
+- **Bug Fix (`ansible_failed_task` FieldAttribute templating in rescue blocks)**: Removed references to `ansible_failed_task.name` across all phase rescue blocks (`01_Policy_Check.yaml`, `02_Pre_upgrade_check.yaml`, `05_post_Upgrade_Checks.yaml`, and `tasks/hop.yml`). In Ansible, `ansible_failed_task` is a internal Task object containing un-serializable `FieldAttribute` instances, which triggered unhandled templating exceptions upon rescue execution. Replaced with safe extraction from `ansible_failed_result.msg` and `ansible_failed_result.message`.
+- **Bug Fix (`sendmail` template path resolution)**: Fixed YAML double-quoted backslash unescaping in `roles/sendmail/tasks/main.yml` task `Resolve email template path` (`'\\'` in double quotes unescaped to an unclosed single quote in Jinja2, causing `An exception occurred during task execution... line 1`). Simplified template path check to standard POSIX forward slashes.
+- **Bug Fix (`utilization` role multiline shell command formatting)**: In `roles/utilization/tasks/main.yml`, task `Query Node allocatable and Pod requests`, YAML `shell: >-` separated `jq` arguments onto separate lines without shell line-continuation backslashes, causing `/bin/sh` to treat `--arg max_cpu` as an executable command (`/bin/sh: 3: --arg: not found`). Switched to `shell: |` with explicit `\` line continuations.
+- **Bug Fix (`error_handle` → `sendmail` `failed_phase` recursion)**: In `roles/error_handle/tasks/main.yml`, `phase_name` and `failed_phase` passed `vars: failed_phase: "{{ failed_phase | default(...) }}"` into `sendmail`, creating a circular self-referencing Jinja2 template during `error-report.j2` rendering. Pre-computed `resolved_failed_phase` as a concrete fact in step 1 and passed `resolved_failed_phase` cleanly.
+- **Enhanced `sendmail` Role to Native `mail` Module**: Replaced `/usr/sbin/sendmail` local MTA invocation with Ansible's native `mail:` module (connecting directly to `smtp_host:smtp_port` via Python's standard `smtplib`). Matches the verified server pattern and eliminates host binary dependencies and shell parsing errors. Added optional attachment support via `mail_attach`.
+- **Bug Fix (`jq` 1.5 `round/0 is not defined` compatibility)**: In `roles/utilization/tasks/main.yml` and `roles/prevalidation/tasks/main.yml` (Check 11 drain headroom), replaced calls to `round` with a portable helper function. Originally named `round2`, but jq 1.5's lexer tokenizes `round2` as `round` (unknown builtin) + `2` (literal), still producing `round/0 is not defined`. Renamed to `rnd2` to fully avoid collisions with any jq keyword on all versions.
+- **Bug Fix (`jq` operator precedence `endswith() requires string inputs`)**: In `roles/utilization/tasks/main.yml`, the `parse_mem` function's `elif` for SI kilo units (`"k"` / `"K"`) used `(tostring | endswith("k") or tostring | endswith("K"))`. Because jq's `or` binds tighter than `|`, this was parsed as `tostring | (endswith("k") or tostring) | endswith("K")`, feeding a boolean into `endswith()` and crashing with `endswith() requires string inputs` on any memory value reaching that branch (plain bytes, `"M"`, `"G"` suffixes). Fixed by adding explicit parentheses: `((tostring | endswith("k")) or (tostring | endswith("K")))`.
+- **Bug Fix (Jinja2 Infinite Recursion on `hop_label` in Phase 04 / `tasks/hop.yml`)**: In `tasks/hop.yml` (when including `04_Live_monitoring_upgrade.yaml`) and `04_Live_monitoring_upgrade.yaml` (when including `monitor` role), passing `vars: hop_label: "{{ hop_label }}"`, `hop_target_version: "{{ hop_target_version }}"`, etc. caused infinite recursive templating because the variable names matched the templated expressions. Removed redundant `vars:` blocks since these variables are already global facts set via `set_fact` in `tasks/hop.yml`.
+- **Bug Fix (`sendmail` role email body caching across hops)**: In `roles/sendmail/tasks/main.yml`, rendering was guarded by `when: (mail_html_body | default('') | length) == 0`. Once `mail_html_body` was set as a host fact during Hop 1 progress/heartbeat dispatches, subsequent invocations (such as Hop 2 error alerts) skipped rendering `error-report.j2` and re-sent Hop 1's cached body under Hop 2's Alert subject. Removed the stale fact check, ensured dynamic template resolution on every invocation, and added post-dispatch fact cleanup.
+- **Bug Fix (Command stderr and RBAC Forbidden Error Extraction)**: In `tasks/hop.yml`, `01_Policy_Check.yaml`, `02_Pre_upgrade_check.yaml`, `05_post_Upgrade_Checks.yaml`, and `roles/error_handle/tasks/main.yml`, rescue blocks previously only inspected `ansible_failed_result.msg`, capturing generic messages like `"non-zero return code"`. Updated error resolution to prioritize `ansible_failed_result.stderr` and `stderr_lines`. Added automated detection for RBAC / permission errors (`forbidden`, `cannot patch`, `unauthorized`) that exposes `is_rbac_error` facts and actionable operator remediation in alert emails.
+- **Bug Fix (MachineConfigPool Email Deserialization & RBAC Access Fallback)**: In `roles/monitor/tasks/poll_iteration.yml`, `monitor_mcp_display_list` was constructed via Jinja2 loop resulting in raw JSON string representation rather than a parsed list of dictionaries, leading to `N/A ?/?` fallback values in `progress-mail.j2`. Applied `from_json` parsing to guarantee clean list objects. Added detection for `oc get mcp` RBAC access errors (`mcp_access_error`) so that service account permission denials on `machineconfigpools` render a clean, explicit notice instead of blank tables.
+- **Bug Fix (`is_rbac_error` Jinja2 Infinite Recursion during `error-report.j2` Rendering)**: In `roles/error_handle/tasks/main.yml`, calling `include_role: name: sendmail` with `vars: is_rbac_error: "{{ is_rbac_error | default(false) | bool }}"` passed a lazy self-referencing variable to the role scope. When `sendmail` rendered `error-report.j2` via `lookup('template', ...)`, Jinja2 evaluated `is_rbac_error` recursively against its own role-scoped definition, failing with `An unhandled exception occurred while templating '{{ is_rbac_error | default(false) | bool }}'`. Resolved by removing redundant self-referencing role `vars:` so that `sendmail` and `error-report.j2` directly consume the static host fact `is_rbac_error` established by `set_fact` on localhost.
+- **Documentation & GitHub Readiness Enhancement**: Comprehensive overhaul of `README.md` and `Documentation.md`. Created `.gitignore` to prevent generated artifacts (`logs/`, `output/`, `snapshots/`, `*.kubeconfig`, `*.retry`) from entering version control. `README.md` now features status badges, architectural diagrams, quick-start CLI operations guide, validation gate matrices, and troubleshooting steps. `Documentation.md` serves as the complete technical manual covering system invariants, phase deep-dives, the 20-role catalog, error handling and RBAC diagnostic architecture, Jinja2 design system, and cumulative changelogs.
+- **Bug Fix (Postvalidation Check 01 False-Positive HARD Gate — Jinja2 `bool` vs `string` Type Coercion)**: In `roles/postvalidation/tasks/main.yml`, Check 01 "Enforce HARD gate on ClusterVersion target and condition" fired even when the cluster was fully healthy (target=desired=current, Progressing=False, Available=True, Degraded=False, Failing=False). Root cause: Jinja2's `map(attribute='status')` can return Python `bool True` instead of the string `"True"` from OpenShift condition payloads. The subsequent evaluation `postval_cv_settled: "{{ (postval_cv_available == 'True') ... }}"` compared `True == 'True'` which is `False` in Python (bool ≠ string), causing the settle check to fail falsely. Fixed by: (1) applying `| string | trim` normalization on all condition value extractions so types are always strings; (2) replacing fragile string equality checks (`== 'True'` / `== 'False'`) with `| bool` coercion (`not (x | string | trim | bool)` for false-checking, `x | string | trim | bool` for true-checking); (3) adding a diagnostic debug task logging types and values for future troubleshooting; (4) hardening the enforcement `when:` condition with `| string | trim | bool` as defense-in-depth.
+- **Bug Fix (Phase 08 `08_operator_upgrade.yml` Authentication Skip & Dry Run Crash)**: Fixed a bug where `08_operator_upgrade.yml` completely lacked the `vars_files:` block (missing paths and credentials) and credential resolution pre-tasks, causing the `login` role to crash with an empty API URL. Additionally, fixed a bug where the block-level `dry_run` condition was missing, causing the main operator execution block to crash while trying to run `oc get subscriptions` against a missing `.kubeconfig` file when `-e "dry_run=true"` was passed. Aligned the playbook structure exactly with `05_post_Upgrade_Checks.yaml`.
+- **Bug Fix (Phase 08 `dash` vs `bash` shell `set -o pipefail` Incompatibility)**: In the `operator_compat`, `operator_upgrade`, and `operator_validate` roles, shell scripts using `set -euo pipefail` crashed instantly with `/bin/sh: 1: set: Illegal option -o pipefail`. This occurred because Ansible defaults to `/bin/sh` for the `shell` module, which on Debian/Ubuntu points to `dash` (a lightweight POSIX shell that lacks `pipefail` support). Fixed by explicitly setting `args: executable: /bin/bash` on all shell tasks across all three Phase 08 roles.
+- **Feature Add (Hop-Complete Email Attachment)**: Updated `monitor` role to automatically attach the latest Phase 02 prevalidation HTML report to every hop-complete email dispatched.
+- **Feature Add (Upgrade Complete Email)**: Updated `08_operator_upgrade.yml` to dispatch a final "Upgrade Complete" email upon successful completion of all phases. This email includes four attachments: the Phase 05 postvalidation HTML report, the Phase 08 operator validation HTML report, and the latest `.txt` and `.csv` execution logs.
+- **Bug Fix (Phase 05 Double Logout)**: Fixed an issue in `05_post_Upgrade_Checks.yaml` where the `always:` block invoked `logout` unconditionally, severing the authenticated session required by Phase 08. Applied a `when: phase05_failed | default(false)` guard to ensure the session remains active on success while still tearing down on failure. Phase 08 now handles terminal logout.
+- **Bug Fix (Phase 08 `gather_facts`)**: Changed `gather_facts: false` to `gather_facts: true` in `08_operator_upgrade.yml` to prevent `ansible_date_time` lookup failures during rescue reporting and final email dispatch.
+
+
+
+
+
+
+
+

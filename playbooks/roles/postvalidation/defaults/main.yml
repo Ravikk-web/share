@@ -1,0 +1,29 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names work on both versions.
+#                 | default('') guards are applied on all optional variables.
+#                 No `warn:` parameter is used on any task.
+#
+# Defaults for postvalidation role (Phase 05 10-Check Aggregator + Baseline Diff).
+
+---
+# Cluster session & environment paths
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+snapshot_dir: "{{ playbook_dir }}/snapshots"
+baseline_snapshot_file_path: ""
+
+# Target version (defaults to last element in upgrade_path)
+final_target_version: "{{ (upgrade_path | default([])) | last | default('') }}"
+
+# Allow-lists for permitted cluster exceptions (empty by default)
+co_allow_list: []
+mcp_allow_list: []
+node_allow_list: []
+allowed_unschedulable_nodes: []
+etcd_allow_list: []
+alert_allow_list: []
+critical_pod_allow_list: []
+csr_allow_list: []
+
+# Pattern for critical namespaces inspected in Check 07
+critical_namespace_pattern: "openshift-|kube-system"

@@ -1,0 +1,108 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (file, set_fact, template, stat, lineinfile, debug)
+#                 work identically on both 2.7.17 and 2.14.18.
+#                 | default('') guards are applied on all optional variables.
+#                 No `warn:` parameter is used on any task.
+#
+# report role — Renders client-facing HTML validation reports and updates run logs.
+#
+# Contract:
+#   - Renders `health-overview.j2` to `output/<cluster>_<phase>_<timestamp>.html`.
+#   - Presentation-only template driven by passed-in vars (health_summary, failed_validations).
+#   - Emits structured execution summary rows to .txt and .csv run logs in `logs/`.
+#   - Exposes `report_html_path` fact for subsequent playbook notifications or references.
+#   - Zero secrets rendered or logged.
+
+---
+# --- 1. Ensure required directories exist -------------------------------------
+- name: Ensure report output directory exists
+  file:
+    path: "{{ report_output_dir | default(output_dir | default(playbook_dir ~ '/output')) }}"
+    state: directory
+
+- name: Ensure report log directory exists
+  file:
+    path: "{{ report_log_dir | default(log_dir | default(playbook_dir ~ '/logs')) }}"
+    state: directory
+
+# --- 2. Resolve metadata, timestamps, and target file paths -------------------
+- name: Resolve report execution metadata and file paths
+  set_fact:
+    resolved_report_timestamp: "{{ timestamp if (timestamp | default('') | length > 0) else (ansible_date_time.iso8601 if (ansible_date_time is defined and ansible_date_time.iso8601 is defined) else lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')) }}"
+    resolved_report_file_tag: "{{ timestamp if (timestamp | default('') | length > 0) else (ansible_date_time.date ~ '_' ~ ansible_date_time.hour ~ ansible_date_time.minute ~ ansible_date_time.second if (ansible_date_time is defined and ansible_date_time.date is defined) else lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+    resolved_report_phase: "{{ report_phase | default('prevalidation') }}"
+    resolved_phase_name: "{{ phase_name | default('Pre-Upgrade Validation') }}"
+
+- name: Resolve report output and log file destinations
+  set_fact:
+    resolved_output_html_file: "{{ output_html_file if (output_html_file | default('') | length > 0) else ((report_output_dir | default(output_dir | default(playbook_dir ~ '/output'))) ~ '/' ~ (cluster_name | default('cluster')) ~ '_' ~ resolved_report_phase ~ '_' ~ resolved_report_file_tag ~ '.html') }}"
+    resolved_log_file_txt: "{{ log_file_txt if (log_file_txt | default('') | length > 0) else (log_path if (log_path is defined and log_path | length > 0) else ((report_log_dir | default(log_dir | default(playbook_dir ~ '/logs'))) ~ '/' ~ (cluster_name | default('cluster')) ~ '_' ~ resolved_report_file_tag ~ '.txt')) }}"
+    resolved_log_file_csv: "{{ log_file_csv if (log_file_csv | default('') | length > 0) else (log_csv_path if (log_csv_path is defined and log_csv_path | length > 0) else ((report_log_dir | default(log_dir | default(playbook_dir ~ '/logs'))) ~ '/' ~ (cluster_name | default('cluster')) ~ '_' ~ resolved_report_file_tag ~ '.csv')) }}"
+
+# --- 3. Compute verification summary statistics ------------------------------
+- name: Calculate report validation summary counts
+  set_fact:
+    resolved_pass_count: "{{ report_pass_count if (report_pass_count is defined) else (health_summary | default([]) | selectattr('status', 'equalto', 'PASS') | list | length) }}"
+    resolved_warn_count: "{{ report_warn_count if (report_warn_count is defined) else (health_summary | default([]) | selectattr('status', 'equalto', 'WARN') | list | length) }}"
+    resolved_fail_count: "{{ report_fail_count if (report_fail_count is defined) else ((health_summary | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length) + (failed_validations | default([]) | length)) }}"
+
+- name: Calculate total checks and overall verdict
+  set_fact:
+    resolved_total_count: "{{ report_total_count if (report_total_count is defined) else ((resolved_pass_count | int) + (resolved_warn_count | int) + (resolved_fail_count | int)) }}"
+    resolved_report_verdict: "{{ report_verdict | upper if (report_verdict | default('') | length > 0) else ('FAIL' if (resolved_fail_count | int > 0) else ('WARN' if (resolved_warn_count | int > 0) else 'PASS')) }}"
+
+# --- 4. Render client-facing HTML report -------------------------------------
+- name: Render client-facing HTML validation report — health-overview.j2
+  template:
+    src: "health-overview.j2"
+    dest: "{{ resolved_output_html_file }}"
+  vars:
+    report_pass_count: "{{ resolved_pass_count | int }}"
+    report_warn_count: "{{ resolved_warn_count | int }}"
+    report_fail_count: "{{ resolved_fail_count | int }}"
+    report_total_count: "{{ resolved_total_count | int }}"
+    report_verdict: "{{ resolved_report_verdict }}"
+    output_file_name: "{{ resolved_output_html_file }}"
+    log_path: "{{ resolved_log_file_txt }}"
+
+- name: Export report HTML path fact
+  set_fact:
+    report_html_path: "{{ resolved_output_html_file }}"
+    report_last_verdict: "{{ resolved_report_verdict }}"
+
+# --- 5. Emit summary records to run logs (.txt + .csv) -----------------------
+- name: Append report summary entry to .txt run log
+  lineinfile:
+    path: "{{ resolved_log_file_txt }}"
+    line: "[{{ resolved_report_timestamp }}] [REPORT] [{{ resolved_report_verdict }}] Phase: {{ resolved_phase_name }} | Total Checks: {{ resolved_total_count }} (Passed: {{ resolved_pass_count }}, Warnings: {{ resolved_warn_count }}, Failures: {{ resolved_fail_count }}) | HTML: {{ resolved_output_html_file }}"
+    create: yes
+  failed_when: false
+
+- name: Check if .csv run log exists
+  stat:
+    path: "{{ resolved_log_file_csv }}"
+  register: report_csv_stat
+  failed_when: false
+
+- name: Initialize .csv run log header if new file
+  lineinfile:
+    path: "{{ resolved_log_file_csv }}"
+    line: "Timestamp,Cluster,Phase,Step,Task,Gate,Observed,Reason,Status"
+    create: yes
+  when: not (report_csv_stat.stat.exists | default(false))
+  failed_when: false
+
+- name: Append structured record to .csv run log
+  lineinfile:
+    path: "{{ resolved_log_file_csv }}"
+    line: '"{{ resolved_report_timestamp }}","{{ cluster_name | default(''N/A'') }}","{{ resolved_phase_name }}","REPORT","Report Generation","SUMMARY","Passed: {{ resolved_pass_count }}, Warnings: {{ resolved_warn_count }}, Failures: {{ resolved_fail_count }} (Total: {{ resolved_total_count }})","Report generated at {{ resolved_output_html_file | replace(''"'', ''""'') }}","{{ resolved_report_verdict }}"'
+    create: yes
+  failed_when: false
+
+# --- 6. Confirm report generation --------------------------------------------
+- name: Confirm HTML report generated successfully
+  debug:
+    msg: >-
+      ✔ HTML Report generated successfully: '{{ resolved_output_html_file }}'
+      [Verdict: {{ resolved_report_verdict }} | Total: {{ resolved_total_count }} |
+      Pass: {{ resolved_pass_count }} | Warn: {{ resolved_warn_count }} | Fail: {{ resolved_fail_count }}]

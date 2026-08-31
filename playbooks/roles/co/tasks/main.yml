@@ -1,0 +1,114 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (shell, command, fail, set_fact, debug)
+#                 work on both versions. Replace with FQCN only if adopting the
+#                 ansible.builtin.* convention project-wide.
+#                 | default('') guards are applied on all optional variables.
+#
+# co role — validates ClusterOperators health (HARD gate).
+#
+# Contract:
+#   - Queries `oc get clusteroperators -o json` piped to `jq`.
+#   - Read-only operation; changed_when: false.
+#   - Asserts every ClusterOperator is Available=True and Degraded=False.
+#   - Respects optional co_allow_list override for permitted exceptions.
+#   - HARD gate: fails with explicit error naming cluster and failing operators.
+#   - Records a structured PASS entry into `health_summary` list via set_fact.
+
+---
+# Shell module chosen to pipe oc get clusteroperators JSON output to jq (v1.5 compatible)
+- name: Query ClusterOperators and evaluate health conditions — oc get clusteroperators
+  shell: >-
+    oc get clusteroperators -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      .items // [] | {
+        "all": [
+          .[] | {
+            "name": .metadata.name,
+            "available": ([.status.conditions[]? | select(.type=="Available") | .status][0] // "Unknown"),
+            "progressing": ([.status.conditions[]? | select(.type=="Progressing") | .status][0] // "Unknown"),
+            "degraded": ([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "Unknown")
+          }
+        ],
+        "offenders": [
+          .[] | {
+            "name": .metadata.name,
+            "available": ([.status.conditions[]? | select(.type=="Available") | .status][0] // "Unknown"),
+            "progressing": ([.status.conditions[]? | select(.type=="Progressing") | .status][0] // "Unknown"),
+            "degraded": ([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "Unknown")
+          } | select(.available != "True" or .degraded != "False")
+        ]
+      }
+    '
+  register: co_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Evaluate ClusterOperators query execution
+  fail:
+    msg: >-
+      Failed to query cluster operators for cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Command exited with code {{ co_raw_query.rc | default(1) }}.
+      Error: {{ co_raw_query.stderr | default(co_raw_query.stdout | default('No output')) | trim }}.
+      Check kubeconfig path ({{ kubeconfig_path }}) and cluster reachability.
+  when: (co_raw_query.rc | default(1) != 0) or (co_raw_query.stdout | default('') | trim == '')
+
+- name: Parse ClusterOperators JSON payload
+  set_fact:
+    co_parsed_data: "{{ co_raw_query.stdout | from_json }}"
+
+- name: Extract all ClusterOperators list
+  set_fact:
+    co_all_operators: "{{ co_parsed_data.all | default([]) }}"
+
+- name: Validate at least one ClusterOperator was discovered
+  fail:
+    msg: >-
+      Cluster Operators check FAILED (HARD gate) for cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      No ClusterOperators found in cluster response.
+  when: (co_all_operators | length) == 0
+
+- name: Initialize offending operators list
+  set_fact:
+    co_offending_operators: []
+
+- name: Filter offending operators against co_allow_list
+  set_fact:
+    co_offending_operators: "{{ co_offending_operators + [item] }}"
+  loop: "{{ co_parsed_data.offenders | default([]) }}"
+  when: item.name not in (co_allow_list | default([]))
+
+- name: Display ClusterOperators inspection summary
+  debug:
+    msg: >-
+      Cluster '{{ cluster_name | default('UNKNOWN') }}': Scanned {{ co_all_operators | length }} operator(s).
+      Found {{ co_offending_operators | length }} failing operator(s)
+      (Allow-listed: {{ co_allow_list | default([]) | length }}).
+
+- name: Enforce HARD gate on ClusterOperators health
+  fail:
+    msg: >-
+      Cluster Operators check FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Found {{ co_offending_operators | length }} unhealthy operator(s):
+      {% for op in co_offending_operators %}
+        - {{ op.name }}: Available={{ op.available | default('Unknown') }}, Degraded={{ op.degraded | default('Unknown') }}, Progressing={{ op.progressing | default('Unknown') }}
+      {% endfor %}
+      All ClusterOperators must report Available=True and Degraded=False before upgrade operations can proceed.
+  when: (co_offending_operators | length) > 0
+
+- name: Record co PASS in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [co_summary_entry] }}"
+  vars:
+    co_summary_entry:
+      id: "{{ co_id | default('03') }}"
+      name: "{{ co_name | default('Cluster Operators Health') }}"
+      gate: "{{ co_gate | default('HARD') }}"
+      status: "PASS"
+      observed: "All {{ co_all_operators | length }} operators are Available=True and Degraded=False"
+      details: "Verified {{ co_all_operators | length }} cluster operators on {{ cluster_name | default('cluster') }}"
+      raw_output: "{{ co_all_operators | to_json }}"
+
+- name: Confirm ClusterOperators health passed
+  debug:
+    msg: >-
+      ✔ PASS [Check {{ co_id | default('03') }} - {{ co_name | default('Cluster Operators Health') }}] —
+      All {{ co_all_operators | length }} ClusterOperators healthy (Available=True, Degraded=False).

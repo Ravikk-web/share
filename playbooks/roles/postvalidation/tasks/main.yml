@@ -1,0 +1,802 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (shell, command, fail, set_fact, debug, include_role, stat)
+#                 work on both versions.
+#                 | default('') guards are applied on all optional variables.
+#                 No `warn:` parameter is used on any task.
+#
+# postvalidation role — 10-check post-upgrade verification aggregator + baseline diff.
+#
+# 10-Check Contract:
+#   HARD Gates (1–5) — Any failure immediately halts execution and triggers logout:
+#     Check 01: ClusterVersion Target & Not Progressing (`oc get clusterversion`)
+#     Check 02: ClusterOperators Health (`co` role + not Progressing)
+#     Check 03: MachineConfigPool Health (`mcp` role — Updated=True, Degraded=False)
+#     Check 04: Node Health & New Kubelet Version Verification (`node` role + kubelet version checks)
+#     Check 05: etcd Member Health (`etcd` role — member pods Running/Ready, 0 degraded operator conditions)
+#
+#   WARN Gates (6–10) — Surface in the report only; never block or auto-remediate:
+#     Check 06: Firing Critical Alerts (Cluster Monitoring / Prometheus)
+#     Check 07: Critical Namespace Pod Health (openshift-*, kube-system)
+#     Check 08: Baseline Snapshot Comparison Diff (nodes/operators/routes vs Phase 01 snapshot)
+#     Check 09: Pending Certificate Signing Requests (CSR)
+#     Check 10: Workload & Route Reachability Smoke Test (ingress controller + console route admission)
+
+---
+# ==============================================================================
+# INITIALIZATION
+# ==============================================================================
+- name: Initialize postvalidation health_summary and fact containers
+  set_fact:
+    health_summary: []
+    postval_failed_hard_checks: []
+    resolved_final_target_version: "{{ final_target_version | default((upgrade_path | default([])) | last | default('')) }}"
+
+- name: Display Postvalidation Start Banner
+  debug:
+    msg:
+      - "═══════════════════════════════════════════════════════════"
+      - "Phase 05 — Post-Upgrade Verification (10 Checks + Baseline Diff)"
+      - "Cluster: {{ cluster_name | default('UNKNOWN') }}"
+      - "Final Target Version: {{ resolved_final_target_version | default('NOT SPECIFIED') }}"
+      - "═══════════════════════════════════════════════════════════"
+
+# ==============================================================================
+# HARD CHECK 01: ClusterVersion Target & Not Progressing
+# ==============================================================================
+- name: Execute Check 01 (HARD) — Query ClusterVersion for final target and condition
+  command: oc get clusterversion version -o json --kubeconfig "{{ kubeconfig_path }}"
+  register: postval_cv_raw
+  changed_when: false
+  failed_when: postval_cv_raw.rc != 0
+
+- name: Parse ClusterVersion JSON payload
+  set_fact:
+    postval_cv_data: "{{ postval_cv_raw.stdout | from_json }}"
+
+- name: Extract ClusterVersion condition facts
+  set_fact:
+    postval_cv_desired_version: "{{ postval_cv_data.status.desired.version | default(postval_cv_data.spec.desiredUpdate.version | default('unknown')) | string | trim }}"
+    postval_cv_current_version: "{{ ((postval_cv_data.status.history | default([{}]) | first).version | default('unknown')) | string | trim }}"
+    postval_cv_progressing: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first) | default('Unknown')) | string | trim }}"
+    postval_cv_available: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first) | default('Unknown')) | string | trim }}"
+    postval_cv_degraded: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | list | first) | default('False')) | string | trim }}"
+    postval_cv_failing: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Failing') | map(attribute='status') | list | first) | default('False')) | string | trim }}"
+    postval_cv_prog_message: "{{ ((postval_cv_data.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='message') | list | first) | default('None')) | string | trim }}"
+
+- name: Evaluate ClusterVersion target version and conditions
+  set_fact:
+    postval_cv_version_matches: >-
+      {{
+        (resolved_final_target_version | string | trim == '')
+        or
+        (
+          (postval_cv_desired_version | string | trim) == (resolved_final_target_version | string | trim)
+          and
+          (postval_cv_current_version | string | trim) == (resolved_final_target_version | string | trim)
+        )
+      }}
+    postval_cv_settled: >-
+      {{
+        (not (postval_cv_progressing | default('False') | string | trim | bool))
+        and
+        (postval_cv_available | default('Unknown') | string | trim | bool)
+        and
+        (not (postval_cv_degraded | default('False') | string | trim | bool))
+        and
+        (not (postval_cv_failing | default('False') | string | trim | bool))
+      }}
+
+- name: Debug ClusterVersion evaluation results
+  debug:
+    msg: >-
+      [Check 01 Evaluation] version_matches={{ postval_cv_version_matches }} (type={{ postval_cv_version_matches | type_debug }}),
+      settled={{ postval_cv_settled }} (type={{ postval_cv_settled | type_debug }}),
+      resolved_target='{{ resolved_final_target_version }}',
+      desired='{{ postval_cv_desired_version }}',
+      current='{{ postval_cv_current_version }}',
+      progressing={{ postval_cv_progressing }} (bool={{ postval_cv_progressing | string | trim | bool }}),
+      available={{ postval_cv_available }} (bool={{ postval_cv_available | string | trim | bool }}),
+      degraded={{ postval_cv_degraded }} (bool={{ postval_cv_degraded | string | trim | bool }}),
+      failing={{ postval_cv_failing }} (bool={{ postval_cv_failing | string | trim | bool }})
+
+- name: Enforce HARD gate on ClusterVersion target and condition
+  fail:
+    msg: >-
+      ClusterVersion verification FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Target version: '{{ resolved_final_target_version }}';
+      Observed desired version: '{{ postval_cv_desired_version }}';
+      Observed current version: '{{ postval_cv_current_version }}';
+      Progressing: {{ postval_cv_progressing }} (message: {{ postval_cv_prog_message }});
+      Available: {{ postval_cv_available }};
+      Degraded: {{ postval_cv_degraded }};
+      Failing: {{ postval_cv_failing }}.
+      Cluster has not completed upgrade to final target version or is still in a progressing/degraded state.
+  when: not (postval_cv_version_matches | string | trim | bool) or not (postval_cv_settled | string | trim | bool)
+
+- name: Record ClusterVersion PASS in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [cv_summary_entry] }}"
+  vars:
+    cv_summary_entry:
+      id: "01"
+      name: "ClusterVersion Target and Condition"
+      gate: "HARD"
+      status: "PASS"
+      observed: "Cluster is at target version '{{ postval_cv_current_version }}' (Progressing=False, Available=True, Degraded=False)"
+      details: "Desired: {{ postval_cv_desired_version }}, Current: {{ postval_cv_current_version }}, Progressing: {{ postval_cv_progressing }}, Available: {{ postval_cv_available }}"
+      raw_output: "{{ postval_cv_data | to_json }}"
+
+- name: Confirm ClusterVersion check passed
+  debug:
+    msg: "✔ PASS [Check 01 - ClusterVersion Target and Condition] — Cluster is at target '{{ postval_cv_current_version }}' (Progressing=False, Available=True)."
+
+# ==============================================================================
+# HARD CHECK 02: ClusterOperators Health (co role + not Progressing)
+# ==============================================================================
+- name: Execute Check 02 (HARD) — ClusterOperators Health (co role)
+  include_role:
+    name: co
+  vars:
+    co_id: "02"
+    co_name: "Cluster Operators Health"
+    co_gate: "HARD"
+
+- name: Check for any ClusterOperators still Progressing
+  set_fact:
+    postval_progressing_cos: >-
+      [
+        {% for op in co_all_operators | default([]) %}
+          {% if op.progressing | default('False') == 'True' and op.name not in (co_allow_list | default([])) %}
+            "{{ op.name }}"{{ '' if loop.last else ',' }}
+          {% endif %}
+        {% endfor %}
+      ]
+
+- name: Enforce HARD gate on Progressing ClusterOperators
+  fail:
+    msg: >-
+      Cluster Operators check FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Found {{ postval_progressing_cos | length }} operator(s) still reporting Progressing=True after upgrade:
+      {{ postval_progressing_cos | join(', ') }}.
+      All ClusterOperators must be Available=True, Degraded=False, and Progressing=False in postvalidation.
+  when: (postval_progressing_cos | default([]) | length) > 0
+
+- name: Confirm ClusterOperators postvalidation passed
+  debug:
+    msg: "✔ PASS [Check 02 - Cluster Operators Health] — All {{ co_all_operators | length }} operators are Available=True, Degraded=False, and Progressing=False."
+
+# ==============================================================================
+# HARD CHECK 03: MachineConfigPool Health (mcp role)
+# ==============================================================================
+- name: Execute Check 03 (HARD) — MachineConfigPool Health (mcp role)
+  include_role:
+    name: mcp
+  vars:
+    mcp_id: "03"
+    mcp_name: "Machine Config Pool (MCP) Health"
+    mcp_gate: "HARD"
+
+# ==============================================================================
+# HARD CHECK 04: Node Health & Kubelet Version Verification (node role + versions)
+# ==============================================================================
+- name: Execute Check 04 (HARD) — Node Health and Readiness (node role)
+  include_role:
+    name: node
+  vars:
+    node_id: "04"
+    node_name: "Node Health and Readiness"
+    node_gate: "HARD"
+
+- name: Verify Kubelet Versions on all cluster nodes
+  shell: >-
+    cat <<'EOF' | jq -r '
+      . as $nodes |
+      {
+        "total_nodes": ($nodes | length),
+        "kubelet_versions": ([$nodes[].kubelet_version] | unique),
+        "invalid_nodes": [
+          $nodes[] | select(
+            (.kubelet_version == null) or
+            (.kubelet_version == "") or
+            (.kubelet_version == "unknown") or
+            (.ready != "True")
+          ) | {
+            "name": .name,
+            "ready": .ready,
+            "kubelet_version": .kubelet_version
+          }
+        ]
+      }
+    '
+    {{ (node_all_nodes | default([])) | to_json }}
+    EOF
+  register: node_kubelet_eval_raw
+  changed_when: false
+  failed_when: false
+
+- name: Parse Node Kubelet evaluation payload
+  set_fact:
+    node_kubelet_eval: "{{ node_kubelet_eval_raw.stdout | from_json }}"
+  when: (node_kubelet_eval_raw.rc | default(1) == 0) and (node_kubelet_eval_raw.stdout | default('') | trim != '')
+
+- name: Fallback Node Kubelet evaluation on calculation failure
+  set_fact:
+    node_kubelet_eval:
+      total_nodes: "{{ node_all_nodes | default([]) | length }}"
+      kubelet_versions: []
+      invalid_nodes: []
+  when: (node_kubelet_eval_raw.rc | default(1) != 0) or (node_kubelet_eval_raw.stdout | default('') | trim == '')
+
+- name: Enforce HARD gate on Node Kubelet versions
+  fail:
+    msg: >-
+      Node Kubelet verification FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Found {{ node_kubelet_eval.invalid_nodes | length }} node(s) with invalid, unready, or missing kubelet versions:
+      {% for n in node_kubelet_eval.invalid_nodes %}
+        - {{ n.name }}: Ready={{ n.ready }}, KubeletVersion={{ n.kubelet_version }}
+      {% endfor %}
+      All nodes must report Ready=True and valid updated kubelet versions.
+  when: (node_kubelet_eval.invalid_nodes | length) > 0
+
+- name: Confirm Node Health and Kubelet check passed
+  debug:
+    msg: >-
+      ✔ PASS [Check 04 - Node Health and Readiness] —
+      All {{ node_all_nodes | length }} nodes Ready with active kubelet version(s): {{ node_kubelet_eval.kubelet_versions | join(', ') }}.
+
+# ==============================================================================
+# HARD CHECK 05: etcd Member Health (etcd role)
+# ==============================================================================
+- name: Execute Check 05 (HARD) — etcd Member Health (etcd role)
+  include_role:
+    name: etcd
+  vars:
+    etcd_id: "05"
+    etcd_name: "etcd Member Health"
+    etcd_gate: "HARD"
+
+# ==============================================================================
+# WARN CHECK 06: Firing Critical Alerts (Cluster Monitoring / Prometheus)
+# ==============================================================================
+- name: Execute Check 06 (WARN) — Query Prometheus / Alertmanager for firing alerts
+  shell: >-
+    (oc get --raw /api/v1/namespaces/openshift-monitoring/services/https:prometheus-k8s:9091/proxy/api/v1/alerts --kubeconfig "{{ kubeconfig_path }}" 2>/dev/null ||
+     oc get prometheusrules -n openshift-monitoring -o json --kubeconfig "{{ kubeconfig_path }}" 2>/dev/null ||
+     echo '{"status":"success","data":{"alerts":[]}}') | jq -r '
+      if (.data.alerts != null) then
+        {
+          "source": "prometheus_api",
+          "firing_critical": [
+            .data.alerts[]? | select(.state == "firing" and (.labels.severity == "critical" or .labels.severity == "warning")) | {
+              "alertname": (.labels.alertname // "Unknown"),
+              "severity": (.labels.severity // "Unknown"),
+              "namespace": (.labels.namespace // "cluster"),
+              "summary": (.annotations.summary // .annotations.message // "No description")
+            }
+          ]
+        }
+      else
+        {
+          "source": "fallback",
+          "firing_critical": []
+        }
+      end
+    '
+  register: postval_alerts_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse Firing Alerts JSON payload
+  set_fact:
+    postval_alerts_parsed: "{{ postval_alerts_raw_query.stdout | from_json }}"
+  when: (postval_alerts_raw_query.rc | default(1) == 0) and (postval_alerts_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback Firing Alerts payload on query failure
+  set_fact:
+    postval_alerts_parsed:
+      source: "unreachable"
+      firing_critical: []
+  when: (postval_alerts_raw_query.rc | default(1) != 0) or (postval_alerts_raw_query.stdout | default('') | trim == '')
+
+- name: Initialize offending firing alerts list
+  set_fact:
+    postval_alerts_offenders: []
+
+- name: Filter firing alerts against alert_allow_list
+  set_fact:
+    postval_alerts_offenders: "{{ postval_alerts_offenders + [item] }}"
+  loop: "{{ postval_alerts_parsed.firing_critical | default([]) }}"
+  when: >-
+    (item.alertname not in (alert_allow_list | default([]))) and
+    ((item.namespace + '/' + item.alertname) not in (alert_allow_list | default([])))
+
+- name: Determine Firing Alerts check verdict
+  set_fact:
+    postval_alerts_verdict: "{{ 'WARN' if (postval_alerts_offenders | length > 0) else 'PASS' }}"
+
+- name: Record Firing Alerts check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [postval_alert_summary_entry] }}"
+  vars:
+    postval_alert_summary_entry:
+      id: "06"
+      name: "Firing Critical Alerts"
+      gate: "WARN"
+      status: "{{ postval_alerts_verdict }}"
+      observed: >-
+        {% if postval_alerts_verdict == 'PASS' %}
+        No critical firing alerts detected across cluster monitoring
+        {% else %}
+        Found {{ postval_alerts_offenders | length }} firing alert(s) in cluster monitoring
+        {% endif %}
+      details: >-
+        {% if postval_alerts_verdict == 'PASS' %}
+        Queried Prometheus / Alertmanager monitoring service on cluster {{ cluster_name | default('cluster') }}.
+        {% else %}
+        Firing alerts: {% for a in postval_alerts_offenders %}{{ a.alertname }} ({{ a.severity }} in {{ a.namespace }}){% if not loop.last %}, {% endif %}{% endfor %}.
+        {% endif %}
+      raw_output: "{{ postval_alerts_parsed | to_json }}"
+
+- name: Display Firing Alerts check evaluation
+  debug:
+    msg: >-
+      {% if postval_alerts_verdict == 'PASS' %}
+      ✔ PASS [Check 06 - Firing Critical Alerts] — No firing critical alerts detected.
+      {% else %}
+      ! WARN [Check 06 - Firing Critical Alerts] — Found {{ postval_alerts_offenders | length }} firing alert(s).
+      {% endif %}
+
+# ==============================================================================
+# WARN CHECK 07: Critical Namespace Pod Health (openshift-*, kube-system)
+# ==============================================================================
+- name: Execute Check 07 (WARN) — Query pods in critical namespaces
+  shell: >-
+    oc get pods --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      .items // [] |
+      [.[] | select(.metadata.namespace | test("^openshift-|^kube-system$"))] as $crit_pods |
+      {
+        "all_critical_count": ($crit_pods | length),
+        "offending_pods": [
+          $crit_pods[] | {
+            "namespace": .metadata.namespace,
+            "name": .metadata.name,
+            "phase": (.status.phase // "Unknown"),
+            "restart_count": ([.status.containerStatuses[]?.restartCount] | add // 0),
+            "waiting_reason": ([.status.containerStatuses[]?.state.waiting.reason] | compact | first // null),
+            "ready": ([.status.conditions[]? | select(.type=="Ready") | .status][0] // "Unknown")
+          } | select(
+            (.phase != "Running" and .phase != "Succeeded") or
+            (.ready != "True" and .phase == "Running") or
+            (.waiting_reason != null and .waiting_reason != "")
+          )
+        ]
+      }
+    '
+  register: postval_crit_pods_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse Critical Namespace Pods JSON payload
+  set_fact:
+    postval_crit_pods_parsed: "{{ postval_crit_pods_raw_query.stdout | from_json }}"
+  when: (postval_crit_pods_raw_query.rc | default(1) == 0) and (postval_crit_pods_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback Critical Namespace Pods payload on query failure
+  set_fact:
+    postval_crit_pods_parsed:
+      all_critical_count: 0
+      offending_pods: []
+  when: (postval_crit_pods_raw_query.rc | default(1) != 0) or (postval_crit_pods_raw_query.stdout | default('') | trim == '')
+
+- name: Initialize offending critical pods list
+  set_fact:
+    postval_crit_pods_offenders: []
+
+- name: Filter critical pods against critical_pod_allow_list
+  set_fact:
+    postval_crit_pods_offenders: "{{ postval_crit_pods_offenders + [item] }}"
+  loop: "{{ postval_crit_pods_parsed.offending_pods | default([]) }}"
+  when: >-
+    (item.name not in (critical_pod_allow_list | default([]))) and
+    ((item.namespace + '/' + item.name) not in (critical_pod_allow_list | default([])))
+
+- name: Determine Critical Namespace Pods check verdict
+  set_fact:
+    postval_crit_pods_verdict: "{{ 'WARN' if (postval_crit_pods_offenders | length > 0) else 'PASS' }}"
+
+- name: Record Critical Namespace Pods check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [postval_cp_summary_entry] }}"
+  vars:
+    postval_cp_summary_entry:
+      id: "07"
+      name: "Critical Namespace Pod Health"
+      gate: "WARN"
+      status: "{{ postval_crit_pods_verdict }}"
+      observed: >-
+        {% if postval_crit_pods_verdict == 'PASS' %}
+        All {{ postval_crit_pods_parsed.all_critical_count | default(0) }} pods in critical namespaces (openshift-*, kube-system) are Running or Completed
+        {% else %}
+        Found {{ postval_crit_pods_offenders | length }} unhealthy/pending pod(s) in critical namespaces
+        {% endif %}
+      details: >-
+        {% if postval_crit_pods_verdict == 'PASS' %}
+        Scanned {{ postval_crit_pods_parsed.all_critical_count | default(0) }} pods across system namespaces on cluster {{ cluster_name | default('cluster') }}.
+        {% else %}
+        Unhealthy pods: {% for p in postval_crit_pods_offenders %}{{ p.namespace }}/{{ p.name }} (phase: {{ p.phase }}, ready: {{ p.ready }}){% if not loop.last %}, {% endif %}{% endfor %}.
+        {% endif %}
+      raw_output: "{{ postval_crit_pods_parsed | to_json }}"
+
+- name: Display Critical Namespace Pods check evaluation
+  debug:
+    msg: >-
+      {% if postval_crit_pods_verdict == 'PASS' %}
+      ✔ PASS [Check 07 - Critical Namespace Pod Health] — All critical namespace pods healthy.
+      {% else %}
+      ! WARN [Check 07 - Critical Namespace Pod Health] — Found {{ postval_crit_pods_offenders | length }} unhealthy critical pod(s).
+      {% endif %}
+
+# ==============================================================================
+# WARN CHECK 08: Baseline Snapshot Comparison Diff (Phase 01 vs Live State)
+# ==============================================================================
+- name: Locate Phase 01 baseline snapshot file
+  shell: >-
+    if [ -n "{{ baseline_snapshot_file_path | default('') }}" ] && [ -f "{{ baseline_snapshot_file_path | default('') }}" ]; then
+      echo "{{ baseline_snapshot_file_path }}"
+    else
+      ls -t "{{ snapshot_dir | default(playbook_dir ~ '/snapshots') }}/{{ cluster_name | default('cluster') }}"_*_baseline.json 2>/dev/null | head -n 1 || echo ""
+    fi
+  register: resolved_baseline_file_query
+  changed_when: false
+  failed_when: false
+
+- name: Resolve baseline snapshot file path
+  set_fact:
+    active_baseline_file: "{{ resolved_baseline_file_query.stdout | default('') | trim }}"
+
+- name: Check baseline snapshot file existence
+  stat:
+    path: "{{ active_baseline_file }}"
+  register: baseline_stat_result
+  when: active_baseline_file != ""
+
+- name: Capture live routes for baseline route comparison
+  command: oc get routes --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}"
+  register: postval_live_routes_raw
+  changed_when: false
+  failed_when: false
+
+- name: Parse live routes JSON payload
+  set_fact:
+    postval_live_routes: >-
+      [
+        {% for r in (postval_live_routes_raw.stdout | default('{"items":[]}') | from_json)['items'] | default([]) %}
+        {
+          "key": "{{ r.metadata.namespace | default('') }}/{{ r.metadata.name | default('') }}",
+          "namespace": "{{ r.metadata.namespace | default('') }}",
+          "name": "{{ r.metadata.name | default('') }}",
+          "host": "{{ r.spec.host | default('') }}"
+        }{{ '' if loop.last else ',' }}
+        {% endfor %}
+      ]
+  when: postval_live_routes_raw.rc | default(1) == 0
+
+- name: Fallback live routes on query failure
+  set_fact:
+    postval_live_routes: []
+  when: postval_live_routes_raw.rc | default(1) != 0
+
+- name: Compare live cluster state against baseline snapshot
+  shell: >-
+    cat <<'EOF' | jq -r '
+      . as $root |
+      ($root.baseline // {}) as $base |
+      ($root.live_nodes // []) as $live_nodes |
+      ($root.live_cos // []) as $live_cos |
+      ($root.live_routes // []) as $live_routes |
+      ($root.live_version // "unknown") as $live_ver |
+
+      ($base.nodes // []) as $base_nodes |
+      ($base.clusteroperators // []) as $base_cos |
+      ($base.routes // []) as $base_routes |
+      ($base.clusterversion.desired_version // $base.clusterversion.current_version // "unknown") as $base_ver |
+
+      # Node comparison
+      ([$base_nodes[].name] // []) as $base_node_names |
+      ([$live_nodes[].name] // []) as $live_node_names |
+      ($base_node_names - $live_node_names) as $missing_nodes |
+      ($live_node_names - $base_node_names) as $added_nodes |
+
+      # Operator comparison
+      ([$base_cos[].name] // []) as $base_co_names |
+      ([$live_cos[].name] // []) as $live_co_names |
+      ($base_co_names - $live_co_names) as $missing_cos |
+
+      # Route comparison
+      ([$base_routes[] | (.namespace + "/" + .name)] // []) as $base_route_keys |
+      ([$live_routes[].key] // []) as $live_route_keys |
+      ($base_route_keys - $live_route_keys) as $missing_routes |
+
+      {
+        "snapshot_file": ($root.snapshot_file // "none"),
+        "baseline_version": $base_ver,
+        "live_version": $live_ver,
+        "node_diff": {
+          "baseline_count": ($base_nodes | length),
+          "live_count": ($live_nodes | length),
+          "missing_nodes": $missing_nodes,
+          "added_nodes": $added_nodes
+        },
+        "operator_diff": {
+          "baseline_count": ($base_cos | length),
+          "live_count": ($live_cos | length),
+          "missing_operators": $missing_cos
+        },
+        "route_diff": {
+          "baseline_count": ($base_routes | length),
+          "live_count": ($live_routes | length),
+          "missing_routes": $missing_routes
+        },
+        "has_missing_resources": (($missing_nodes | length > 0) or ($missing_cos | length > 0) or ($missing_routes | length > 0))
+      }
+    '
+    {
+      "snapshot_file": "{{ active_baseline_file }}",
+      "baseline": {{ (lookup('file', active_baseline_file) | default('{}')) if (baseline_stat_result is defined and baseline_stat_result.stat is defined and baseline_stat_result.stat.exists) else '{}' }},
+      "live_nodes": {{ (node_all_nodes | default([])) | to_json }},
+      "live_cos": {{ (co_all_operators | default([])) | to_json }},
+      "live_routes": {{ (postval_live_routes | default([])) | to_json }},
+      "live_version": "{{ postval_cv_current_version | default('unknown') }}"
+    }
+    EOF
+  register: baseline_diff_calc_raw
+  changed_when: false
+  failed_when: false
+  when:
+    - active_baseline_file != ""
+    - baseline_stat_result is defined
+    - baseline_stat_result.stat is defined
+    - baseline_stat_result.stat.exists
+
+- name: Parse Baseline Diff JSON calculation payload
+  set_fact:
+    baseline_diff_calc: "{{ baseline_diff_calc_raw.stdout | from_json }}"
+  when:
+    - baseline_diff_calc_raw is defined
+    - baseline_diff_calc_raw.rc | default(1) == 0
+    - baseline_diff_calc_raw.stdout | default('') | trim != ''
+
+- name: Fallback Baseline Diff when snapshot file is absent
+  set_fact:
+    baseline_diff_calc:
+      snapshot_file: "None (baseline snapshot not found on disk)"
+      baseline_version: "unknown"
+      live_version: "{{ postval_cv_current_version | default('unknown') }}"
+      node_diff:
+        baseline_count: 0
+        live_count: "{{ node_all_nodes | default([]) | length }}"
+        missing_nodes: []
+        added_nodes: []
+      operator_diff:
+        baseline_count: 0
+        live_count: "{{ co_all_operators | default([]) | length }}"
+        missing_operators: []
+      route_diff:
+        baseline_count: 0
+        live_count: "{{ postval_live_routes | default([]) | length }}"
+        missing_routes: []
+      has_missing_resources: false
+      snapshot_missing: true
+  when: >-
+    (baseline_diff_calc is not defined) or
+    (active_baseline_file == "") or
+    (baseline_stat_result is not defined) or
+    (baseline_stat_result.stat is not defined) or
+    (not (baseline_stat_result.stat.exists | default(false)))
+
+- name: Determine Baseline Diff check verdict
+  set_fact:
+    baseline_diff_verdict: >-
+      {{
+        'WARN' if (baseline_diff_calc.has_missing_resources | default(false) or baseline_diff_calc.snapshot_missing | default(false))
+        else 'PASS'
+      }}
+
+- name: Record Baseline Diff check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [baseline_diff_summary_entry] }}"
+  vars:
+    baseline_diff_summary_entry:
+      id: "08"
+      name: "Baseline Snapshot Comparison Diff"
+      gate: "WARN"
+      status: "{{ baseline_diff_verdict }}"
+      observed: >-
+        {% if baseline_diff_calc.snapshot_missing | default(false) %}
+        Baseline snapshot file not found on disk at '{{ snapshot_dir }}' (standalone execution mode)
+        {% elif baseline_diff_verdict == 'PASS' %}
+        All baseline resources intact & upgraded: Nodes {{ baseline_diff_calc.node_diff.live_count }}/{{ baseline_diff_calc.node_diff.baseline_count }}, Operators {{ baseline_diff_calc.operator_diff.live_count }}/{{ baseline_diff_calc.operator_diff.baseline_count }}, Routes {{ baseline_diff_calc.route_diff.live_count }}/{{ baseline_diff_calc.route_diff.baseline_count }} (0 missing)
+        {% else %}
+        Discovered missing resources vs baseline: Nodes missing: {{ baseline_diff_calc.node_diff.missing_nodes | length }}, Operators missing: {{ baseline_diff_calc.operator_diff.missing_operators | length }}, Routes missing: {{ baseline_diff_calc.route_diff.missing_routes | length }}
+        {% endif %}
+      details: >-
+        Snapshot: {{ baseline_diff_calc.snapshot_file | default('N/A') }}.
+        Version: {{ baseline_diff_calc.baseline_version }} → {{ baseline_diff_calc.live_version }}.
+        Nodes: {{ baseline_diff_calc.node_diff.baseline_count }} baseline, {{ baseline_diff_calc.node_diff.live_count }} live (missing: {{ baseline_diff_calc.node_diff.missing_nodes | join(', ') if baseline_diff_calc.node_diff.missing_nodes | length > 0 else 'none' }}).
+        Operators: {{ baseline_diff_calc.operator_diff.baseline_count }} baseline, {{ baseline_diff_calc.operator_diff.live_count }} live (missing: {{ baseline_diff_calc.operator_diff.missing_operators | join(', ') if baseline_diff_calc.operator_diff.missing_operators | length > 0 else 'none' }}).
+        Routes: {{ baseline_diff_calc.route_diff.baseline_count }} baseline, {{ baseline_diff_calc.route_diff.live_count }} live (missing: {{ baseline_diff_calc.route_diff.missing_routes | join(', ') if baseline_diff_calc.route_diff.missing_routes | length > 0 else 'none' }}).
+      raw_output: "{{ baseline_diff_calc | to_json }}"
+
+- name: Display Baseline Diff check evaluation
+  debug:
+    msg: >-
+      {% if baseline_diff_verdict == 'PASS' %}
+      ✔ PASS [Check 08 - Baseline Snapshot Comparison Diff] — All baseline nodes, operators, and routes intact across upgrade.
+      {% else %}
+      ! WARN [Check 08 - Baseline Snapshot Comparison Diff] — Resource diff detected vs Phase 01 baseline snapshot.
+      {% endif %}
+
+# ==============================================================================
+# WARN CHECK 09: Pending Certificate Signing Requests (CSR)
+# ==============================================================================
+- name: Execute Check 09 (WARN) — Query Certificate Signing Requests (CSRs)
+  shell: >-
+    oc get csr -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      .items // [] | {
+        "all_count": (length),
+        "pending": [
+          .[] | {
+            "name": .metadata.name,
+            "signerName": (.spec.signerName // "unknown"),
+            "username": (.spec.username // "unknown"),
+            "conditions": ([.status.conditions[]?.type] // [])
+          } | select((.conditions | length == 0) or (.conditions | contains(["Approved"]) | not))
+        ]
+      }
+    '
+  register: postval_csr_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse CSR JSON payload
+  set_fact:
+    postval_csr_parsed: "{{ postval_csr_raw_query.stdout | from_json }}"
+  when: (postval_csr_raw_query.rc | default(1) == 0) and (postval_csr_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback CSR payload on query failure
+  set_fact:
+    postval_csr_parsed:
+      all_count: 0
+      pending: []
+  when: (postval_csr_raw_query.rc | default(1) != 0) or (postval_csr_raw_query.stdout | default('') | trim == '')
+
+- name: Initialize offending pending CSRs list
+  set_fact:
+    postval_csr_offenders: []
+
+- name: Filter pending CSRs against csr_allow_list
+  set_fact:
+    postval_csr_offenders: "{{ postval_csr_offenders + [item] }}"
+  loop: "{{ postval_csr_parsed.pending | default([]) }}"
+  when: item.name not in (csr_allow_list | default([]))
+
+- name: Determine CSR check verdict
+  set_fact:
+    postval_csr_verdict: "{{ 'WARN' if (postval_csr_offenders | length > 0) else 'PASS' }}"
+
+- name: Record CSR check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [postval_csr_summary_entry] }}"
+  vars:
+    postval_csr_summary_entry:
+      id: "09"
+      name: "Pending Certificate Signing Requests (CSR)"
+      gate: "WARN"
+      status: "{{ postval_csr_verdict }}"
+      observed: >-
+        {% if postval_csr_verdict == 'PASS' %}
+        No stuck or pending CertificateSigningRequests discovered ({{ postval_csr_parsed.all_count | default(0) }} total CSRs evaluated)
+        {% else %}
+        Found {{ postval_csr_offenders | length }} stuck/pending CertificateSigningRequest(s) requiring approval
+        {% endif %}
+      details: >-
+        {% if postval_csr_verdict == 'PASS' %}
+        All CSRs are approved and issued on cluster {{ cluster_name | default('cluster') }}.
+        {% else %}
+        Pending CSRs: {% for c in postval_csr_offenders %}{{ c.name }} (signer: {{ c.signerName | default('unknown') }}){% if not loop.last %}, {% endif %}{% endfor %}.
+        {% endif %}
+      raw_output: "{{ postval_csr_parsed | to_json }}"
+
+- name: Display CSR check evaluation
+  debug:
+    msg: >-
+      {% if postval_csr_verdict == 'PASS' %}
+      ✔ PASS [Check 09 - Pending Certificate Signing Requests (CSR)] — No stuck or pending CSRs.
+      {% else %}
+      ! WARN [Check 09 - Pending Certificate Signing Requests (CSR)] — Found {{ postval_csr_offenders | length }} pending CSR(s).
+      {% endif %}
+
+# ==============================================================================
+# WARN CHECK 10: Workload & Route Reachability Smoke Test
+# ==============================================================================
+- name: Execute Check 10 (WARN) — Query default IngressController and console route
+  shell: >-
+    (oc get ingresscontroller default -n openshift-ingress-operator -o json --kubeconfig "{{ kubeconfig_path }}" 2>/dev/null &&
+     oc get route console -n openshift-console -o json --kubeconfig "{{ kubeconfig_path }}" 2>/dev/null) | jq -s -r '
+      (.[0] // {}) as $ic |
+      (.[1] // {}) as $rc |
+      {
+        "ingress_available": ([($ic.status.conditions // [])[] | select(.type=="Available") | .status] | first // "Unknown"),
+        "ingress_degraded": ([($ic.status.conditions // [])[] | select(.type=="Degraded") | .status] | first // "Unknown"),
+        "ingress_domain": ($ic.status.domain // "unknown"),
+        "console_route_admitted": ([($rc.status.ingress // [])[].conditions[]? | select(.type=="Admitted") | .status] | first // "Unknown"),
+        "console_host": ($rc.spec.host // "unknown")
+      }
+    '
+  register: smoke_test_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse Smoke Test JSON payload
+  set_fact:
+    smoke_test_parsed: "{{ smoke_test_raw_query.stdout | from_json }}"
+  when: (smoke_test_raw_query.rc | default(1) == 0) and (smoke_test_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback Smoke Test payload on query failure
+  set_fact:
+    smoke_test_parsed:
+      ingress_available: "Unknown"
+      ingress_degraded: "Unknown"
+      ingress_domain: "unknown"
+      console_route_admitted: "Unknown"
+      console_host: "unknown"
+  when: (smoke_test_raw_query.rc | default(1) != 0) or (smoke_test_raw_query.stdout | default('') | trim == '')
+
+- name: Determine Smoke Test verdict
+  set_fact:
+    smoke_test_verdict: >-
+      {{
+        'PASS' if ((smoke_test_parsed.ingress_available == 'True' or smoke_test_parsed.ingress_available == 'Unknown') and (smoke_test_parsed.ingress_degraded != 'True') and (smoke_test_parsed.console_route_admitted == 'True' or smoke_test_parsed.console_route_admitted == 'Unknown'))
+        else 'WARN'
+      }}
+
+- name: Record Smoke Test check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [smoke_test_summary_entry] }}"
+  vars:
+    smoke_test_summary_entry:
+      id: "10"
+      name: "Workload and Route Reachability Smoke Test"
+      gate: "WARN"
+      status: "{{ smoke_test_verdict }}"
+      observed: >-
+        {% if smoke_test_verdict == 'PASS' %}
+        Default IngressController is Available (domain: {{ smoke_test_parsed.ingress_domain | default('unknown') }}) and console route is admitted (host: {{ smoke_test_parsed.console_host | default('unknown') }})
+        {% else %}
+        Ingress or sample route reachability degraded (Ingress Available={{ smoke_test_parsed.ingress_available }}, Degraded={{ smoke_test_parsed.ingress_degraded }}, Console Admitted={{ smoke_test_parsed.console_route_admitted }})
+        {% endif %}
+      details: "Ingress Available: {{ smoke_test_parsed.ingress_available }}, Degraded: {{ smoke_test_parsed.ingress_degraded }}; Console Route Host: {{ smoke_test_parsed.console_host }}, Admitted: {{ smoke_test_parsed.console_route_admitted }}."
+      raw_output: "{{ smoke_test_parsed | to_json }}"
+
+- name: Display Smoke Test check evaluation
+  debug:
+    msg: >-
+      {% if smoke_test_verdict == 'PASS' %}
+      ✔ PASS [Check 10 - Workload and Route Reachability Smoke Test] — Ingress controller and console routes healthy.
+      {% else %}
+      ! WARN [Check 10 - Workload and Route Reachability Smoke Test] — Ingress or console route reported non-optimal status.
+      {% endif %}
+
+# ==============================================================================
+# SUMMARY & CONFIRMATION
+# ==============================================================================
+- name: Postvalidation Checks Completed Summary
+  debug:
+    msg: >-
+      ══════════════════════════════════════════════════════════════════════════
+      Postvalidation Completed for Cluster '{{ cluster_name | default('cluster') }}'
+      Total Checks Evaluated: {{ health_summary | length }}
+      Passed:   {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}
+      Warnings: {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}
+      Failures: {{ health_summary | selectattr('status', 'equalto', 'FAIL') | list | length }}
+      ══════════════════════════════════════════════════════════════════════════

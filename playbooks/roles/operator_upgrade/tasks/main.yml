@@ -1,0 +1,8 @@
+# Targets Ansible 2.7.17.
+---
+- name: Process Operator Upgrades
+  include_tasks: upgrade_operator.yml
+  loop: "{{ operator_upgrade_needed | default([]) }}"
+  loop_control:
+    loop_var: operator_item
+    label: "{{ operator_item.namespace }}/{{ operator_item.name }}"

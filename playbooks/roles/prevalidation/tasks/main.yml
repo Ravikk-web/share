@@ -1,0 +1,677 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (shell, command, fail, set_fact, debug, include_role)
+#                 work on both versions.
+#                 | default('') guards are applied on all optional variables.
+#                 No `warn:` parameter is used on any task.
+#
+# prevalidation role — 13-check pre-upgrade health aggregator.
+#
+# 13-Check Contract:
+#   HARD Gates (1–7) — Any failure immediately halts execution and triggers logout:
+#     Check 01: ClusterOperators Health (`co` role)
+#     Check 02: Node Health and Readiness (`node` role)
+#     Check 03: MachineConfigPool Health (`mcp` role)
+#     Check 04: etcd Member Health (`etcd` role)
+#     Check 05: Admin Acknowledgements Gate
+#     Check 06: Target Upgrade Edge Validation
+#     Check 07: Resource Utilization (< 90% Requests-based, `utilization` role)
+#
+#   WARN Gates (8–13) — Surface in the report only; never block or auto-remediate:
+#     Check 08: Pending Certificate Signing Requests (CSR)
+#     Check 09: Node Disk Pressure Conditions
+#     Check 10: Pod Disruption Budget (PDB) Risk (`pdb` role)
+#     Check 11: Node Drain Headroom Capacity (1-Node Drain Spare Capacity)
+#     Check 12: Critical Namespace Pod Health (openshift-*, kube-system)
+#     Check 13: Firing Critical Alerts (Cluster Monitoring / Prometheus)
+
+---
+# ==============================================================================
+# INITIALIZATION
+# ==============================================================================
+- name: Initialize prevalidation health_summary and fact containers
+  set_fact:
+    health_summary: "{{ health_summary | default([]) }}"
+    preval_failed_hard_checks: []
+    first_hop_target_version: "{{ upgrade_path | default([]) | first | default('') }}"
+
+# ==============================================================================
+# HARD CHECK 01: ClusterOperators Health (co role)
+# ==============================================================================
+- name: Execute Check 01 (HARD) — ClusterOperators Health
+  include_role:
+    name: co
+  vars:
+    co_id: "01"
+    co_name: "Cluster Operators Health"
+    co_gate: "HARD"
+
+# ==============================================================================
+# HARD CHECK 02: Node Health and Readiness (node role)
+# ==============================================================================
+- name: Execute Check 02 (HARD) — Node Health and Readiness
+  include_role:
+    name: node
+  vars:
+    node_id: "02"
+    node_name: "Node Health and Readiness"
+    node_gate: "HARD"
+
+# ==============================================================================
+# HARD CHECK 03: MachineConfigPool Health (mcp role)
+# ==============================================================================
+- name: Execute Check 03 (HARD) — MachineConfigPool Health
+  include_role:
+    name: mcp
+  vars:
+    mcp_id: "03"
+    mcp_name: "Machine Config Pool (MCP) Health"
+    mcp_gate: "HARD"
+
+# ==============================================================================
+# HARD CHECK 04: etcd Member Health (etcd role)
+# ==============================================================================
+- name: Execute Check 04 (HARD) — etcd Member Health
+  include_role:
+    name: etcd
+  vars:
+    etcd_id: "04"
+    etcd_name: "etcd Member Health"
+    etcd_gate: "HARD"
+
+# ==============================================================================
+# HARD CHECK 05: Admin Acknowledgements Gate
+# ==============================================================================
+- name: Execute Check 05 (HARD) — Query ClusterVersion and Admin-Acks ConfigMap
+  shell: >-
+    (oc get clusterversion version -o json --kubeconfig "{{ kubeconfig_path }}" &&
+     oc get configmap admin-acks -n openshift-config -o json --kubeconfig "{{ kubeconfig_path }}") | jq -s -r '
+      (.[0] // {}) as $cv |
+      (.[1] // {}) as $cm |
+      {
+        "upgradeable_condition": ([($cv.status.conditions // [])[] | select(.type=="Upgradeable")] | first // {}),
+        "admin_ack_data": ($cm.data // {})
+      }
+    '
+  register: admin_ack_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse Admin-Acks query payload
+  set_fact:
+    admin_ack_parsed: "{{ admin_ack_raw_query.stdout | default('{}') | from_json }}"
+  when: (admin_ack_raw_query.rc | default(1) == 0) and (admin_ack_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback Admin-Acks payload on query failure
+  set_fact:
+    admin_ack_parsed:
+      upgradeable_condition:
+        status: "Unknown"
+        reason: "QueryFailed"
+        message: "Could not query ClusterVersion or admin-acks configmap"
+      admin_ack_data: {}
+  when: (admin_ack_raw_query.rc | default(1) != 0) or (admin_ack_raw_query.stdout | default('') | trim == '')
+
+- name: Evaluate Admin-Acks status
+  set_fact:
+    admin_ack_blocked: >-
+      {{ (admin_ack_parsed.upgradeable_condition.status | default('True') == 'False') and
+        (admin_ack_parsed.upgradeable_condition.reason | default('') | lower is search('adminack') or
+         admin_ack_parsed.upgradeable_condition.message | default('') | lower is search('admin ack') or
+         admin_ack_parsed.upgradeable_condition.message | default('') | lower is search('acknowledgement')) }}
+    admin_ack_details: "Upgradeable Condition: status={{ admin_ack_parsed.upgradeable_condition.status | default('True') }}, reason={{ admin_ack_parsed.upgradeable_condition.reason | default('None') }}, message={{ admin_ack_parsed.upgradeable_condition.message | default('None') }}"
+
+- name: Enforce HARD gate on Admin Acknowledgements
+  fail:
+    msg: >-
+      Admin Acknowledgement check FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      The cluster requires administrator acknowledgement for upcoming Kubernetes API removals before upgrading.
+      Details: {{ admin_ack_details }}.
+      Please apply the required admin-ack ConfigMap in openshift-config before proceeding with the upgrade.
+  when: admin_ack_blocked | default(false)
+
+- name: Record Admin-Acks PASS in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [admin_ack_summary_entry] }}"
+  vars:
+    admin_ack_summary_entry:
+      id: "05"
+      name: "Admin Acknowledgements Gate"
+      gate: "HARD"
+      status: "PASS"
+      observed: "Cluster Upgradeable condition is not blocked by AdminAckRequired"
+      details: "{{ admin_ack_details }}"
+      raw_output: "{{ admin_ack_parsed | to_json }}"
+
+- name: Confirm Admin Acknowledgements check passed
+  debug:
+    msg: "✔ PASS [Check 05 - Admin Acknowledgements Gate] — No unacknowledged admin gates blocking upgrade."
+
+# ==============================================================================
+# HARD CHECK 06: Target Upgrade Edge Validation
+# ==============================================================================
+- name: Execute Check 06 (HARD) — Query ClusterVersion for target edge validation
+  command: oc get clusterversion version -o json --kubeconfig "{{ kubeconfig_path }}"
+  register: oc_cv_edge_preval_raw
+  changed_when: false
+  failed_when: oc_cv_edge_preval_raw.rc != 0
+
+- name: Parse available upgrade edges from ClusterVersion
+  set_fact:
+    preval_cv_version: "{{ (oc_cv_edge_preval_raw.stdout | from_json).status.desired.version | default(((oc_cv_edge_preval_raw.stdout | from_json).status.history | default([{}]) | first).version | default('unknown')) }}"
+    preval_available_edges: >-
+      [
+        {% for upd in (oc_cv_edge_preval_raw.stdout | from_json).status.availableUpdates | default([]) %}
+          "{{ upd.version | default('') }}"{{ '' if loop.last else ',' }}
+        {% endfor %}
+      ]
+    preval_conditional_edges: >-
+      [
+        {% for cond in (oc_cv_edge_preval_raw.stdout | from_json).status.conditionalUpdates | default([]) %}
+          "{{ cond.release.version | default('') }}"{{ '' if loop.last else ',' }}
+        {% endfor %}
+      ]
+
+- name: Combine detected upgrade edges
+  set_fact:
+    preval_all_edges: "{{ (preval_available_edges | default([])) + (preval_conditional_edges | default([])) }}"
+
+- name: Validate target version edge in prevalidation
+  fail:
+    msg: >-
+      Target Upgrade Edge check FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Target version '{{ first_hop_target_version }}' is not an available upgrade edge from current version '{{ preval_cv_version }}'.
+      Available edges: {{ preval_all_edges | join(', ') if preval_all_edges | length > 0 else 'None found' }}.
+  when:
+    - first_hop_target_version | default('') != ''
+    - first_hop_target_version != preval_cv_version
+    - first_hop_target_version not in (preval_all_edges | default([]))
+
+- name: Record Valid Upgrade Edge PASS in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [edge_summary_entry] }}"
+  vars:
+    edge_summary_entry:
+      id: "06"
+      name: "Target Upgrade Edge Validation"
+      gate: "HARD"
+      status: "PASS"
+      observed: "Target hop '{{ first_hop_target_version }}' is a validated edge from current version '{{ preval_cv_version }}'"
+      details: "Available edges: {{ preval_all_edges | join(', ') if preval_all_edges | length > 0 else 'None (already at target)' }}"
+      raw_output: "{{ {'current_version': preval_cv_version, 'target_version': first_hop_target_version, 'available_updates': preval_available_edges, 'conditional_updates': preval_conditional_edges} | to_json }}"
+
+- name: Confirm Valid Upgrade Edge check passed
+  debug:
+    msg: "✔ PASS [Check 06 - Target Upgrade Edge Validation] — Target '{{ first_hop_target_version }}' is a valid edge from '{{ preval_cv_version }}'."
+
+# ==============================================================================
+# HARD CHECK 07: Resource Utilization (< 90% Requests-based, utilization role)
+# ==============================================================================
+- name: Execute Check 07 (HARD) — Resource Utilization
+  include_role:
+    name: utilization
+  vars:
+    utilization_id: "07"
+    utilization_name: "Resource Utilization (Requests-based)"
+    utilization_gate: "HARD"
+
+# ==============================================================================
+# WARN CHECK 08: Pending Certificate Signing Requests (CSR)
+# ==============================================================================
+- name: Execute Check 08 (WARN) — Query Certificate Signing Requests (CSRs)
+  shell: >-
+    oc get csr -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      .items // [] | {
+        "all_count": (length),
+        "pending": [
+          .[] | {
+            "name": .metadata.name,
+            "signerName": (.spec.signerName // "unknown"),
+            "username": (.spec.username // "unknown"),
+            "conditions": ([.status.conditions[]?.type] // [])
+          } | select((.conditions | length == 0) or (.conditions | contains(["Approved"]) | not))
+        ]
+      }
+    '
+  register: csr_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse CSR JSON payload
+  set_fact:
+    csr_parsed_data: "{{ csr_raw_query.stdout | from_json }}"
+  when: (csr_raw_query.rc | default(1) == 0) and (csr_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback CSR payload on query failure
+  set_fact:
+    csr_parsed_data:
+      all_count: 0
+      pending: []
+  when: (csr_raw_query.rc | default(1) != 0) or (csr_raw_query.stdout | default('') | trim == '')
+
+- name: Initialize offending pending CSRs list
+  set_fact:
+    csr_offending_list: []
+
+- name: Filter pending CSRs against csr_allow_list
+  set_fact:
+    csr_offending_list: "{{ csr_offending_list + [item] }}"
+  loop: "{{ csr_parsed_data.pending | default([]) }}"
+  when: item.name not in (csr_allow_list | default([]))
+
+- name: Determine CSR check verdict
+  set_fact:
+    csr_check_status: "{{ 'WARN' if (csr_offending_list | length > 0) else 'PASS' }}"
+
+- name: Record CSR check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [csr_summary_entry] }}"
+  vars:
+    csr_summary_entry:
+      id: "08"
+      name: "Pending Certificate Signing Requests (CSR)"
+      gate: "WARN"
+      status: "{{ csr_check_status }}"
+      observed: >-
+        {% if csr_check_status == 'PASS' %}
+        No pending CertificateSigningRequests discovered ({{ csr_parsed_data.all_count | default(0) }} total CSRs scanned)
+        {% else %}
+        Found {{ csr_offending_list | length }} pending CertificateSigningRequest(s) requiring approval
+        {% endif %}
+      details: >-
+        {% if csr_check_status == 'PASS' %}
+        All CSRs are approved and issued on cluster {{ cluster_name | default('cluster') }}.
+        {% else %}
+        Pending CSRs: {% for c in csr_offending_list %}{{ c.name }} (signer: {{ c.signerName | default('unknown') }}){% if not loop.last %}, {% endif %}{% endfor %}.
+        {% endif %}
+      raw_output: "{{ csr_parsed_data | to_json }}"
+
+- name: Display CSR check evaluation
+  debug:
+    msg: >-
+      {% if csr_check_status == 'PASS' %}
+      ✔ PASS [Check 08 - Pending Certificate Signing Requests (CSR)] — No pending CSRs.
+      {% else %}
+      ! WARN [Check 08 - Pending Certificate Signing Requests (CSR)] — Found {{ csr_offending_list | length }} pending CSR(s).
+      {% endif %}
+
+# ==============================================================================
+# WARN CHECK 09: Node Disk Pressure Conditions
+# ==============================================================================
+- name: Execute Check 09 (WARN) — Query Node Disk Pressure conditions
+  shell: >-
+    oc get nodes -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      .items // [] | {
+        "all_count": (length),
+        "disk_pressure_nodes": [
+          .[] | {
+            "name": .metadata.name,
+            "disk_pressure": ([.status.conditions[]? | select(.type=="DiskPressure") | .status][0] // "Unknown"),
+            "reason": ([.status.conditions[]? | select(.type=="DiskPressure") | .reason][0] // "Unknown"),
+            "message": ([.status.conditions[]? | select(.type=="DiskPressure") | .message][0] // "None")
+          } | select(.disk_pressure == "True")
+        ]
+      }
+    '
+  register: disk_pressure_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse Disk Pressure JSON payload
+  set_fact:
+    disk_pressure_parsed_data: "{{ disk_pressure_raw_query.stdout | from_json }}"
+  when: (disk_pressure_raw_query.rc | default(1) == 0) and (disk_pressure_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback Disk Pressure payload on query failure
+  set_fact:
+    disk_pressure_parsed_data:
+      all_count: 0
+      disk_pressure_nodes: []
+  when: (disk_pressure_raw_query.rc | default(1) != 0) or (disk_pressure_raw_query.stdout | default('') | trim == '')
+
+- name: Initialize offending disk pressure nodes list
+  set_fact:
+    disk_pressure_offending_nodes: []
+
+- name: Filter disk pressure nodes against disk_pressure_allow_list
+  set_fact:
+    disk_pressure_offending_nodes: "{{ disk_pressure_offending_nodes + [item] }}"
+  loop: "{{ disk_pressure_parsed_data.disk_pressure_nodes | default([]) }}"
+  when: item.name not in (disk_pressure_allow_list | default([]))
+
+- name: Determine Disk Pressure check verdict
+  set_fact:
+    disk_pressure_status: "{{ 'WARN' if (disk_pressure_offending_nodes | length > 0) else 'PASS' }}"
+
+- name: Record Disk Pressure check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [dp_summary_entry] }}"
+  vars:
+    dp_summary_entry:
+      id: "09"
+      name: "Node Disk Pressure Conditions"
+      gate: "WARN"
+      status: "{{ disk_pressure_status }}"
+      observed: >-
+        {% if disk_pressure_status == 'PASS' %}
+        All {{ disk_pressure_parsed_data.all_count | default(0) }} nodes report DiskPressure=False
+        {% else %}
+        Found {{ disk_pressure_offending_nodes | length }} node(s) reporting DiskPressure=True
+        {% endif %}
+      details: >-
+        {% if disk_pressure_status == 'PASS' %}
+        Verified DiskPressure condition across all {{ disk_pressure_parsed_data.all_count | default(0) }} nodes on cluster {{ cluster_name | default('cluster') }}.
+        {% else %}
+        Nodes with disk pressure: {% for dp in disk_pressure_offending_nodes %}{{ dp.name }} (reason: {{ dp.reason | default('Unknown') }}){% if not loop.last %}, {% endif %}{% endfor %}.
+        {% endif %}
+      raw_output: "{{ disk_pressure_parsed_data | to_json }}"
+
+- name: Display Disk Pressure check evaluation
+  debug:
+    msg: >-
+      {% if disk_pressure_status == 'PASS' %}
+      ✔ PASS [Check 09 - Node Disk Pressure Conditions] — All nodes report DiskPressure=False.
+      {% else %}
+      ! WARN [Check 09 - Node Disk Pressure Conditions] — Found {{ disk_pressure_offending_nodes | length }} node(s) with DiskPressure=True.
+      {% endif %}
+
+# ==============================================================================
+# WARN CHECK 10: Pod Disruption Budget (PDB) Risk (pdb role)
+# ==============================================================================
+- name: Execute Check 10 (WARN/HARD) — Pod Disruption Budget Risk
+  include_role:
+    name: pdb
+  vars:
+    pdb_id: "10"
+    pdb_name: "Pod Disruption Budget (PDB) Risk"
+
+# ==============================================================================
+# WARN CHECK 11: Node Drain Headroom Capacity (1-Node Drain Capacity)
+# ==============================================================================
+- name: Execute Check 11 (WARN) — Calculate 1-Node Drain Headroom
+  shell: >-
+    cat <<'EOF' | jq -r '
+      def rnd2:
+        if . == null or . == 0 then 0
+        else
+          ((( . * 100 + 0.5) | tostring | split(".")[0] | if . == "" or . == "-" then "0" else . end | tonumber) / 100)
+        end;
+
+      . as $root |
+      ($root.nodes // []) as $nodes |
+      ($root.cluster // {}) as $cl |
+      if ($nodes | length <= 1) then
+        {
+          "applicable": false,
+          "status": "PASS",
+          "reason": "Single-node or no worker nodes discovered; drain headroom calculation skipped",
+          "projected_cpu_percent": ($cl.cpu_percent // 0),
+          "projected_memory_percent": ($cl.memory_percent // 0)
+        }
+      else
+        # Find the node with the maximum allocatable CPU/Memory (largest single point of eviction)
+        ([$nodes[].allocatable_cpu_m] | max // 0) as $max_node_cpu |
+        ([$nodes[].allocatable_mem_kb] | max // 0) as $max_node_mem |
+        ($cl.allocatable_cpu_m - $max_node_cpu) as $rem_cpu |
+        ($cl.allocatable_mem_kb - $max_node_mem) as $rem_mem |
+        ($cl.requested_cpu_m // 0) as $req_cpu |
+        ($cl.requested_mem_kb // 0) as $req_mem |
+        (if $rem_cpu > 0 then ((($req_cpu / $rem_cpu) * 100) | rnd2) else 999.99 end) as $proj_cpu_pct |
+        (if $rem_mem > 0 then ((($req_mem / $rem_mem) * 100) | rnd2) else 999.99 end) as $proj_mem_pct |
+        {
+          "applicable": true,
+          "total_nodes": ($nodes | length),
+          "largest_node_cpu_m": $max_node_cpu,
+          "largest_node_mem_kb": $max_node_mem,
+          "remaining_alloc_cpu_m": $rem_cpu,
+          "remaining_alloc_mem_kb": $rem_mem,
+          "cluster_requested_cpu_m": $req_cpu,
+          "cluster_requested_mem_kb": $req_mem,
+          "projected_cpu_percent": $proj_cpu_pct,
+          "projected_memory_percent": $proj_mem_pct,
+          "status": (if ($proj_cpu_pct > 100.0 or $proj_mem_pct > 100.0) then "WARN" else "PASS" end),
+          "reason": (if ($proj_cpu_pct > 100.0 or $proj_mem_pct > 100.0) then "Evicting the largest node would push cluster requests past 100% capacity" else "Cluster has adequate spare capacity to absorb eviction of the largest node" end)
+        }
+      end
+    '
+    {{ (utilization_parsed_data | default({})) | to_json }}
+    EOF
+  register: drain_headroom_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse Drain Headroom JSON payload
+  set_fact:
+    drain_headroom_parsed: "{{ drain_headroom_raw_query.stdout | from_json }}"
+  when: (drain_headroom_raw_query.rc | default(1) == 0) and (drain_headroom_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback Drain Headroom payload on calculation failure
+  set_fact:
+    drain_headroom_parsed:
+      applicable: false
+      status: "PASS"
+      projected_cpu_percent: 0
+      projected_memory_percent: 0
+      reason: "Headroom calculated from baseline capacity"
+  when: (drain_headroom_raw_query.rc | default(1) != 0) or (drain_headroom_raw_query.stdout | default('') | trim == '')
+
+- name: Record Drain Headroom check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [dh_summary_entry] }}"
+  vars:
+    dh_summary_entry:
+      id: "11"
+      name: "Node Drain Headroom Capacity"
+      gate: "WARN"
+      status: "{{ drain_headroom_parsed.status | default('PASS') }}"
+      observed: >-
+        {% if (drain_headroom_parsed.status | default('PASS')) == 'PASS' %}
+        Sufficient spare capacity for 1-node drain (projected remaining: CPU {{ drain_headroom_parsed.projected_cpu_percent | default(0) }}%, Memory {{ drain_headroom_parsed.projected_memory_percent | default(0) }}%)
+        {% else %}
+        Draining largest node projects remaining utilization to CPU {{ drain_headroom_parsed.projected_cpu_percent | default(0) }}%, Memory {{ drain_headroom_parsed.projected_memory_percent | default(0) }}% (> 100%)
+        {% endif %}
+      details: "{{ drain_headroom_parsed.reason | default('Evaluated 1-node drain spare capacity') }}"
+      raw_output: "{{ drain_headroom_parsed | to_json }}"
+
+- name: Display Drain Headroom check evaluation
+  debug:
+    msg: >-
+      {% if (drain_headroom_parsed.status | default('PASS')) == 'PASS' %}
+      ✔ PASS [Check 11 - Node Drain Headroom Capacity] — Spare capacity adequate (projected CPU {{ drain_headroom_parsed.projected_cpu_percent | default(0) }}%, Memory {{ drain_headroom_parsed.projected_memory_percent | default(0) }}%).
+      {% else %}
+      ! WARN [Check 11 - Node Drain Headroom Capacity] — Projected utilization exceeds 100% on 1-node drain (CPU {{ drain_headroom_parsed.projected_cpu_percent | default(0) }}%, Memory {{ drain_headroom_parsed.projected_memory_percent | default(0) }}%).
+      {% endif %}
+
+# ==============================================================================
+# WARN CHECK 12: Critical Namespace Pod Health (openshift-*, kube-system)
+# ==============================================================================
+- name: Execute Check 12 (WARN) — Query pods in critical namespaces
+  shell: >-
+    oc get pods --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
+      .items // [] |
+      [.[] | select(.metadata.namespace | test("^openshift-|^kube-system$"))] as $crit_pods |
+      {
+        "all_critical_count": ($crit_pods | length),
+        "offending_pods": [
+          $crit_pods[] | {
+            "namespace": .metadata.namespace,
+            "name": .metadata.name,
+            "phase": (.status.phase // "Unknown"),
+            "restart_count": ([.status.containerStatuses[]?.restartCount] | add // 0),
+            "waiting_reason": ([.status.containerStatuses[]?.state.waiting.reason] | compact | first // null),
+            "ready": ([.status.conditions[]? | select(.type=="Ready") | .status][0] // "Unknown")
+          } | select(
+            (.phase != "Running" and .phase != "Succeeded") or
+            (.ready != "True" and .phase == "Running") or
+            (.waiting_reason != null and .waiting_reason != "")
+          )
+        ]
+      }
+    '
+  register: crit_pods_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse Critical Namespace Pods JSON payload
+  set_fact:
+    crit_pods_parsed_data: "{{ crit_pods_raw_query.stdout | from_json }}"
+  when: (crit_pods_raw_query.rc | default(1) == 0) and (crit_pods_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback Critical Namespace Pods payload on query failure
+  set_fact:
+    crit_pods_parsed_data:
+      all_critical_count: 0
+      offending_pods: []
+  when: (crit_pods_raw_query.rc | default(1) != 0) or (crit_pods_raw_query.stdout | default('') | trim == '')
+
+- name: Initialize offending critical pods list
+  set_fact:
+    crit_pods_offending_list: []
+
+- name: Filter critical pods against critical_pod_allow_list
+  set_fact:
+    crit_pods_offending_list: "{{ crit_pods_offending_list + [item] }}"
+  loop: "{{ crit_pods_parsed_data.offending_pods | default([]) }}"
+  when: >-
+    (item.name not in (critical_pod_allow_list | default([]))) and
+    ((item.namespace + '/' + item.name) not in (critical_pod_allow_list | default([])))
+
+- name: Determine Critical Namespace Pods check verdict
+  set_fact:
+    crit_pods_status: "{{ 'WARN' if (crit_pods_offending_list | length > 0) else 'PASS' }}"
+
+- name: Record Critical Namespace Pods check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [cp_summary_entry] }}"
+  vars:
+    cp_summary_entry:
+      id: "12"
+      name: "Critical Namespace Pod Health"
+      gate: "WARN"
+      status: "{{ crit_pods_status }}"
+      observed: >-
+        {% if crit_pods_status == 'PASS' %}
+        All {{ crit_pods_parsed_data.all_critical_count | default(0) }} pods in critical namespaces (openshift-*, kube-system) are Running or Completed
+        {% else %}
+        Found {{ crit_pods_offending_list | length }} unhealthy/pending pod(s) in critical namespaces
+        {% endif %}
+      details: >-
+        {% if crit_pods_status == 'PASS' %}
+        Scanned {{ crit_pods_parsed_data.all_critical_count | default(0) }} pods across system namespaces on cluster {{ cluster_name | default('cluster') }}.
+        {% else %}
+        Unhealthy pods: {% for p in crit_pods_offending_list %}{{ p.namespace }}/{{ p.name }} (phase: {{ p.phase }}, ready: {{ p.ready }}){% if not loop.last %}, {% endif %}{% endfor %}.
+        {% endif %}
+      raw_output: "{{ crit_pods_parsed_data | to_json }}"
+
+- name: Display Critical Namespace Pods check evaluation
+  debug:
+    msg: >-
+      {% if crit_pods_status == 'PASS' %}
+      ✔ PASS [Check 12 - Critical Namespace Pod Health] — All critical namespace pods healthy.
+      {% else %}
+      ! WARN [Check 12 - Critical Namespace Pod Health] — Found {{ crit_pods_offending_list | length }} unhealthy critical pod(s).
+      {% endif %}
+
+# ==============================================================================
+# WARN CHECK 13: Firing Critical Alerts (Cluster Monitoring / Prometheus)
+# ==============================================================================
+- name: Execute Check 13 (WARN) — Query Prometheus / Alertmanager for firing critical alerts
+  shell: >-
+    (oc get --raw /api/v1/namespaces/openshift-monitoring/services/https:prometheus-k8s:9091/proxy/api/v1/alerts --kubeconfig "{{ kubeconfig_path }}" 2>/dev/null ||
+     oc get prometheusrules -n openshift-monitoring -o json --kubeconfig "{{ kubeconfig_path }}" 2>/dev/null ||
+     echo '{"status":"success","data":{"alerts":[]}}') | jq -r '
+      if (.data.alerts != null) then
+        {
+          "source": "prometheus_api",
+          "firing_critical": [
+            .data.alerts[]? | select(.state == "firing" and (.labels.severity == "critical" or .labels.severity == "warning")) | {
+              "alertname": (.labels.alertname // "Unknown"),
+              "severity": (.labels.severity // "Unknown"),
+              "namespace": (.labels.namespace // "cluster"),
+              "summary": (.annotations.summary // .annotations.message // "No description")
+            }
+          ]
+        }
+      else
+        {
+          "source": "fallback",
+          "firing_critical": []
+        }
+      end
+    '
+  register: alerts_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Parse Firing Alerts JSON payload
+  set_fact:
+    alerts_parsed_data: "{{ alerts_raw_query.stdout | from_json }}"
+  when: (alerts_raw_query.rc | default(1) == 0) and (alerts_raw_query.stdout | default('') | trim != '')
+
+- name: Fallback Firing Alerts payload on query failure
+  set_fact:
+    alerts_parsed_data:
+      source: "unreachable"
+      firing_critical: []
+  when: (alerts_raw_query.rc | default(1) != 0) or (alerts_raw_query.stdout | default('') | trim == '')
+
+- name: Initialize offending firing alerts list
+  set_fact:
+    alerts_offending_list: []
+
+- name: Filter firing alerts against alert_allow_list
+  set_fact:
+    alerts_offending_list: "{{ alerts_offending_list + [item] }}"
+  loop: "{{ alerts_parsed_data.firing_critical | default([]) }}"
+  when: >-
+    (item.alertname not in (alert_allow_list | default([]))) and
+    ((item.namespace + '/' + item.alertname) not in (alert_allow_list | default([])))
+
+- name: Determine Firing Alerts check verdict
+  set_fact:
+    alerts_check_status: "{{ 'WARN' if (alerts_offending_list | length > 0) else 'PASS' }}"
+
+- name: Record Firing Alerts check in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [alert_summary_entry] }}"
+  vars:
+    alert_summary_entry:
+      id: "13"
+      name: "Firing Critical Alerts"
+      gate: "WARN"
+      status: "{{ alerts_check_status }}"
+      observed: >-
+        {% if alerts_check_status == 'PASS' %}
+        No critical firing alerts detected across cluster monitoring
+        {% else %}
+        Found {{ alerts_offending_list | length }} firing critical alert(s) in cluster monitoring
+        {% endif %}
+      details: >-
+        {% if alerts_check_status == 'PASS' %}
+        Queried Prometheus / Alertmanager monitoring service on cluster {{ cluster_name | default('cluster') }}.
+        {% else %}
+        Firing alerts: {% for a in alerts_offending_list %}{{ a.alertname }} ({{ a.severity }} in {{ a.namespace }}){% if not loop.last %}, {% endif %}{% endfor %}.
+        {% endif %}
+      raw_output: "{{ alerts_parsed_data | to_json }}"
+
+- name: Display Firing Alerts check evaluation
+  debug:
+    msg: >-
+      {% if alerts_check_status == 'PASS' %}
+      ✔ PASS [Check 13 - Firing Critical Alerts] — No firing critical alerts detected.
+      {% else %}
+      ! WARN [Check 13 - Firing Critical Alerts] — Found {{ alerts_offending_list | length }} firing alert(s).
+      {% endif %}
+
+# ==============================================================================
+# SUMMARY & CONFIRMATION
+# ==============================================================================
+- name: Prevalidation Checks Completed Summary
+  debug:
+    msg: >-
+      ══════════════════════════════════════════════════════════════════════════
+      Prevalidation Completed for Cluster '{{ cluster_name | default('cluster') }}'
+      Total Checks Evaluated: {{ health_summary | length }}
+      Passed:   {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}
+      Warnings: {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}
+      Failures: {{ health_summary | selectattr('status', 'equalto', 'FAIL') | list | length }}
+      ══════════════════════════════════════════════════════════════════════════

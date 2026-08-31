@@ -1,0 +1,241 @@
+# Targets Ansible 2.7.17.
+# MIGRATION 2.14: Short module names (shell, fail, set_fact, debug) work on
+#                 both versions. Replace with FQCN only if adopting the
+#                 ansible.builtin.* convention project-wide.
+#                 | default('') guards are applied on all optional variables.
+#
+# utilization role — validates per-node and cluster-wide resource utilization (HARD gate).
+#
+# Contract:
+#   - Queries `oc get nodes -o json` (allocatable capacity) and `oc get pods --all-namespaces -o json` (requests).
+#   - Read-only operation; changed_when: false.
+#   - Evaluates requests-based utilization (sum of pod container requests vs allocatable), not live usage.
+#   - Thresholds are sourced from vars (max_cpu_percent | default(90), max_memory_percent | default(90)) — never hardcoded literals.
+#   - Identifies any node or cluster total exceeding CPU or Memory threshold as an offender.
+#   - HARD gate: fails with explicit error naming cluster, offending node(s) or cluster total, and observed percentages.
+#   - Exposes parsed facts (utilization_parsed_data, utilization_nodes, utilization_cluster, utilization_offenders, node_headroom)
+#     providing per-node headroom for downstream prevalidation checks (e.g. WARN spare capacity for 1 node draining).
+#   - Records a structured PASS entry into `health_summary` list via set_fact.
+
+---
+# Shell module chosen to stream and pipe node allocatable and pod requests to jq (v1.5 compatible)
+- name: Query Node allocatable and Pod requests — oc get nodes & pods
+  shell: |
+    (oc get nodes -o json --kubeconfig "{{ kubeconfig_path }}" && \
+     oc get pods --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}") | jq -s -r \
+      --arg max_cpu "{{ max_cpu_percent | default(90) }}" \
+      --arg max_mem "{{ max_memory_percent | default(90) }}" '
+      def parse_cpu:
+        if . == null or . == "" then 0
+        elif (tostring | endswith("m")) then (tostring[0:-1] | tonumber)
+        elif (tostring | endswith("n")) then ((tostring[0:-1] | tonumber) / 1000000)
+        elif (tostring | endswith("u")) then ((tostring[0:-1] | tonumber) / 1000)
+        else (tostring | tonumber * 1000)
+        end;
+      def parse_mem:
+        if . == null or . == "" then 0
+        elif (tostring | endswith("Ki")) then (tostring[0:-2] | tonumber)
+        elif (tostring | endswith("Mi")) then ((tostring[0:-2] | tonumber) * 1024)
+        elif (tostring | endswith("Gi")) then ((tostring[0:-2] | tonumber) * 1024 * 1024)
+        elif (tostring | endswith("Ti")) then ((tostring[0:-2] | tonumber) * 1024 * 1024 * 1024)
+        elif ((tostring | endswith("k")) or (tostring | endswith("K"))) then (((tostring[0:-1] | tonumber) * 1000) / 1024)
+        elif (tostring | endswith("M")) then (((tostring[0:-1] | tonumber) * 1000000) / 1024)
+        elif (tostring | endswith("G")) then (((tostring[0:-1] | tonumber) * 1000000000) / 1024)
+        else ((tostring | tonumber) / 1024)
+        end;
+      def rnd2:
+        if . == null or . == 0 then 0
+        else
+          ((( . * 100 + 0.5) | tostring | split(".")[0] | if . == "" or . == "-" then "0" else . end | tonumber) / 100)
+        end;
+
+      (.[0].items // []) as $raw_nodes |
+      (.[1].items // []) as $raw_pods |
+
+      ($max_cpu | tonumber) as $threshold_cpu |
+      ($max_mem | tonumber) as $threshold_mem |
+
+      [$raw_pods[] | select(.spec.nodeName != null and .spec.nodeName != "" and .status.phase != "Succeeded" and .status.phase != "Failed")] as $active_pods |
+
+      ($active_pods | group_by(.spec.nodeName) | map({(.[0].spec.nodeName): {
+        cpu_req_m: ([.[].spec.containers[]?.resources.requests.cpu? | parse_cpu] | add // 0),
+        mem_req_kb: ([.[].spec.containers[]?.resources.requests.memory? | parse_mem] | add // 0),
+        pod_count: (length)
+      }}) | add // {}) as $node_requests |
+
+      [ $raw_nodes[] |
+        .metadata.name as $nname |
+        (.status.allocatable.cpu? | parse_cpu) as $alloc_cpu |
+        (.status.allocatable.memory? | parse_mem) as $alloc_mem |
+        ($node_requests[$nname].cpu_req_m // 0) as $req_cpu |
+        ($node_requests[$nname].mem_req_kb // 0) as $req_mem |
+        ($node_requests[$nname].pod_count // 0) as $pcount |
+        (if $alloc_cpu > 0 then ((($req_cpu / $alloc_cpu) * 100) | rnd2) else 0 end) as $cpu_pct |
+        (if $alloc_mem > 0 then ((($req_mem / $alloc_mem) * 100) | rnd2) else 0 end) as $mem_pct |
+        ($alloc_cpu - $req_cpu) as $cpu_hr_m |
+        ($alloc_mem - $req_mem) as $mem_hr_kb |
+        (if $alloc_cpu > 0 then ((($cpu_hr_m / $alloc_cpu) * 100) | rnd2) else 0 end) as $cpu_hr_pct |
+        (if $alloc_mem > 0 then ((($mem_hr_kb / $alloc_mem) * 100) | rnd2) else 0 end) as $mem_hr_pct |
+        {
+          "name": $nname,
+          "allocatable_cpu_m": $alloc_cpu,
+          "allocatable_mem_kb": $alloc_mem,
+          "requested_cpu_m": $req_cpu,
+          "requested_mem_kb": $req_mem,
+          "pod_count": $pcount,
+          "cpu_percent": $cpu_pct,
+          "memory_percent": $mem_pct,
+          "cpu_headroom_m": $cpu_hr_m,
+          "memory_headroom_kb": $mem_hr_kb,
+          "cpu_headroom_percent": $cpu_hr_pct,
+          "memory_headroom_percent": $mem_hr_pct
+        }
+      ] as $nodes_summary |
+
+      ([$nodes_summary[].allocatable_cpu_m] | add // 0) as $cl_alloc_cpu |
+      ([$nodes_summary[].allocatable_mem_kb] | add // 0) as $cl_alloc_mem |
+      ([$nodes_summary[].requested_cpu_m] | add // 0) as $cl_req_cpu |
+      ([$nodes_summary[].requested_mem_kb] | add // 0) as $cl_req_mem |
+      ([$nodes_summary[].pod_count] | add // 0) as $cl_pod_count |
+      (if $cl_alloc_cpu > 0 then ((($cl_req_cpu / $cl_alloc_cpu) * 100) | rnd2) else 0 end) as $cl_cpu_pct |
+      (if $cl_alloc_mem > 0 then ((($cl_req_mem / $cl_alloc_mem) * 100) | rnd2) else 0 end) as $cl_mem_pct |
+      ($cl_alloc_cpu - $cl_req_cpu) as $cl_cpu_hr_m |
+      ($cl_alloc_mem - $cl_req_mem) as $cl_mem_hr_kb |
+      (if $cl_alloc_cpu > 0 then ((($cl_cpu_hr_m / $cl_alloc_cpu) * 100) | rnd2) else 0 end) as $cl_cpu_hr_pct |
+      (if $cl_alloc_mem > 0 then ((($cl_mem_hr_kb / $cl_alloc_mem) * 100) | rnd2) else 0 end) as $cl_mem_hr_pct |
+
+      {
+        "allocatable_cpu_m": $cl_alloc_cpu,
+        "allocatable_mem_kb": $cl_alloc_mem,
+        "requested_cpu_m": $cl_req_cpu,
+        "requested_mem_kb": $cl_req_mem,
+        "pod_count": $cl_pod_count,
+        "cpu_percent": $cl_cpu_pct,
+        "memory_percent": $cl_mem_pct,
+        "cpu_headroom_m": $cl_cpu_hr_m,
+        "memory_headroom_kb": $cl_mem_hr_kb,
+        "cpu_headroom_percent": $cl_cpu_hr_pct,
+        "memory_headroom_percent": $cl_mem_hr_pct
+      } as $cluster_summary |
+
+      [
+        $nodes_summary[] | select(.cpu_percent >= $threshold_cpu or .memory_percent >= $threshold_mem) | {
+          "type": "node",
+          "name": .name,
+          "cpu_percent": .cpu_percent,
+          "memory_percent": .memory_percent,
+          "max_cpu_percent": $threshold_cpu,
+          "max_memory_percent": $threshold_mem,
+          "reason": (
+            (if .cpu_percent >= $threshold_cpu then ["CPU requests (" + (.cpu_percent|tostring) + "% >= " + ($threshold_cpu|tostring) + "%)"] else [] end) +
+            (if .memory_percent >= $threshold_mem then ["Memory requests (" + (.memory_percent|tostring) + "% >= " + ($threshold_mem|tostring) + "%)"] else [] end)
+          ) | join(", ")
+        }
+      ] as $node_offenders |
+
+      (if ($cluster_summary.cpu_percent >= $threshold_cpu or $cluster_summary.memory_percent >= $threshold_mem) then [{
+        "type": "cluster",
+        "name": "cluster-total",
+        "cpu_percent": $cluster_summary.cpu_percent,
+        "memory_percent": $cluster_summary.memory_percent,
+        "max_cpu_percent": $threshold_cpu,
+        "max_memory_percent": $threshold_mem,
+        "reason": (
+          (if $cluster_summary.cpu_percent >= $threshold_cpu then ["Cluster CPU requests (" + ($cluster_summary.cpu_percent|tostring) + "% >= " + ($threshold_cpu|tostring) + "%)"] else [] end) +
+          (if $cluster_summary.memory_percent >= $threshold_mem then ["Cluster Memory requests (" + ($cluster_summary.memory_percent|tostring) + "% >= " + ($threshold_mem|tostring) + "%)"] else [] end)
+        ) | join(", ")
+      }] else [] end) as $cluster_offenders |
+
+      {
+        "nodes": $nodes_summary,
+        "cluster": $cluster_summary,
+        "offenders": ($node_offenders + $cluster_offenders)
+      }
+    '
+  register: utilization_raw_query
+  changed_when: false
+  failed_when: false
+
+- name: Evaluate utilization query execution
+  fail:
+    msg: >-
+      Failed to query Node and Pod resources for cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Command exited with code {{ utilization_raw_query.rc | default(1) }}.
+      Error: {{ utilization_raw_query.stderr | default(utilization_raw_query.stdout | default('No output')) | trim }}.
+      Check kubeconfig path ({{ kubeconfig_path }}) and cluster reachability.
+  when: (utilization_raw_query.rc | default(1) != 0) or (utilization_raw_query.stdout | default('') | trim == '')
+
+- name: Parse utilization JSON payload
+  set_fact:
+    utilization_parsed_data: "{{ utilization_raw_query.stdout | from_json }}"
+
+- name: Extract utilization node list, cluster summary, and offenders
+  set_fact:
+    utilization_nodes: "{{ utilization_parsed_data.nodes | default([]) }}"
+    utilization_cluster: "{{ utilization_parsed_data.cluster | default({}) }}"
+    utilization_offenders: "{{ utilization_parsed_data.offenders | default([]) }}"
+
+- name: Validate at least one node was discovered
+  fail:
+    msg: >-
+      Resource utilization check FAILED (HARD gate) for cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      No nodes found in cluster response.
+  when: (utilization_nodes | length) == 0
+
+- name: Assemble reusable per-node headroom facts for prevalidation drain check
+  set_fact:
+    node_headroom: >-
+      {
+        {% for n in utilization_nodes %}
+        "{{ n.name }}": {
+          "allocatable_cpu_m": {{ n.allocatable_cpu_m | default(0) }},
+          "allocatable_mem_kb": {{ n.allocatable_mem_kb | default(0) }},
+          "requested_cpu_m": {{ n.requested_cpu_m | default(0) }},
+          "requested_mem_kb": {{ n.requested_mem_kb | default(0) }},
+          "cpu_percent": {{ n.cpu_percent | default(0) }},
+          "memory_percent": {{ n.memory_percent | default(0) }},
+          "cpu_headroom_m": {{ n.cpu_headroom_m | default(0) }},
+          "memory_headroom_kb": {{ n.memory_headroom_kb | default(0) }},
+          "cpu_headroom_percent": {{ n.cpu_headroom_percent | default(0) }},
+          "memory_headroom_percent": {{ n.memory_headroom_percent | default(0) }}
+        }{{ '' if loop.last else ',' }}
+        {% endfor %}
+      }
+
+- name: Display resource utilization inspection summary
+  debug:
+    msg: >-
+      Cluster '{{ cluster_name | default('UNKNOWN') }}': Scanned {{ utilization_nodes | length }} node(s) with {{ utilization_cluster.pod_count | default(0) }} active pod(s).
+      Cluster-wide: CPU {{ utilization_cluster.cpu_percent | default(0) }}% (limit {{ max_cpu_percent | default(90) }}%), Memory {{ utilization_cluster.memory_percent | default(0) }}% (limit {{ max_memory_percent | default(90) }}%).
+      Offenders found: {{ utilization_offenders | length }}.
+
+- name: Enforce HARD gate on resource utilization thresholds
+  fail:
+    msg: >-
+      Resource utilization check FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
+      Capacity threshold: max CPU {{ max_cpu_percent | default(90) }}%, max Memory {{ max_memory_percent | default(90) }}%.
+      Found {{ utilization_offenders | length }} threshold violation(s):
+      {% for off in utilization_offenders %}
+        - [{{ off.type | upper }}] {{ off.name }}: Observed CPU={{ off.cpu_percent }}% (max {{ off.max_cpu_percent }}%), Memory={{ off.memory_percent }}% (max {{ off.max_memory_percent }}%) — Reason: {{ off.reason }}
+      {% endfor %}
+      All nodes and cluster total requests must remain below {{ max_cpu_percent | default(90) }}% CPU and {{ max_memory_percent | default(90) }}% Memory before upgrade operations can proceed.
+  when: (utilization_offenders | length) > 0
+
+- name: Record utilization PASS in health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [utilization_summary_entry] }}"
+  vars:
+    utilization_summary_entry:
+      id: "{{ utilization_id | default('07') }}"
+      name: "{{ utilization_name | default('Resource Utilization (Requests-based)') }}"
+      gate: "{{ utilization_gate | default('HARD') }}"
+      status: "PASS"
+      observed: "Cluster CPU {{ utilization_cluster.cpu_percent | default(0) }}% (< {{ max_cpu_percent | default(90) }}%), Memory {{ utilization_cluster.memory_percent | default(0) }}% (< {{ max_memory_percent | default(90) }}%) across {{ utilization_nodes | length }} nodes"
+      details: "Verified requests-based CPU/memory utilization on all {{ utilization_nodes | length }} nodes and cluster total for cluster {{ cluster_name | default('cluster') }}"
+      raw_output: "{{ utilization_parsed_data | to_json }}"
+
+- name: Confirm utilization check passed
+  debug:
+    msg: >-
+      ✔ PASS [Check {{ utilization_id | default('07') }} - {{ utilization_name | default('Resource Utilization (Requests-based)') }}] —
+      All {{ utilization_nodes | length }} node(s) and cluster total are within capacity limits (Cluster: CPU {{ utilization_cluster.cpu_percent | default(0) }}%/{{ max_cpu_percent | default(90) }}%, Mem {{ utilization_cluster.memory_percent | default(0) }}%/{{ max_memory_percent | default(90) }}%).

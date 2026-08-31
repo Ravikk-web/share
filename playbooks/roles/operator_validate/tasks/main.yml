@@ -1,0 +1,94 @@
+# Targets Ansible 2.7.17.
+---
+- name: Query Final Operator State and Validation
+  shell: |
+    set -euo pipefail
+    TMP_SUBS=$(mktemp)
+    TMP_CSVS=$(mktemp)
+    TMP_IPS=$(mktemp)
+    TMP_PODS=$(mktemp)
+
+    oc get subscriptions --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_SUBS"
+    oc get csv --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_CSVS"
+    oc get installplan --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_IPS"
+    oc get pods --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_PODS"
+
+    jq -s -r '
+      .[0].items as $subs |
+      .[1].items as $csvs |
+      .[2].items as $ips |
+      .[3].items as $pods |
+      $subs | map(
+        . as $sub |
+        ($csvs | map(select(.metadata.namespace == $sub.metadata.namespace and .metadata.name == $sub.status.installedCSV))[0]) as $csv |
+        ($ips | map(select(.metadata.namespace == $sub.metadata.namespace and .spec.approved == false and (.spec.clusterServiceVersionNames | index($sub.status.currentCSV))))[0]) as $pending_ip |
+        ($pods | map(select(.metadata.namespace == $sub.metadata.namespace and (.metadata.ownerReferences[]? | select(.kind == "ReplicaSet" or .kind == "Deployment"))))) as $op_pods |
+        
+        {
+          name: .metadata.name,
+          namespace: .metadata.namespace,
+          state: (.status.state // "Unknown"),
+          csv_phase: ($csv.status.phase // "Unknown"),
+          has_pending_ip: ($pending_ip != null),
+          pods_ready: (if ($op_pods | length) == 0 then true else ($op_pods | map(select(.status.phase == "Running")) | length) > 0 end)
+        }
+      )
+    ' "$TMP_SUBS" "$TMP_CSVS" "$TMP_IPS" "$TMP_PODS"
+    rm -f "$TMP_SUBS" "$TMP_CSVS" "$TMP_IPS" "$TMP_PODS"
+  args:
+    executable: /bin/bash
+  register: validate_raw
+  changed_when: false
+
+- name: Parse Validation Data
+  set_fact:
+    operator_validation_data: "{{ validate_raw.stdout | from_json }}"
+
+- name: Initialize Operator Report Records
+  set_fact:
+    operator_report_records: []
+    operator_hard_failures: []
+    operator_warn_failures: []
+
+- name: Evaluate Operator Validation Rules
+  set_fact:
+    operator_report_records: "{{ operator_report_records + [record] }}"
+    operator_hard_failures: "{{ operator_hard_failures + ([record] if gate == 'HARD' else []) }}"
+    operator_warn_failures: "{{ operator_warn_failures + ([record] if gate == 'WARN' else []) }}"
+  vars:
+    csv_succeeded: "{{ item.csv_phase == 'Succeeded' }}"
+    sub_healthy: "{{ item.state != 'UpgradePending' and item.state != 'InstallPlanFailed' }}"
+    no_pending_ip: "{{ not item.has_pending_ip }}"
+    pods_ready: "{{ item.pods_ready }}"
+    
+    gate: >-
+      {{
+        'HARD' if (not csv_succeeded or not sub_healthy)
+        else ('WARN' if (not no_pending_ip or not pods_ready) else 'PASS')
+      }}
+    
+    record: "{{ item | combine({'validation_gate': gate, 'status': ('FAIL' if gate == 'HARD' else ('WARN' if gate == 'WARN' else 'PASS'))}) }}"
+  loop: "{{ operator_validation_data }}"
+  when: item.name not in (operator_allow_list | default([]))
+
+- name: Record Operator Validation results into health_summary
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [op_summary] }}"
+  vars:
+    op_summary:
+      id: "20"
+      name: "Operator Upgrade & Validation"
+      gate: "HARD"
+      status: "{{ 'FAIL' if (operator_hard_failures | length) > 0 else ('WARN' if (operator_warn_failures | length) > 0 else 'PASS') }}"
+      observed: "Validated {{ operator_report_records | length }} operators ({{ operator_hard_failures | length }} HARD failures, {{ operator_warn_failures | length }} WARN)"
+      details: "Operator Post-Upgrade Checks"
+      raw_output: "{{ operator_report_records | to_json }}"
+
+- name: Enforce HARD gate on Operator Validation
+  fail:
+    msg: >-
+      Operator Validation FAILED (HARD gate). Found {{ operator_hard_failures | length }} failed operators:
+      {% for op in operator_hard_failures %}
+        - {{ op.namespace }}/{{ op.name }}: CSV Phase={{ op.csv_phase }}, Sub State={{ op.state }}
+      {% endfor %}
+  when: (operator_hard_failures | length) > 0
