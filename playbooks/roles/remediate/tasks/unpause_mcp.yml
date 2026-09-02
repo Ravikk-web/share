@@ -1,0 +1,275 @@
+---
+# ============================================================================
+# Role Tasks: remediate - unpause_mcp (Blocker 3)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, debug, fail, lineinfile, stat).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Detects and automatically unpauses paused MachineConfigPools (MCPs).
+#          Paused pools block node configuration rollouts and cluster upgrades.
+#          Unpauses permitted pools defined in mcp_auto_unpause_list (default:
+#          worker, master) via deterministic JSON patch and verifies state.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/paths.yml
+# Gate type: HARD (Remediated: AUTO-FIXED / FIX-FAILED)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Detect Condition: Query live MachineConfigPools & identify paused pools
+# Why: Resilient oc query with retry protection handles transient API server blips.
+# Why: jq 1.5 expression extracts paused pool names safely.
+# ----------------------------------------------------------------------------
+- name: "Query live MachineConfigPools to detect paused pools"
+  shell: |
+    set -o pipefail
+    oc get mcp -o json | jq -c '[.items[] | select((.spec.paused // false) == true) | .metadata.name]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: mcp_paused_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: mcp_paused_raw.rc == 0
+
+- name: "Identify permitted and blocked paused MachineConfigPools"
+  set_fact:
+    current_paused_pools: "{{ mcp_paused_raw.stdout | default('[]') | from_json }}"
+    configured_unpause_allowlist: "{{ mcp_auto_unpause_list | default(['worker', 'master']) }}"
+
+- name: "Partition paused pools into permitted and blocked sets"
+  set_fact:
+    permitted_unpause_pools: "{{ current_paused_pools | intersect(configured_unpause_allowlist) }}"
+    blocked_unpause_pools: "{{ current_paused_pools | difference(configured_unpause_allowlist) }}"
+    mcp_unpause_needed: "{{ (current_paused_pools | length) > 0 }}"
+
+- name: "Log detected paused MachineConfigPools status"
+  debug:
+    msg:
+      - "Paused Pools Detected : {{ current_paused_pools }}"
+      - "Permitted to Unpause  : {{ permitted_unpause_pools }}"
+      - "Blocked (Not in List) : {{ blocked_unpause_pools }}"
+      - "Toggle State          : {{ auto_unpause_mcp | default(true) | bool }}"
+
+# ----------------------------------------------------------------------------
+# 2. Skip if No MachineConfigPools are Paused
+# ----------------------------------------------------------------------------
+- name: "Confirm all MachineConfigPools are unpaused"
+  debug:
+    msg: "[PASS] All MachineConfigPools are unpaused (spec.paused: false). No remediation required."
+  when: not (mcp_unpause_needed | bool)
+
+# ----------------------------------------------------------------------------
+# 3. Apply Deterministic Remediation: Unpause Permitted Pools
+# Why: Gated behind master auto_remediation_enabled and specific auto_unpause_mcp.
+# ----------------------------------------------------------------------------
+- name: "[AUTO-FIX] Unpause MachineConfigPool"
+  shell: "oc patch mcp {{ item }} --type=json -p='[{\"op\":\"replace\",\"path\":\"/spec/paused\",\"value\":false}]'"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: unpause_result
+  changed_when: true
+  failed_when: false
+  loop: "{{ permitted_unpause_pools }}"
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+
+# ----------------------------------------------------------------------------
+# 4. Re-Verify Condition: Confirm pools are unpaused (spec.paused == false)
+# Why: Re-query live state to ensure patch was applied and confirmed.
+# ----------------------------------------------------------------------------
+- name: "Re-query MachineConfigPools to verify unpause status"
+  shell: |
+    set -o pipefail
+    oc get mcp -o json | jq -c '[.items[] | select((.spec.paused // false) == true) | .metadata.name]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: reverified_paused_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: reverified_paused_raw.rc == 0
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+
+- name: "Evaluate MCP unpause re-verification outcome"
+  set_fact:
+    still_paused_pools: "{{ reverified_paused_raw.stdout | default('[]') | from_json }}"
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+
+- name: "Check whether any permitted pools remain paused"
+  set_fact:
+    unpause_verified: "{{ (permitted_unpause_pools | intersect(still_paused_pools | default([])) | length) == 0 }}"
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+
+# ----------------------------------------------------------------------------
+# 5. Handle Disabled Auto-Fix State or Non-Permitted Pools
+# ----------------------------------------------------------------------------
+- name: "Log warning if MCP auto-unpause is disabled but pools are paused"
+  debug:
+    msg: "[WARN] Paused MCPs detected ({{ current_paused_pools | join(', ') }}), but auto_unpause_mcp is disabled. Pools remain paused."
+  when:
+    - mcp_unpause_needed | bool
+    - not (auto_remediation_enabled | default(true) | bool) or not (auto_unpause_mcp | default(true) | bool)
+
+- name: "Log warning if non-permitted pools remain paused"
+  debug:
+    msg: "[WARN] Paused MCP(s) {{ blocked_unpause_pools | join(', ') }} are not present in mcp_auto_unpause_list. These pools require manual evaluation."
+  when:
+    - mcp_unpause_needed | bool
+    - (blocked_unpause_pools | length) > 0
+
+# ----------------------------------------------------------------------------
+# 6. Update Tracking Facts: autofix_items & health_summary
+# ----------------------------------------------------------------------------
+- name: "Append MCP unpause remediation records to autofix_items"
+  set_fact:
+    autofix_items: >-
+      {{ (autofix_items | default([])) + [{
+        'name': 'MachineConfigPool Unpausing (' ~ (permitted_unpause_pools | join(', ')) ~ ')',
+        'action': 'Unpaused permitted MachineConfigPool(s) ' ~ (permitted_unpause_pools | join(', ')) ~ '; configuration rollouts unblocked.',
+        'reference': 'https://docs.openshift.com/container-platform/4.14/post_installation_configuration/machine-configuration-tasks.html#mco-pause_machine-config-tasks'
+      }] }}
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+    - unpause_verified | bool
+
+- name: "Update health_summary tracking list with MCP remediation result"
+  set_fact:
+    health_summary: >-
+      {%- set updated = [] -%}
+      {%- set matching = [] -%}
+      {%- for item in health_summary | default([]) -%}
+        {%- if ('MachineConfigPool' in (item.name | default(''))) or ('MCP' in (item.name | default(''))) -%}
+          {%- set _ = matching.append(1) -%}
+          {%- set final_status = 'AUTO-FIXED' if (unpause_verified | default(false) | bool and (blocked_unpause_pools | length == 0)) else ('WARN' if (unpause_verified | default(false) | bool and (blocked_unpause_pools | length > 0)) else 'FIX-FAILED') -%}
+          {%- set _ = updated.append({
+            'num': item.num,
+            'name': item.name,
+            'gate': item.gate,
+            'status': final_status,
+            'observed': ('Unpaused permitted pools: ' ~ (permitted_unpause_pools | join(', ')) ~ (('; Remaining blocked pools: ' ~ (blocked_unpause_pools | join(', '))) if (blocked_unpause_pools | length > 0) else '') if (unpause_verified | default(false) | bool) else ('Unpause failed; still paused: ' ~ (still_paused_pools | default([]) | join(', '))))
+          }) -%}
+        {%- else -%}
+          {%- set _ = updated.append(item) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if matching | length == 0 -%}
+        {%- set final_status = 'AUTO-FIXED' if (unpause_verified | default(false) | bool and (blocked_unpause_pools | length == 0)) else ('WARN' if (unpause_verified | default(false) | bool and (blocked_unpause_pools | length > 0)) else 'FIX-FAILED') -%}
+        {%- set _ = updated.append({
+          'num': ((health_summary | default([]) | length) + 1),
+          'name': 'MachineConfigPools Synchronization',
+          'gate': 'HARD',
+          'status': final_status,
+          'observed': ('Unpaused permitted pools: ' ~ (permitted_unpause_pools | join(', ')) ~ (('; Remaining blocked pools: ' ~ (blocked_unpause_pools | join(', '))) if (blocked_unpause_pools | length > 0) else '') if (unpause_verified | default(false) | bool) else ('Unpause failed; still paused: ' ~ (still_paused_pools | default([]) | join(', '))))
+        }) -%}
+      {%- endif -%}
+      {{ updated }}
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+
+# ----------------------------------------------------------------------------
+# 7. Dual Audit Logging: Human-Readable (.txt) and Machine-Parseable (.csv)
+# ----------------------------------------------------------------------------
+- name: "Log MCP unpause remediation outcome to text run log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.txt"
+    line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [{{ 'AUTO-FIX' if (unpause_verified | bool) else 'FIX-FAILED' }}] [HARD] Task 'MachineConfigPool Unpausing': {{ 'Successfully unpaused pool(s): ' ~ (permitted_unpause_pools | join(', ')) if (unpause_verified | bool) else 'Failed to unpause pool(s)' }} | Observed: {{ still_paused_pools | default([]) | join(', ') }}"
+    create: true
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+
+- name: "Check if CSV run log exists"
+  stat:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.csv"
+  register: mcp_csv_stat
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+
+- name: "Initialize CSV run log header if new"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.csv"
+    line: "timestamp,cluster,task_name,gate_type,status,reason,observed"
+    create: true
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+    - not (mcp_csv_stat.stat.exists | default(false))
+
+- name: "Log MCP unpause remediation outcome to CSV run log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.csv"
+    line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name | default(''cluster'') }}","MachineConfigPool Unpausing","HARD","{{ ''AUTO-FIXED'' if (unpause_verified | bool) else ''FIX-FAILED'' }}","{{ ''Unpaused pool(s): '' ~ (permitted_unpause_pools | join(''; '')) if (unpause_verified | bool) else ''Unpause verification failed'' }}","{{ permitted_unpause_pools | join(''; '') }}"'
+    create: true
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+
+# ----------------------------------------------------------------------------
+# 8. Console Feedback & Optional Gate Enforcement
+# ----------------------------------------------------------------------------
+- name: "Display MCP unpause remediation confirmation banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "[AUTO-FIX] MACHINECONFIGPOOL UNPAUSING APPLIED & VERIFIED"
+      - "============================================================================"
+      - "Cluster       : {{ cluster_name | default('cluster') }}"
+      - "Unpaused MCPs : {{ permitted_unpause_pools | join(', ') }}"
+      - "Status        : AUTO-FIXED"
+      - "Impact        : Node configuration rollouts unblocked."
+      - "============================================================================"
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+    - unpause_verified | bool
+
+- name: "Halt execution if MCP unpause failed and gate enforcement is enabled"
+  fail:
+    msg: "AUTO-REMEDIATION HALT: Attempted to unpause MachineConfigPools '{{ permitted_unpause_pools | join(', ') }}', but pools '{{ still_paused_pools | default([]) | join(', ') }}' remain paused. Halting upgrade."
+  when:
+    - mcp_unpause_needed | bool
+    - (permitted_unpause_pools | length) > 0
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+    - not (unpause_verified | bool)
+    - remediate_enforce_gate | default(false) | bool

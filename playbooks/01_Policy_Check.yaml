@@ -1,179 +1,212 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (set_fact, fail, include_role, command, debug)
-#                 work on both versions.
-#                 | default('') guards are applied on all optional variables.
-#
-# Phase 01 — Policy Check & Baseline Snapshot (01_Policy_Check.yaml)
-#
-# Responsibilities:
-#   1. Authenticate once via login role and establish kubeconfig under playbook_dir.
-#   2. Capture baseline cluster snapshot via snapshot role (writes to snapshots/<cluster>_<ts>_baseline.json).
-#   3. Validate that the target upgrade versions in upgrade_path are real edges in oc adm upgrade.
-#   4. Enforce HARD gate: invalid edge or baseline failure aborts before any upgrade.
-#   5. Wrap tasks in block/rescue/always: rescue records failure via error_handle and tears down via logout.
-
 ---
-- name: Phase 01 — Policy Check & Baseline Snapshot
+# ============================================================================
+# Phase 01 Playbook: Policy Check & Baseline Snapshot Capture
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses standard play-level vars_files, include_role, and
+#                 block/rescue/always; compatible across Ansible 2.7 and 2.14.
+#
+# Purpose: Authenticates against the target OpenShift cluster, executes the
+#          snapshot role to capture the baseline JSON snapshot, validates that
+#          the first hop in upgrade_path is a confirmed update edge from the
+#          current version, enforces the HARD edge gate, logs confirmation,
+#          and ensures fail-safe session teardown on any failure.
+# Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               roles/login, roles/logout, roles/snapshot, roles/error_handle
+# Gate type: HARD (fails immediately if edge check fails or cluster unreachable)
+# ============================================================================
+
+- name: "Phase 01 — Policy Check & Baseline Capture"
   hosts: localhost
   connection: local
   gather_facts: true
-
   vars_files:
     - vars/upgrade.yml
-    - vars/paths.yml
     - vars/secrets.yml
+    - vars/paths.yml
     - vars/smtp.yml
     - vars/report_vars.yml
     - vars/api_regex.yml
 
+  # --------------------------------------------------------------------------
+  # Pre-Tasks: Session Establishment
+  # Why: Authenticates once per workflow run, scoping the kubeconfig file
+  #      under playbook_dir. The session is preserved across subsequent phases.
+  # --------------------------------------------------------------------------
   pre_tasks:
-    - name: Resolve target cluster credentials from secrets.yml
-      set_fact:
-        target_cluster_entry: "{{ (clusters | default([]) | selectattr('name', 'equalto', cluster_name) | list | first) | default({}) }}"
-      no_log: true
-
-    - name: Set login parameters for cluster {{ cluster_name | default('UNKNOWN') }}
-      set_fact:
-        login_api_url: "{{ target_cluster_entry.api_url | default(login_api_url | default('')) }}"
-        login_username: "{{ target_cluster_entry.username | default(login_username | default('')) }}"
-        login_password: "{{ target_cluster_entry.password | default(login_password | default('')) }}"
-      no_log: true
-
-    - name: Verify cluster credentials are defined
-      fail:
-        msg: >-
-          Cluster '{{ cluster_name | default('UNKNOWN') }}' was not found in vars/secrets.yml
-          and no explicit login_api_url was provided.
-      when: login_api_url | default('') == ''
-
-    - name: Authenticate to cluster {{ cluster_name | default('UNKNOWN') }}
+    - name: "Phase 01: Establish authenticated cluster session via login role"
       include_role:
         name: login
 
+  # --------------------------------------------------------------------------
+  # Main Tasks: Policy Check, Snapshot Capture & Edge Enforcement
+  # --------------------------------------------------------------------------
   tasks:
-    - name: Phase 01 Execution Block
+    - name: "Phase 01: Execute Baseline Capture and Policy Validation"
       block:
-        - name: Set Phase 01 Step 1 Context — Capture Baseline Snapshot
+        # 1. Establish run timestamp for consistent file naming across phases
+        - name: "Ensure run timestamp is established for snapshot and logs"
           set_fact:
-            failed_phase: "01_Policy_Check"
-            current_step_no: 1
-            current_task_name: "Capture Baseline Snapshot"
-            current_gate_type: "HARD"
-            phase01_failed: false
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+          when: run_timestamp is not defined or run_timestamp | length == 0
 
-        - name: Capture baseline snapshot
+        # 2. Capture immutable baseline JSON snapshot via snapshot role
+        - name: "Capture cluster baseline snapshot"
           include_role:
             name: snapshot
 
-        - name: Set Phase 01 Step 2 Context — Validate Upgrade Path Edges
-          set_fact:
-            current_step_no: 2
-            current_task_name: "Validate Upgrade Path Edges"
-            current_gate_type: "HARD"
-
-        - name: Query ClusterVersion for available upgrade edges
-          command: oc get clusterversion version -o json --kubeconfig {{ kubeconfig_path }}
-          register: oc_cv_edge_raw
+        # 3. Query live available update edges from ClusterVersion
+        - name: "Query live cluster available update edges"
+          shell: |
+            set -o pipefail
+            oc get clusterversion version -o json | jq -r '(.status.availableUpdates // [])[].version'
+          args:
+            executable: /bin/bash
+          environment:
+            KUBECONFIG: "{{ cluster_kubeconfig }}"
+          register: cv_available_edges_raw
           changed_when: false
-          failed_when: oc_cv_edge_raw.rc != 0
+          retries: "{{ oc_command_retries | default(3) }}"
+          delay: "{{ oc_command_retry_delay | default(10) }}"
+          until: cv_available_edges_raw.rc == 0
 
-        - name: Parse available upgrade edges from ClusterVersion
+        # 4. Query live conditional update edges from ClusterVersion
+        - name: "Query live cluster conditional update edges"
+          shell: |
+            set -o pipefail
+            oc get clusterversion version -o json | jq -r '(.status.conditionalUpdates // [])[].version'
+          args:
+            executable: /bin/bash
+          environment:
+            KUBECONFIG: "{{ cluster_kubeconfig }}"
+          register: cv_conditional_edges_raw
+          changed_when: false
+          retries: "{{ oc_command_retries | default(3) }}"
+          delay: "{{ oc_command_retry_delay | default(10) }}"
+          until: cv_conditional_edges_raw.rc == 0
+
+        # 5. Extract and consolidate valid update edges
+        - name: "Consolidate verified cluster update edges"
           set_fact:
-            parsed_cv_edge_data: "{{ oc_cv_edge_raw.stdout | from_json }}"
-            current_cv_version: "{{ (oc_cv_edge_raw.stdout | from_json).status.desired.version | default(((oc_cv_edge_raw.stdout | from_json).status.history | default([{}]) | first).version | default('unknown')) }}"
-            available_edge_list: >-
-              [
-                {% for upd in (oc_cv_edge_raw.stdout | from_json).status.availableUpdates | default([]) %}
-                  "{{ upd.version | default('') }}"{{ '' if loop.last else ',' }}
-                {% endfor %}
-              ]
-            conditional_edge_list: >-
-              [
-                {% for cond in (oc_cv_edge_raw.stdout | from_json).status.conditionalUpdates | default([]) %}
-                  "{{ cond.release.version | default('') }}"{{ '' if loop.last else ',' }}
-                {% endfor %}
-              ]
+            available_edges_list: "{{ cv_available_edges_raw.stdout_lines | default([]) }}"
+            conditional_edges_list: "{{ cv_conditional_edges_raw.stdout_lines | default([]) }}"
+            target_first_hop: "{{ upgrade_path[0] }}"
 
-        - name: Combine available and conditional upgrade edges
+        - name: "Assemble combined valid update edge set"
           set_fact:
-            all_valid_immediate_edges: "{{ (available_edge_list | default([])) + (conditional_edge_list | default([])) }}"
-            resolved_upgrade_path: "{{ (upgrade_path | from_json) if (upgrade_path is string and upgrade_path.startswith('[')) else (upgrade_path.split(',') if (upgrade_path is string and ',' in upgrade_path) else ([upgrade_path] if upgrade_path is string else (upgrade_path | default([])))) }}"
+            all_valid_update_edges: "{{ (available_edges_list + conditional_edges_list) | unique }}"
 
-        - name: Set first hop target version
+        # 6. Validate target first hop against live edges
+        - name: "Verify target first hop exists in cluster update graph"
           set_fact:
-            first_hop_target_version: "{{ resolved_upgrade_path | first | default('') }}"
+            is_valid_target_edge: "{{ target_first_hop in all_valid_update_edges }}"
 
-        - name: Display detected upgrade edges and target path
+        # 7. HARD Gate: Halt if target hop is not a valid update edge
+        - name: "HARD Gate: Enforce target hop is a verified update edge"
+          fail:
+            msg: >-
+              [HARD GATE FAILURE] Target version '{{ target_first_hop }}' is NOT a verified update edge
+              for cluster '{{ cluster_name }}' (current version: '{{ baseline_current_version | default("unknown") }}', channel: '{{ baseline_channel | default("unknown") }}').
+              Available edges: {{ available_edges_list | join(', ') if (available_edges_list | length > 0) else 'None' }}.
+              Conditional edges: {{ conditional_edges_list | join(', ') if (conditional_edges_list | length > 0) else 'None' }}.
+              Execution halted with zero cluster mutations.
+          when: not (is_valid_target_edge | bool)
+
+        # 8. Log confirmation to human-readable text run log (.txt)
+        - name: "Log Phase 01 baseline capture confirmation to text run log"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+            line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [PASS] [HARD] Phase 01: Baseline snapshot captured to {{ baseline_snapshot_file_path }} (Nodes: {{ baseline_nodes_count }}, Operators: {{ baseline_operators_count }}, Routes: {{ baseline_routes_count }}). Target hop '{{ target_first_hop }}' verified in cluster update graph."
+            create: true
+
+        # 9. Log confirmation to machine-parseable CSV run log (.csv)
+        - name: "Check if CSV run log exists"
+          stat:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+          register: phase01_csv_stat
+
+        - name: "Initialize CSV run log header if new"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+            line: "timestamp,cluster,task_name,gate_type,status,reason,observed"
+            create: true
+          when: not (phase01_csv_stat.stat.exists | default(false))
+
+        - name: "Log Phase 01 baseline capture confirmation to CSV run log"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+            line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name }}","Phase 01 Baseline & Edge Check","HARD","PASS","Verified update edge {{ target_first_hop }}","Snapshot: {{ baseline_snapshot_file_path }}"'
+            create: true
+
+        # 10. Display structured confirmation banner
+        - name: "Display Phase 01 completion banner"
           debug:
             msg:
-              - "Cluster:               {{ cluster_name }}"
-              - "Current Version:       {{ current_cv_version }}"
-              - "Target Upgrade Path:   {{ resolved_upgrade_path | join(' → ') }}"
-              - "First Hop Target:      {{ first_hop_target_version }}"
-              - "Available Edges:       {{ available_edge_list | default([]) }}"
-              - "Conditional Edges:     {{ conditional_edge_list | default([]) }}"
+              - "============================================================================"
+              - "PHASE 01 COMPLETE: POLICY CHECK & BASELINE SNAPSHOT CAPTURED"
+              - "============================================================================"
+              - "Cluster Name     : {{ cluster_name }}"
+              - "Current Version  : {{ baseline_current_version }}"
+              - "Target First Hop : {{ target_first_hop }}"
+              - "Snapshot File    : {{ baseline_snapshot_file_path }}"
+              - "Nodes Count      : {{ baseline_nodes_count }}"
+              - "Operators Count  : {{ baseline_operators_count }}"
+              - "Routes Count     : {{ baseline_routes_count }}"
+              - "Session State    : Preserved for Phase 02 Prevalidation"
+              - "============================================================================"
 
-        - name: Validate first hop target is an available edge (or already at target)
-          fail:
-            msg: >-
-              HARD GATE FAILURE in Phase 01: Target version '{{ first_hop_target_version }}'
-              is not a valid upgrade edge for cluster '{{ cluster_name }}'
-              (current version: {{ current_cv_version }}).
-              Available edges from oc get clusterversion:
-              {{ all_valid_immediate_edges | join(', ') if all_valid_immediate_edges | length > 0 else 'None found' }}.
-              Verify channel configuration or target version before proceeding.
-          when:
-            - first_hop_target_version != current_cv_version
-            - first_hop_target_version not in all_valid_immediate_edges
-
-        - name: Validate upgrade_path is non-empty
-          fail:
-            msg: >-
-              HARD GATE FAILURE in Phase 01: upgrade_path is empty for cluster '{{ cluster_name }}'.
-          when: (resolved_upgrade_path | length) == 0
-
-        - name: Confirm Phase 01 Policy Check & Baseline Success
-          debug:
-            msg: >-
-              ✔ Phase 01 Policy Check & Baseline completed successfully.
-              Baseline snapshot: {{ baseline_snapshot_file_path | default('recorded') }}.
-              Current version '{{ current_cv_version }}' validated against target hop '{{ first_hop_target_version }}'.
-
+      # ----------------------------------------------------------------------
+      # Rescue: Error Extraction, Alert Dispatch & Clean Session Logout
+      # ----------------------------------------------------------------------
       rescue:
-        - name: Record failure details for Phase 01
+        - name: "Extract sanitized error message from failure result in Phase 01"
           set_fact:
-            phase01_failed: true
-            failed_phase: "01_Policy_Check"
-            failure_reason: >-
-              {{
-                (((ansible_failed_result | default({})).stderr | default('')) | trim) if (((ansible_failed_result | default({})).stderr | default('')) | trim != '')
-                else (
-                  (((ansible_failed_result | default({})).stderr_lines | default([])) | join(' ') | trim) if ((((ansible_failed_result | default({})).stderr_lines | default([])) | length) > 0)
-                  else (
-                    (((ansible_failed_result | default({})).msg | default('')) | trim) if (((ansible_failed_result | default({})).msg | default('')) | trim != '' and ((ansible_failed_result | default({})).msg | default('')) != 'non-zero return code')
-                    else (
-                      (((ansible_failed_result | default({})).message | default('')) | trim) if (((ansible_failed_result | default({})).message | default('')) | trim != '')
-                      else 'Policy check or baseline capture failed.'
-                    )
-                  )
-                )
-              }}
-            failure_observed: "FAILED at Step {{ current_step_no | default(1) }}: {{ current_task_name | default('Policy Check & Baseline') }}"
+            resolved_error: >-
+              {{ ansible_failed_result.stderr | default('')
+                 if (ansible_failed_result.stderr | default('') | length > 0)
+                 else (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 if (ansible_failed_result.stderr_lines | default([]) | length > 0)
+                 else ansible_failed_result.msg | default('Unknown error — inspect logs') }}
 
-        - name: Trigger standardized error handling and alert
+        - name: "Evaluate whether failure is an RBAC / authorization error in Phase 01"
+          set_fact:
+            is_rbac_error: >-
+              {{ (resolved_error | lower is search('forbidden'))
+                 or (resolved_error | lower is search('cannot patch'))
+                 or (resolved_error | lower is search('unauthorized'))
+                 or (resolved_error | lower is search('cannot get'))
+                 or (resolved_error | lower is search('cannot list'))
+                 or (resolved_error | lower is search('cannot create')) }}
+
+        - name: "Configure Phase 01 error context facts"
+          set_fact:
+            current_step_no: "Phase 01"
+            current_task_name: "Phase 01 Policy Check & Baseline Capture"
+            current_gate_type: "HARD"
+            failure_reason: "Phase 01 Policy Check or Baseline Snapshot failed"
+            failure_observed: "{{ resolved_error }}"
+            phase_01_failed: true
+
+        - name: "Record Phase 01 failure and alert via error_handle role"
           include_role:
             name: error_handle
 
-        - name: Tear down cluster session on failure
+        - name: "Execute session logout on Phase 01 failure"
           include_role:
             name: logout
+          failed_when: false
 
-        - name: Halt execution due to Phase 01 failure
+        - name: "Halt execution on Phase 01 failure"
           fail:
-            msg: "Phase 01 (01_Policy_Check) failed for cluster '{{ cluster_name }}'. Session torn down."
+            msg: "Phase 01 Policy Check & Baseline Capture failed: {{ resolved_error }}"
 
+      # ----------------------------------------------------------------------
+      # Always: Fail-Safe Session Logout Guarantee
+      # ----------------------------------------------------------------------
       always:
-        - name: Ensure session logout on failure
+        - name: "Guarantee session logout if Phase 01 failed"
           include_role:
             name: logout
-          when: phase01_failed | default(false)
+          when: phase_01_failed | default(false) | bool
+          failed_when: false

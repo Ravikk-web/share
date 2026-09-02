@@ -1,160 +1,279 @@
-{#- Targets Ansible 2.7.17.
-    MIGRATION 2.14: No changes required — Jinja2 template is compatible with both versions.
-    
-    error-report.j2 — Failure Alert Email Template (Concise & High-Impact)
-    Presentation-only: Renders short, colour-coded HTML for failure alerts and RBAC errors.
-    All status colours and gate verdicts are driven by passed-in variables.
--#}
 <!DOCTYPE html>
-<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{{ report_title | default('ARO Cluster Upgrade') }} — Failure Alert</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>[ARO Upgrade ALERT] {{ cluster_name | default('Cluster') }} Upgrade Halted</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: {{ color_page_bg | default('#f8f9fb') }};
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      color: {{ color_heading | default('#101828') }};
+      -webkit-font-smoothing: antialiased;
+    }
+    table {
+      border-collapse: collapse;
+      mso-table-lspace: 0pt;
+      mso-table-rspace: 0pt;
+    }
+    td {
+      padding: 0;
+    }
+    .email-container {
+      max-width: {{ email_max_width | default('580px') }};
+      width: 100%;
+      margin: 20px auto;
+      background-color: {{ color_surface | default('#ffffff') }};
+      border: 1px solid {{ color_border | default('#e4e7ec') }};
+      border-top: 4px solid {{ color_fail | default('#b42318') }};
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 1px 3px rgba(16, 24, 40, 0.05);
+    }
+    .header-panel {
+      padding: 24px;
+      border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};
+    }
+    .status-badge {
+      display: inline-block;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      border-radius: 12px;
+      text-transform: uppercase;
+      background-color: {{ bg_fail | default('#fdecea') }};
+      color: {{ color_fail | default('#b42318') }};
+      border: 1px solid #fecdca;
+    }
+    .cluster-title {
+      margin: 12px 0 4px 0;
+      font-size: 20px;
+      font-weight: 700;
+      color: {{ color_heading | default('#101828') }};
+    }
+    .subtitle {
+      margin: 0;
+      font-size: 13px;
+      color: #667085;
+    }
+    .content-panel {
+      padding: 20px 24px;
+    }
+    .callout-box {
+      border-radius: 6px;
+      padding: 14px 16px;
+      margin-bottom: 20px;
+      font-size: 13px;
+    }
+    .callout-rbac {
+      background-color: {{ bg_warn | default('#fff8e1') }};
+      border: 1px solid #fedf89;
+      color: #7a4f01;
+    }
+    .callout-teardown {
+      background-color: {{ bg_pass | default('#e6f4ea') }};
+      border: 1px solid #b7e1cd;
+      color: {{ color_pass | default('#1a7f37') }};
+    }
+    .section-heading {
+      margin: 20px 0 10px 0;
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #475467;
+    }
+    .matrix-table {
+      width: 100%;
+      border: 1px solid {{ color_border | default('#e4e7ec') }};
+      border-radius: 4px;
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+    .matrix-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};
+      vertical-align: top;
+    }
+    .matrix-table tr:last-child td {
+      border-bottom: none;
+    }
+    .matrix-label {
+      width: 32%;
+      font-weight: 600;
+      color: #344054;
+      background-color: #fcfcfd;
+    }
+    .matrix-value {
+      color: #101828;
+    }
+    .code-block {
+      background-color: #0f172a;
+      color: #f8fafc;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+      font-size: 12px;
+      padding: 12px;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow-x: auto;
+      margin: 8px 0;
+      line-height: 1.45;
+    }
+    .cmd-callout {
+      background-color: #ffffff;
+      color: #0f172a;
+      border: 1px solid #fedf89;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+      font-size: 12px;
+      padding: 8px 10px;
+      border-radius: 4px;
+      margin: 6px 0;
+      display: block;
+      word-break: break-all;
+    }
+    .footer-panel {
+      padding: 16px 24px;
+      background-color: #f9fafb;
+      border-top: 1px solid {{ color_border | default('#e4e7ec') }};
+      font-size: 12px;
+      color: #667085;
+      line-height: 1.4;
+    }
+  </style>
 </head>
-<body style="margin: 0; padding: 0; background-color: #f8f9fb; font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.4; color: #344054; -webkit-font-smoothing: antialiased;">
-
-  <!-- Outer Background Container -->
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #f8f9fb; padding: 16px 8px;">
+<body style="margin: 0; padding: 0; background-color: {{ color_page_bg | default('#f8f9fb') }}; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.5; color: {{ color_heading | default('#101828') }};">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: {{ color_page_bg | default('#f8f9fb') }}; padding: 20px 0;">
     <tr>
       <td align="center">
-
-        <!-- Main Card Container (max-width 580px) -->
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width: 580px; margin: 0 auto; background-color: #ffffff; border: 1px solid #e4e7ec; border-radius: 8px; overflow: hidden; border-collapse: separate;">
-
-          <!-- Header Band -->
+        <table class="email-container" border="0" cellspacing="0" cellpadding="0" style="max-width: {{ email_max_width | default('580px') }}; width: 100%; margin: 0 auto; background-color: {{ color_surface | default('#ffffff') }}; border: 1px solid {{ color_border | default('#e4e7ec') }}; border-top: 4px solid {{ color_fail | default('#b42318') }}; border-radius: 6px; overflow: hidden;">
+          
+          <!-- Header Panel -->
           <tr>
-            <td style="background-color: #ffffff; padding: 14px 18px; border-bottom: 2px solid #fdecea;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-                <tr>
-                  <td valign="middle" style="text-align: left;">
-                    <div style="font-size: 11px; font-weight: 700; color: #b42318; text-transform: uppercase; letter-spacing: 0.6px;">
-                      {{ report_org | default('ARO Automation') }} &bull; Upgrade Alert
-                    </div>
-                    <div style="font-size: 17px; font-weight: 700; color: #101828; margin-top: 2px;">
-                      Cluster: <span style="font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;">{{ cluster_name | default('N/A') }}</span>
-                    </div>
-                  </td>
-                  <td valign="middle" align="right" style="text-align: right; width: 100px;">
-                    <!-- Verdict Pill -->
-                    <span style="display: inline-block; padding: 4px 10px; font-size: 12px; font-weight: 700; color: #b42318; background-color: #fdecea; border: 1px solid #ffa39e; border-radius: 12px; text-transform: uppercase;">
-                      FAIL {{ (status_glyphs | default({})).fail | default('✖') }}
-                    </span>
-                  </td>
-                </tr>
-              </table>
+            <td class="header-panel" style="padding: 24px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">
+              <span class="status-badge" style="display: inline-block; padding: 4px 10px; font-size: 12px; font-weight: 700; border-radius: 12px; background-color: {{ bg_fail | default('#fdecea') }}; color: {{ color_fail | default('#b42318') }}; border: 1px solid #fecdca;">
+                {{ badge_fail | default('UPGRADE HALTED ✖') }}
+              </span>
+              <h1 class="cluster-title" style="margin: 12px 0 4px 0; font-size: 20px; font-weight: 700; color: {{ color_heading | default('#101828') }};">
+                {{ cluster_name | default('Cluster') }} Upgrade Halted
+              </h1>
+              <p class="subtitle" style="margin: 0; font-size: 13px; color: #667085;">
+                Hard safety gate triggered during automated upgrade execution
+              </p>
             </td>
           </tr>
 
-          <!-- Metadata Strip -->
+          <!-- Content Panel -->
           <tr>
-            <td style="background-color: #f8f9fb; padding: 6px 18px; border-bottom: 1px solid #e4e7ec; font-size: 11px; color: #667085;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-                <tr>
-                  <td style="text-align: left;">
-                    <strong>Phase:</strong> <code style="font-family: 'SFMono-Regular', Consolas, monospace; font-size: 11px; color: #101828;">{{ phase_name | default(failed_phase | default('Upgrade Phase')) }}</code>
-                  </td>
-                  <td style="text-align: right;">
-                    <strong>Time:</strong> {{ timestamp | default(run_id | default('N/A')) }}
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
+            <td class="content-panel" style="padding: 20px 24px;">
 
-          <!-- Body Content -->
-          <tr>
-            <td style="padding: 16px 18px;">
-
-              {% if (is_rbac_error | default(false)) or ('forbidden' in (failure_reason | default('') | lower)) or ('cannot patch' in (failure_reason | default('') | lower)) or ('unauthorized' in (failure_reason | default('') | lower)) %}
-              <!-- RBAC Permission Denial Banner -->
-              <div style="background-color: #fdecea; border: 1px solid #ffa39e; border-left: 4px solid #b42318; border-radius: 4px; padding: 12px 14px; margin-bottom: 14px;">
-                <div style="font-size: 13px; font-weight: 700; color: #b42318; margin-bottom: 4px;">
-                  ⚠️ Service Account RBAC Permission Denied (Forbidden)
+              <!-- RBAC Callout (Rendered conditionally when RBAC/Permission issue detected) -->
+              {% if is_rbac_error | default(false) in [true, 'True', 'true', 1, '1'] %}
+              <div class="callout-box callout-rbac" style="border-radius: 6px; padding: 14px 16px; margin-bottom: 20px; font-size: 13px; background-color: {{ bg_warn | default('#fff8e1') }}; border: 1px solid #fedf89; color: #7a4f01;">
+                <div style="font-weight: 700; margin-bottom: 6px; font-size: 13px;">
+                  ⚠ Action Required: OpenShift RBAC Permission Failure
                 </div>
-                <div style="font-size: 12px; color: #344054; line-height: 1.4; margin-bottom: 8px;">
-                  The authenticated service account does not have sufficient OpenShift cluster privileges to perform the requested upgrade operation.
+                <div style="margin-bottom: 8px;">
+                  The execution account lacks sufficient authorization to complete this operation:
+                  <ul style="margin: 4px 0 6px 18px; padding: 0;">
+                    <li><strong>Missing Verb:</strong> <code>{{ rbac_missing_verb | default('patch / get / update') }}</code></li>
+                    <li><strong>Target Resource:</strong> <code>{{ rbac_missing_resource | default('ClusterVersion / MachineConfigPool / Node') }}</code></li>
+                  </ul>
                 </div>
-                <div style="font-size: 11px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace; color: #b42318; background-color: #ffffff; border: 1px solid #ffa39e; padding: 6px 8px; border-radius: 4px; word-break: break-all;">
-                  {{ failure_reason | default(observed_value | default('Permission denied: cannot patch resource clusterversions at cluster scope')) }}
-                </div>
-                <div style="font-size: 11px; color: #667085; margin-top: 6px;">
-                  <strong>Remediation:</strong> Grant <code style="font-family: 'SFMono-Regular', Consolas, monospace; color: #b42318;">cluster-admin</code> or dedicated upgrade ClusterRole permissions to the service account.
-                </div>
-              </div>
-              {% else %}
-              <!-- General Failure Summary Banner -->
-              <div style="background-color: #fdecea; border: 1px solid #ffa39e; border-left: 4px solid #b42318; border-radius: 4px; padding: 10px 12px; margin-bottom: 14px;">
-                <div style="font-size: 13px; font-weight: 700; color: #b42318; margin-bottom: 3px;">
-                  {{ (status_glyphs | default({})).fail | default('✖') }} Upgrade Halted — HARD Gate Failure
-                </div>
-                <div style="font-size: 12px; color: #344054; line-height: 1.4;">
-                  {{ failure_summary | default('A critical check failed during phase execution. Automated session teardown was initiated.') }}
-                </div>
+                <div style="font-size: 12px; margin-bottom: 4px; font-weight: 600;">Remediation Command (Cluster Administrator):</div>
+                <code class="cmd-callout" style="background-color: #ffffff; color: #0f172a; border: 1px solid #fedf89; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; padding: 8px 10px; border-radius: 4px; display: block; word-break: break-all;">
+                  {{ rbac_remediation_cmd | default('oc adm policy add-cluster-role-to-user cluster-admin ' ~ (cluster_username | default('<upgrade-service-account>'))) }}
+                </code>
               </div>
               {% endif %}
 
-              <!-- Concise Failure Details Card -->
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; margin-bottom: 14px; border: 1px solid #e4e7ec; border-radius: 4px; font-size: 12px;">
+              <!-- Safe Session Teardown Callout -->
+              <div class="callout-box callout-teardown" style="border-radius: 6px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; background-color: {{ bg_pass | default('#e6f4ea') }}; border: 1px solid #b7e1cd; color: {{ color_pass | default('#1a7f37') }};">
+                <strong>✔ Safe Teardown Confirmed:</strong> {{ session_teardown_status | default('Cluster session token revoked and temporary kubeconfig purged from jump host.') }}
+              </div>
+
+              <!-- Diagnostic Matrix -->
+              <div class="section-heading" style="margin: 10px 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">
+                Failure Diagnostics
+              </div>
+              <table class="matrix-table" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; border-radius: 4px; font-size: 13px; margin-bottom: 20px; border-collapse: collapse;">
                 <tr>
-                  <td style="padding: 7px 10px; background-color: #f8f9fb; border-bottom: 1px solid #e4e7ec; font-weight: 600; color: #344054; width: 110px;">
-                    Failed Check:
-                  </td>
-                  <td style="padding: 7px 10px; background-color: #ffffff; border-bottom: 1px solid #e4e7ec; font-weight: 600; color: #101828;">
-                    {{ failed_check_name | default(check_name | default(current_task_name | default('Upgrade Sequence'))) }}
+                  <td class="matrix-label" style="width: 32%; font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Target Cluster</td>
+                  <td class="matrix-value" style="padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; color: #101828;">
+                    <strong>{{ cluster_name | default('N/A') }}</strong>
+                    {% if cluster_tier | default('') | length > 0 %}
+                    <span style="font-size: 11px; padding: 2px 6px; background-color: #f2f4f7; border-radius: 4px; color: #344054; margin-left: 6px;">{{ cluster_tier }}</span>
+                    {% endif %}
                   </td>
                 </tr>
                 <tr>
-                  <td style="padding: 7px 10px; background-color: #f8f9fb; border-bottom: 1px solid #e4e7ec; font-weight: 600; color: #344054;">
-                    Observed:
-                  </td>
-                  <td style="padding: 7px 10px; background-color: #ffffff; border-bottom: 1px solid #e4e7ec; color: #344054;">
-                    {{ observed_value | default(observed | default(failure_observed | default('Task non-zero exit'))) }}
+                  <td class="matrix-label" style="width: 32%; font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Failed Task</td>
+                  <td class="matrix-value" style="padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; color: #101828;">
+                    <code>{{ failed_task_name | default('Unknown Task') }}</code>
                   </td>
                 </tr>
-                {% if not (is_rbac_error | default(false)) and (failure_reason is defined and failure_reason | length > 0) %}
                 <tr>
-                  <td style="padding: 7px 10px; background-color: #f8f9fb; border-bottom: 1px solid #e4e7ec; font-weight: 600; color: #344054; vertical-align: top;">
-                    Error Details:
-                  </td>
-                  <td style="padding: 7px 10px; background-color: #ffffff; border-bottom: 1px solid #e4e7ec; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 11px; color: #b42318; word-break: break-all;">
-                    {{ failure_reason }}
+                  <td class="matrix-label" style="width: 32%; font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Safety Gate Type</td>
+                  <td class="matrix-value" style="padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; color: #101828;">
+                    <span style="font-weight: 700; color: {{ color_fail | default('#b42318') }};">{{ failed_gate_type | default('HARD') }}</span> (Immediate Abort)
                   </td>
                 </tr>
-                {% endif %}
                 <tr>
-                  <td style="padding: 7px 10px; background-color: #f8f9fb; font-weight: 600; color: #344054;">
-                    Session Status:
+                  <td class="matrix-label" style="width: 32%; font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Observed State</td>
+                  <td class="matrix-value" style="padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; color: #101828;">
+                    {{ failure_observed | default('Non-zero return code or health validation failure') }}
                   </td>
-                  <td style="padding: 7px 10px; background-color: #ffffff; color: #1a7f37; font-weight: 600;">
-                    <span style="display: inline-block; padding: 1px 5px; font-size: 10px; font-weight: 700; color: #1a7f37; background-color: #e6f4ea; border-radius: 3px; margin-right: 4px;">
-                      {{ (status_glyphs | default({})).pass | default('✔') }} LOGGED OUT
-                    </span>
-                    Kubeconfig invalidated safely
+                </tr>
+                <tr>
+                  <td class="matrix-label" style="width: 32%; font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Upgrade Hop</td>
+                  <td class="matrix-value" style="padding: 10px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; color: #101828;">
+                    {{ current_cluster_version | default('N/A') }} &rarr; <strong>{{ target_cluster_version | default('N/A') }}</strong>
                   </td>
                 </tr>
               </table>
 
-              <!-- Action Strip -->
-              <div style="background-color: #f8f9fb; border: 1px solid #e4e7ec; border-radius: 4px; padding: 8px 12px; font-size: 11px; color: #475467;">
-                <strong>Next Step:</strong> Review full logs on jump server at <code style="font-family: 'SFMono-Regular', Consolas, monospace; color: #101828;">{{ log_path | default('logs/') }}</code>, resolve the error above, and re-run <code style="font-family: 'SFMono-Regular', Consolas, monospace; color: #101828;">00_Run.sh</code>.
+              <!-- Error Message / Stack Trace -->
+              <div class="section-heading" style="margin: 10px 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">
+                Error Output
+              </div>
+              <div class="code-block" style="background-color: #0f172a; color: #f8fafc; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; padding: 12px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; margin: 8px 0; line-height: 1.45;">
+{{ failure_reason | default(resolved_error | default('No detailed error output captured from execution host.')) }}
+              </div>
+
+              <!-- Next Steps Box -->
+              <div style="margin-top: 20px; padding: 14px 16px; background-color: #f8f9fb; border: 1px solid {{ color_border | default('#e4e7ec') }}; border-radius: 6px; font-size: 13px;">
+                <div style="font-weight: 700; margin-bottom: 6px; color: #344054;">Next Steps & Remediation:</div>
+                <ol style="margin: 0; padding-left: 18px; color: #475467;">
+                  <li style="margin-bottom: 4px;">Inspect the complete execution run log on the jump host:
+                    <div style="font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; color: #101828; margin: 3px 0;">
+                      {{ log_file_path | default('playbooks/logs/' ~ (cluster_name | default('cluster')) ~ '.txt') }}
+                    </div>
+                  </li>
+                  <li style="margin-bottom: 4px;">Resolve root cause identified in the diagnostic table above.</li>
+                  <li>Re-run upgrade with <code>--resume</code> flag to resume from the interrupted phase.</li>
+                </ol>
               </div>
 
             </td>
           </tr>
 
-          <!-- Footer Band -->
+          <!-- Footer Panel -->
           <tr>
-            <td style="background-color: #f8f9fb; padding: 10px 18px; border-top: 1px solid #e4e7ec; text-align: center; font-size: 11px; color: #667085;">
-              {{ report_footer | default('Generated by ARO Cluster Upgrade Automation') }} &bull; Run ID: <code style="font-family: 'SFMono-Regular', Consolas, monospace;">{{ run_id | default('N/A') }}</code>
+            <td class="footer-panel" style="padding: 16px 24px; background-color: #f9fafb; border-top: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; color: #667085; line-height: 1.4;">
+              <div><strong>Generated:</strong> {{ report_timestamp | default((ansible_date_time.iso8601 if (ansible_date_time is defined and ansible_date_time.iso8601 is defined) else 'N/A')) }}</div>
+              <div><strong>Execution Host:</strong> {{ ansible_hostname | default('localhost') }} (Ansible {{ (ansible_version.string if (ansible_version is defined and ansible_version.string is defined) else '2.x') }})</div>
+              <div style="margin-top: 4px;">Automated notification from ARO Cluster Upgrade Engine &bull; Do not reply directly to this message.</div>
             </td>
           </tr>
 
         </table>
-
       </td>
     </tr>
   </table>
-
 </body>
 </html>

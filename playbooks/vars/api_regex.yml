@@ -1,19 +1,22 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable definitions.
+# ============================================================================
+# API Validation Patterns and Regular Expressions
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Regular expression string constants.
 #
-# Regular expressions for validating and parsing cluster API URLs.
-# Used by Phase 01 (01_Policy_Check.yaml) to confirm the cluster
-# API endpoint format and extract the cluster name.
+# Purpose: Defines regex patterns for validating OpenShift cluster API endpoints,
+#          cluster names, and version strings to prevent malformed inputs.
+# Dependencies: None
+# Gate type: N/A
+# ============================================================================
 
----
-# --- Cluster API URL validation regex ----------------------------------------
-# Matches the expected ARO API URL pattern:
-#   https://api.<cluster-name>.<domain>:<port>
-# Example: https://api.cluster-d01.example.com:6443
-desired_cluster_api_regex: "^https://api\\.[a-zA-Z0-9-]+\\.[a-zA-Z0-9.-]+:[0-9]+$"
+# Regex for validating strict OpenShift cluster API endpoint URLs
+# Example match: https://api.aro-d01.eastus.aroapp.io:6443
+desired_cluster_api_regex: '^https://api\.aro-[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+:6443/?$'
 
-# --- Cluster name extraction regex -------------------------------------------
-# Extracts the cluster name from the API URL.
-# Captures the segment between 'api.' and the next dot.
-# Example: https://api.cluster-d01.example.com:6443 → cluster-d01
-cluster_name_regex: "^https://api\\.([a-zA-Z0-9-]+)\\."
+# Regex for validating standard OpenShift semantic version strings
+# Matches versions like 4.14.12, 4.15.35, 4.16.18, 4.19.0-0.okd etc.
+ocp_version_regex: '^4\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'
+
+# Regex for validating alphanumeric cluster identifiers
+cluster_name_regex: '^[a-zA-Z0-9_-]+$'

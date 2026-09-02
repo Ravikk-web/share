@@ -1,30 +1,28 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable definitions.
-#                 | default('') guards are already in place for Jinja2 strictness.
-#
-# Default variables for the api_readiness role.
-# Confirms the API server is responsive and ready (/readyz) before heavier checks.
-#
-# Contract:
-#   - Read-only; queries `oc get --raw='/readyz'`.
-#   - Asserts healthy response ('ok').
-#   - Appends a structured PASS/FAIL entry to the `health_summary` list.
-#   - On non-ready response, fails immediately with a HARD gate failure.
-
 ---
-# Path to the active kubeconfig (defaults to playbook_dir/.kubeconfig)
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+# ============================================================================
+# Role Defaults: api_readiness
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar values.
+#
+# Purpose: Defines default input parameters for the api_readiness role, which
+#          confirms that the OpenShift API server readiness endpoint (/readyz)
+#          is responding with 'ok' and return code 0.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: HARD
+# ============================================================================
 
-# Target cluster name (used for logging and failure messages)
+# Target cluster identifier (string, required)
 cluster_name: ""
 
-# Endpoint to query for readiness
+# Target readiness endpoint to query via oc get --raw
+# In OpenShift 4, /readyz aggregates readiness across all API server subsystems
 api_readiness_endpoint: "/readyz"
 
-# Expected healthy response body
-api_readiness_expected_response: "ok"
+# Master toggle for enforcing HARD gate failure on validation error
+# Set to false by prevalidation aggregator during diagnostic sweeps before remediation
+api_readiness_enforce_gate: true
 
-# Metadata for health_summary reporting
-api_readiness_id: "02"
-api_readiness_name: "API Server Readiness (/readyz)"
-api_readiness_gate: "HARD"
+# Transient retry parameters for oc CLI execution
+oc_command_retries: 3
+oc_command_retry_delay: 10

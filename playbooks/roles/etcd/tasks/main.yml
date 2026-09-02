@@ -1,153 +1,126 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (shell, command, fail, set_fact, debug)
-#                 work on both versions. Replace with FQCN only if adopting the
-#                 ansible.builtin.* convention project-wide.
-#                 | default('') guards are applied on all optional variables.
-#
-# etcd role — validates etcd member health (HARD gate).
-#
-# Contract:
-#   - Queries etcd pods via `oc get pods -n <etcd_namespace> -l <etcd_pod_selector> -o json` piped to `jq`.
-#   - Read-only operation; changed_when: false.
-#   - Backup is explicitly OUT OF SCOPE (manual operation); no backup or snapshot mutation is attempted.
-#   - Asserts every etcd member pod is Running and Ready=True.
-#   - Optionally queries etcd cluster operator conditions for operator-level degradation (`oc get etcd`).
-#   - Respects optional etcd_allow_list for permitted exceptions.
-#   - HARD gate: fails with explicit error naming cluster, offending members, and observed conditions.
-#   - Exposes parsed facts (etcd_all_members, etcd_member_count, etcd_offending_members).
-#   - Records a structured PASS entry into `health_summary` list via set_fact.
-
 ---
-# Shell module chosen to pipe oc get pods JSON output to jq (v1.5 compatible)
-- name: Query etcd member pods and evaluate health conditions — oc get pods
-  shell: >-
-    oc get pods -n "{{ etcd_namespace | default('openshift-etcd') }}" -l "{{ etcd_pod_selector | default('app=etcd') }}" -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-      .items // [] | {
-        "members": [
-          .[] | {
-            "name": .metadata.name,
-            "node": (.spec.nodeName // "unknown"),
-            "phase": (.status.phase // "Unknown"),
-            "ready": ([.status.conditions[]? | select(.type=="Ready") | .status][0] // "Unknown"),
-            "restart_count": ([.status.containerStatuses[]?.restartCount] | add // 0),
-            "ip": (.status.podIP // "unknown")
-          }
-        ],
-        "offenders": [
-          .[] | {
-            "name": .metadata.name,
-            "node": (.spec.nodeName // "unknown"),
-            "phase": (.status.phase // "Unknown"),
-            "ready": ([.status.conditions[]? | select(.type=="Ready") | .status][0] // "Unknown"),
-            "restart_count": ([.status.containerStatuses[]?.restartCount] | add // 0),
-            "ip": (.status.podIP // "unknown")
-          } | select(.ready != "True" or .phase != "Running")
-        ]
-      }
-    '
-  register: etcd_raw_query
+# ============================================================================
+# Role Tasks: etcd (etcd Database Health)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, fail, debug).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Verifies etcd member quorum and raft leader stability before cluster
+#          mutation by validating control-plane etcd pod status and the etcd
+#          ClusterOperator condition state.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: HARD
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Query etcd Control-Plane Pods via oc CLI & jq v1.5
+# Why: Validates that all static control-plane etcd pods are Running and Ready.
+# Why: Shell with set -o pipefail and executable: /bin/bash captures errors.
+# ----------------------------------------------------------------------------
+- name: "Query etcd control-plane pods status via jq"
+  shell: |
+    set -o pipefail
+    oc get pods -n {{ etcd_namespace | default('openshift-etcd') }} -l app=etcd -o json | jq -c '
+      {
+        total_pods: ((.items // []) | length),
+        pod_names: [(.items // [])[] | .metadata.name],
+        running_pods: [(.items // [])[] | select(.status.phase == "Running") | .metadata.name],
+        unready_pods: [(.items // [])[] | select(
+          (.status.phase != "Running") or
+          ((((.status.conditions // []) | map(select(.type == "Ready")) | .[0].status) // "False" | tostring) != "True")
+        ) | .metadata.name]
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: etcd_pods_raw
   changed_when: false
   failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: etcd_pods_raw.rc == 0
 
-- name: Evaluate etcd member pods query execution
-  fail:
-    msg: >-
-      Failed to query etcd member pods for cluster '{{ cluster_name | default('UNKNOWN') }}' in namespace '{{ etcd_namespace | default('openshift-etcd') }}'.
-      Command exited with code {{ etcd_raw_query.rc | default(1) }}.
-      Error: {{ etcd_raw_query.stderr | default(etcd_raw_query.stdout | default('No output')) | trim }}.
-      Check kubeconfig path ({{ kubeconfig_path }}) and cluster reachability.
-  when: (etcd_raw_query.rc | default(1) != 0) or (etcd_raw_query.stdout | default('') | trim == '')
-
-- name: Parse etcd pods JSON payload
-  set_fact:
-    etcd_parsed_data: "{{ etcd_raw_query.stdout | from_json }}"
-
-- name: Extract all etcd members list and count
-  set_fact:
-    etcd_all_members: "{{ etcd_parsed_data.members | default([]) }}"
-    etcd_member_count: "{{ (etcd_parsed_data.members | default([])) | length }}"
-
-- name: Validate at least minimum expected etcd members were discovered
-  fail:
-    msg: >-
-      etcd health check FAILED (HARD gate) for cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      Expected at least {{ etcd_min_members | default(1) }} etcd member(s), but found {{ etcd_member_count | default(0) }} in namespace '{{ etcd_namespace | default('openshift-etcd') }}'.
-  when: (etcd_member_count | int) < (etcd_min_members | default(1) | int)
-
-- name: Initialize offending etcd members list
-  set_fact:
-    etcd_offending_members: []
-
-- name: Filter offending etcd members against etcd_allow_list
-  set_fact:
-    etcd_offending_members: "{{ etcd_offending_members + [item] }}"
-  loop: "{{ etcd_parsed_data.offenders | default([]) }}"
-  when: item.name not in (etcd_allow_list | default([]))
-
-# Optional operator-level condition query — oc get etcd
-- name: Query etcd cluster operator conditions — oc get etcd
-  shell: >-
-    oc get etcd -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-      .items[0].status.conditions // [] | {
-        "degraded_conditions": [
-          .[] | select((.type | contains("Degraded")) and .status == "True") | {
-            "type": .type,
-            "status": .status,
-            "reason": (.reason // "Unknown"),
-            "message": (.message // "No message")
-          }
-        ]
-      }
-    '
-  register: etcd_operator_raw_query
+# ----------------------------------------------------------------------------
+# 2. Query ClusterOperator etcd Status via oc CLI & jq v1.5
+# Why: ClusterOperator etcd continuously evaluates member health, quorum, and raft alarms.
+# ----------------------------------------------------------------------------
+- name: "Query ClusterOperator etcd condition status via jq"
+  shell: |
+    set -o pipefail
+    oc get clusteroperator etcd -o json | jq -c '
+      {
+        available: (((.status.conditions // []) | map(select(.type == "Available")) | .[0].status) // "False" | tostring),
+        degraded: (((.status.conditions // []) | map(select(.type == "Degraded")) | .[0].status) // "True" | tostring),
+        progressing: (((.status.conditions // []) | map(select(.type == "Progressing")) | .[0].status) // "Unknown" | tostring),
+        message: (((.status.conditions // []) | map(select(.type == "Degraded")) | .[0].message) // "")
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: etcd_co_raw
   changed_when: false
   failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: etcd_co_raw.rc == 0
 
-- name: Parse etcd operator degraded conditions
+# ----------------------------------------------------------------------------
+# 3. Extract Facts & Evaluate etcd Quorum Health
+# Why: Ensures pod count meets HA quorum threshold and ClusterOperator is healthy.
+# ----------------------------------------------------------------------------
+- name: "Extract etcd pod and operator condition facts"
   set_fact:
-    etcd_operator_degraded: "{{ ((etcd_operator_raw_query.stdout | default('{}') | from_json).degraded_conditions | default([])) if (etcd_operator_raw_query.rc | default(1) == 0 and (etcd_operator_raw_query.stdout | default('') | trim != '')) else [] }}"
+    etcd_total_pods: "{{ (etcd_pods_raw.stdout | default('{}') | from_json)['total_pods'] | default(0) }}"
+    etcd_unready_pods: "{{ (etcd_pods_raw.stdout | default('{}') | from_json)['unready_pods'] | default([]) }}"
+    etcd_co_available: "{{ ((etcd_co_raw.stdout | default('{}') | from_json)['available'] | default('False')) | string | trim }}"
+    etcd_co_degraded: "{{ ((etcd_co_raw.stdout | default('{}') | from_json)['degraded'] | default('True')) | string | trim }}"
 
-- name: Display etcd inspection summary
+- name: "Evaluate etcd quorum and member stability"
+  set_fact:
+    etcd_check_valid: >-
+      {{ ((etcd_total_pods | int) >= (etcd_expected_min_members | default(3) | int)) and
+         ((etcd_unready_pods | length) == 0) and
+         (etcd_co_available == 'True') and
+         (etcd_co_degraded != 'True') }}
+
+# ----------------------------------------------------------------------------
+# 4. Construct Structured Health Record & Append to Summary
+# Why: Appends structured dictionary into health_summary for reporting.
+# ----------------------------------------------------------------------------
+- name: "Construct structured etcd health record"
+  set_fact:
+    etcd_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "etcd Quorum and Member Health"
+      gate: "HARD"
+      status: "{{ 'PASS' if (etcd_check_valid | bool) else 'FAIL' }}"
+      observed: >-
+        {{ ('etcd quorum healthy: ' ~ etcd_total_pods ~ ' control-plane pods Running/Ready, ClusterOperator etcd Available=True, Degraded=False')
+           if (etcd_check_valid | bool)
+           else ('etcd unhealthy: pods=' ~ etcd_total_pods ~ ' (unready: [' ~ (etcd_unready_pods | join(', ')) ~ ']), CO etcd Available=' ~ etcd_co_available ~ ', Degraded=' ~ etcd_co_degraded) }}
+
+- name: "Record etcd result to health_summary tracking list"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [etcd_health_item] }}"
+
+- name: "Log etcd evaluation outcome"
   debug:
-    msg: >-
-      Cluster '{{ cluster_name | default('UNKNOWN') }}': Scanned {{ etcd_all_members | length }} etcd member pod(s).
-      Found {{ etcd_offending_members | length }} unhealthy member pod(s) and {{ etcd_operator_degraded | length }} degraded operator condition(s)
-      (Allow-listed: {{ etcd_allow_list | default([]) | length }}).
+    msg:
+      - "Check        : {{ etcd_health_item.name }}"
+      - "Status       : {{ etcd_health_item.status }}"
+      - "Observed     : {{ etcd_health_item.observed }}"
+      - "Gate Enforced: {{ etcd_enforce_gate | default(true) | bool }}"
 
-- name: Enforce HARD gate on etcd member health
+# ----------------------------------------------------------------------------
+# 5. Enforce HARD Gate
+# Why: Halts execution immediately if etcd loses quorum or member pods fail.
+# ----------------------------------------------------------------------------
+- name: "Enforce HARD gate for etcd health check"
   fail:
-    msg: >-
-      etcd health check FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      {% if (etcd_offending_members | length) > 0 %}
-      Found {{ etcd_offending_members | length }} unhealthy etcd member pod(s):
-      {% for member in etcd_offending_members %}
-        - {{ member.name }} on {{ member.node }}: Phase={{ member.phase | default('Unknown') }}, Ready={{ member.ready | default('Unknown') }}, Restarts={{ member.restart_count | default(0) }}
-      {% endfor %}
-      {% endif %}
-      {% if (etcd_operator_degraded | length) > 0 %}
-      Found {{ etcd_operator_degraded | length }} degraded etcd operator condition(s):
-      {% for cond in etcd_operator_degraded %}
-        - {{ cond.type }}: Status={{ cond.status }}, Reason={{ cond.reason }}, Message={{ cond.message }}
-      {% endfor %}
-      {% endif %}
-      All etcd members must be Running, Ready=True, and non-degraded before upgrade operations can proceed.
-  when: (etcd_offending_members | length) > 0 or (etcd_operator_degraded | length) > 0
-
-- name: Record etcd PASS in health_summary
-  set_fact:
-    health_summary: "{{ (health_summary | default([])) + [etcd_summary_entry] }}"
-  vars:
-    etcd_summary_entry:
-      id: "{{ etcd_id | default('06') }}"
-      name: "{{ etcd_name | default('etcd Member Health') }}"
-      gate: "{{ etcd_gate | default('HARD') }}"
-      status: "PASS"
-      observed: "All {{ etcd_all_members | length }} etcd members are Running and Ready"
-      details: "Verified {{ etcd_all_members | length }} etcd member pods in namespace {{ etcd_namespace | default('openshift-etcd') }} on cluster {{ cluster_name | default('cluster') }}"
-      raw_output: "{{ etcd_all_members | to_json }}"
-
-- name: Confirm etcd health passed
-  debug:
-    msg: >-
-      ✔ PASS [Check {{ etcd_id | default('06') }} - {{ etcd_name | default('etcd Member Health') }}] —
-      All {{ etcd_all_members | length }} etcd member pods are Running and Ready (0 degraded conditions).
+    msg: "HARD GATE FAILURE [etcd]: etcd health check failed on cluster '{{ cluster_name }}'. Pods: {{ etcd_total_pods }} (expected >= {{ etcd_expected_min_members }}), Unready pods: {{ etcd_unready_pods | to_json }}, CO etcd Available: {{ etcd_co_available }}, Degraded: {{ etcd_co_degraded }}."
+  when:
+    - not (etcd_check_valid | bool)
+    - etcd_enforce_gate | default(true) | bool

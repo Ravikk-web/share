@@ -1,22 +1,28 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable definitions.
-#                 | default('') guards are already in place for Jinja2 strictness.
-#
-# Default variables for the snapshot role.
-# Captures clusterversion, clusteroperators, nodes, and routes into a
-# single baseline JSON snapshot file under snapshot_dir.
-#
-# Contract:
-#   - Writes to snapshots/<cluster>_<timestamp>_baseline.json
-#   - Baseline JSON snapshot is the ONLY sanctioned cross-phase persistence.
-#   - Read later only by Phase 05 for baseline diffing.
-
 ---
-# --- Directory & kubeconfig paths (derived from playbook_dir) -----------------
-snapshot_dir: "{{ playbook_dir }}/snapshots"
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+# ============================================================================
+# Role Defaults: snapshot
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Default configuration variables for the cluster baseline snapshot role.
+#          Defines directory locations, filename conventions, and retry parameters.
+# Dependencies: vars/paths.yml, vars/upgrade.yml
+# Gate type: N/A (configuration defaults)
+# ============================================================================
 
-# --- Target cluster identifiers -----------------------------------------------
+# Directory where cluster baseline snapshots are stored
+# Sourced from vars/paths.yml or derived from playbook_dir
+snapshot_dir: "{{ playbook_dir }}/snapshots"
+
+# Target cluster name (required string, passed via vars/upgrade.yml or extra-vars)
 cluster_name: ""
-snapshot_timestamp: ""
-snapshot_file: ""
+
+# Target snapshot output file path
+# Persisted once in Phase 01 and consumed in Phase 05 for postvalidation diff
+snapshot_file: "{{ snapshot_dir }}/{{ cluster_name }}_{{ run_timestamp | default('baseline') }}_baseline.json"
+
+# Transient oc CLI command retry parameters for resilient API communication
+# Sourced from vars/upgrade.yml — do not hardcode in tasks
+oc_command_retries: 3
+oc_command_retry_delay: 10

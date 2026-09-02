@@ -1,26 +1,30 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable definitions.
-#                 | default('') guards are already in place for Jinja2 strictness.
-#
-# Default variables for the login role.
-# kubeconfig_path is derived from playbook_dir — never hardcoded to a machine.
-# Optional overrides use | default('') so callers can pass them at runtime
-# without Jinja2 undefined errors on either Ansible version.
-
 ---
-# --- Kubeconfig path (primary default) ----------------------------------------
-# Written by `oc login` in this role. Stored under playbook_dir so it is
-# cleaned up on logout and never collides with the operator's personal config.
-# Override at runtime to place the kubeconfig elsewhere if needed.
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+# ============================================================================
+# Role Defaults: login
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Standard variable declarations.
+#
+# Purpose: Default configuration variables for the login role. Defines the
+#          session-scoped kubeconfig path, server endpoint validation regex,
+#          TLS verification behavior, and transient command retry parameters.
+# Dependencies: None (consumed by roles/login/tasks/main.yml)
+# Gate type: N/A
+# ============================================================================
 
-# --- Optional overrides -------------------------------------------------------
-# These are intentionally empty-string defaults. The caller (secrets.yml /
-# extra-vars) is expected to supply real values. The | default('') pattern
-# is required here so the vars are always defined, even when the role is
-# included without the parent playbook's vars_files (e.g. in isolation tests).
-# MIGRATION 2.14: Jinja2 strictness requires these defaults; 2.7.17 is lenient
-#                 but we define them for forward compatibility.
-login_api_url: "{{ api_url | default('') }}"
-login_username: "{{ username | default('') }}"
-login_password: "{{ password | default('') }}"
+# Dedicated session kubeconfig path scoped to the active cluster target
+# Isolated under playbook_dir to avoid mutating user default ~/.kube/config
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig-{{ cluster_name | default('default') }}"
+
+# Regular expression pattern to validate the active cluster API URL
+# Enforces https scheme, valid domain hostname or IP, and port 6443
+desired_cluster_api_regex: "^https://api\\.[a-zA-Z0-9.-]+:6443/?$"
+
+# Whether to bypass TLS certificate verification (must remain false in production)
+insecure_skip_tls_verify: false
+
+# Maximum retry attempts for oc commands against API server
+oc_command_retries: 3
+
+# Seconds to pause between transient oc command retries
+oc_command_retry_delay: 10

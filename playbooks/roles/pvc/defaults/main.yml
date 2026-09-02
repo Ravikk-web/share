@@ -1,20 +1,23 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable defaults.
-#                 | default('') guards are applied on all optional variables.
-#
-# pvc role defaults — validates Persistent Volume Claim (PVC) status across all namespaces (WARN gate).
-
 ---
-# Kubeconfig path — defaults to the session kubeconfig established in Phase 01.
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+# ============================================================================
+# Role Defaults: pvc (PersistentVolumeClaims)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar and boolean values.
+#
+# Purpose: Defines default parameters for the pvc role, which audits workload
+#          PersistentVolumeClaims across all namespaces to verify that claims are
+#          in Bound phase, alerting on Pending or Lost claims prior to upgrade.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: WARN
+# ============================================================================
 
-# Cluster name used in log messages and report entries.
-cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+# Target cluster identifier (string, required)
+cluster_name: ""
 
-# Prevalidation check metadata for health_summary reporting.
-pvc_id: "09"
-pvc_name: "Persistent Volume Claim (PVC) Status"
-pvc_gate: "WARN"
+# Master toggle for enforcing gate failure on validation error (WARN gate does not fail by default)
+pvc_enforce_gate: false
 
-# Optional list of PVC identifiers (e.g. "namespace/pvc-name") permitted to be non-Bound without triggering WARN.
-pvc_allow_list: []
+# Transient retry parameters for oc CLI execution
+oc_command_retries: 3
+oc_command_retry_delay: 10

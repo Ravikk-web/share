@@ -1,68 +1,84 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (command, fail, set_fact, debug) work
-#                 on both versions. Replace with FQCN only if adopting the
-#                 ansible.builtin.* convention project-wide.
-#                 | default('') is already applied on all optional variables.
-#
-# api_check role — validates the current cluster API server context.
-#
-# Contract:
-#   - Queries `oc whoami --show-server --kubeconfig {{ kubeconfig_path }}`.
-#   - Read-only operation; changed_when: false.
-#   - Validates the reported server URL against `desired_cluster_api_regex`.
-#   - HARD gate: fails with explicit error naming observed vs expected on mismatch.
-#   - Records a structured entry in `health_summary` list via set_fact.
-
 ---
-- name: Query current cluster API server context — oc whoami --show-server
-  command: >-
-    oc whoami --show-server
-    --kubeconfig {{ kubeconfig_path }}
-  register: api_check_whoami_result
+# ============================================================================
+# Role Tasks: api_check
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (command, set_fact, fail, debug).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Verifies that the active cluster API URL matches the intended cluster
+#          regex pattern, preventing accidental mutations against the wrong cluster.
+# Dependencies: playbooks/vars/api_regex.yml, playbooks/vars/paths.yml
+# Gate type: HARD
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Query Active Server URL via oc CLI
+# Why: oc whoami --show-server returns the live server endpoint recorded in the kubeconfig.
+# Why: Retry logic absorbs transient network hiccups or temporary API restarts.
+# Why: changed_when: false keeps audit reports honest since queries are read-only.
+# ----------------------------------------------------------------------------
+- name: "Query active cluster API server URL via oc CLI"
+  command: "oc whoami --show-server"
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: api_check_query
   changed_when: false
   failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: api_check_query.rc == 0
 
-- name: Evaluate API context query success
-  fail:
-    msg: >-
-      Failed to query cluster API server context for '{{ cluster_name | default('UNKNOWN') }}'.
-      Command 'oc whoami --show-server' exited with code {{ api_check_whoami_result.rc | default(1) }}.
-      Error: {{ api_check_whoami_result.stderr | default(api_check_whoami_result.stdout | default('No output')) | trim }}.
-      Check kubeconfig path ({{ kubeconfig_path }}) and cluster reachability.
-  when: api_check_whoami_result.rc | default(1) != 0
-
-- name: Extract and store authenticated API server URL
+# ----------------------------------------------------------------------------
+# 2. Extract & Validate API Server URL Against Pattern
+# Why: Normalizes output with trim and performs strict regex validation.
+# ----------------------------------------------------------------------------
+- name: "Extract active cluster server URL fact"
   set_fact:
-    api_check_server_url: "{{ api_check_whoami_result.stdout | trim }}"
+    active_cluster_server: "{{ api_check_query.stdout | default('') | trim }}"
 
-- name: Display detected API server context
-  debug:
-    msg: "Cluster '{{ cluster_name | default('UNKNOWN') }}' current API server: {{ api_check_server_url }}"
-
-- name: Validate API server URL against desired_cluster_api_regex
-  fail:
-    msg: >-
-      API context validation FAILED (HARD gate) for cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      Observed API URL: '{{ api_check_server_url }}'.
-      Expected API regex: '{{ desired_cluster_api_regex | default('NOT SET') }}'.
-      The active context does not match the expected cluster regex pattern.
-  when: api_check_server_url is not match(desired_cluster_api_regex | default(''))
-
-- name: Record api_check PASS in health_summary
+- name: "Evaluate API server URL against target regex pattern"
   set_fact:
-    health_summary: "{{ (health_summary | default([])) + [api_check_summary_entry] }}"
-  vars:
-    api_check_summary_entry:
-      id: "{{ api_check_id | default('01') }}"
-      name: "{{ api_check_name | default('API Server Context Validation') }}"
-      gate: "{{ api_check_gate | default('HARD') }}"
-      status: "PASS"
-      observed: "API URL: {{ api_check_server_url }}"
-      details: "Confirmed oc context matches desired regex ({{ desired_cluster_api_regex | default('') }})"
-      raw_output: "{{ api_check_whoami_result.stdout | trim | default('') }}"
+    api_check_valid: >-
+      {{ (api_check_query.rc == 0) and
+         ((active_cluster_server | default('')) | length > 0) and
+         ((active_cluster_server | default('')) is match(desired_cluster_api_regex)) }}
 
-- name: Confirm api_check passed
+# ----------------------------------------------------------------------------
+# 3. Construct Structured Health Record & Append to Summary
+# Why: Every health role appends a clean dictionary to health_summary for reporting.
+# ----------------------------------------------------------------------------
+- name: "Construct structured api_check health record"
+  set_fact:
+    api_check_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "API Context Verification"
+      gate: "HARD"
+      status: "{{ 'PASS' if (api_check_valid | bool) else 'FAIL' }}"
+      observed: >-
+        {{ ('Active API server verified: ' ~ active_cluster_server)
+           if (api_check_valid | bool)
+           else ('Observed API URL (' ~ (active_cluster_server | default('unreachable')) ~ ') does not match expected regex: ' ~ desired_cluster_api_regex) }}
+
+- name: "Record api_check result to health_summary tracking list"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [api_check_item] }}"
+
+- name: "Log api_check evaluation outcome"
   debug:
-    msg: >-
-      ✔ PASS [Check {{ api_check_id | default('01') }} - {{ api_check_name | default('API Server Context Validation') }}] —
-      Server URL '{{ api_check_server_url }}' matches pattern.
+    msg:
+      - "Check        : {{ api_check_item.name }}"
+      - "Status       : {{ api_check_item.status }}"
+      - "Observed     : {{ api_check_item.observed }}"
+      - "Gate Enforced: {{ api_check_enforce_gate | default(true) | bool }}"
+
+# ----------------------------------------------------------------------------
+# 4. Enforce HARD Gate
+# Why: Halts execution immediately if the server URL does not match intended cluster.
+# ----------------------------------------------------------------------------
+- name: "Enforce HARD gate for API context check"
+  fail:
+    msg: "HARD GATE FAILURE [api_check]: Active API server URL '{{ active_cluster_server }}' does not match expected pattern '{{ desired_cluster_api_regex }}' for cluster '{{ cluster_name }}'."
+  when:
+    - not (api_check_valid | bool)
+    - api_check_enforce_gate | default(true) | bool

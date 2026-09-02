@@ -1,25 +1,29 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable defaults.
-#                 | default('') guards are applied on all optional variables.
-#
-# pdb role defaults — validates PodDisruptionBudget (PDB) configurations for blocking-drain risk.
-
 ---
-# Kubeconfig path — defaults to the session kubeconfig established in Phase 01.
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+# ============================================================================
+# Role Defaults: pdb (PodDisruptionBudgets)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar and boolean values.
+#
+# Purpose: Defines default parameters for the pdb role, which audits
+#          PodDisruptionBudgets across all namespaces to detect zero-disruption
+#          budgets (disruptionsAllowed == 0 with expectedPods > 0) that would
+#          deadlock node draining during MachineConfigPool rollouts.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: Configurable (WARN by default; HARD if fail_on_zero_disruption_pdb is true)
+# ============================================================================
 
-# Cluster name used in log messages and report entries.
-cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+# Target cluster identifier (string, required)
+cluster_name: ""
 
-# Prevalidation check metadata for health_summary reporting.
-pdb_id: "10"
-pdb_name: "Pod Disruption Budget (PDB) Risk"
+# Enforce strict PodDisruptionBudget check (fail if any PDB allows 0 disruptions with active pods)
+# Sourced from vars/upgrade.yml (default: true)
+fail_on_zero_disruption_pdb: true
 
-# Escalation toggle: if true, zero-disruption PDBs escalate to HARD gate fail; if false, WARN only.
-fail_on_zero_disruption_pdb: false
+# Master toggle for enforcing gate failure on validation error
+# Set to false by prevalidation aggregator during diagnostic sweeps before remediation
+pdb_enforce_gate: true
 
-# Gate type dynamically reflects whether escalation is enabled.
-pdb_gate: "{{ 'HARD' if (fail_on_zero_disruption_pdb | default(false)) else 'WARN' }}"
-
-# Optional list of PDB identifiers (e.g. "namespace/pdb-name" or "pdb-name") permitted to have 0 disruptions.
-pdb_allow_list: []
+# Transient retry parameters for oc CLI execution
+oc_command_retries: 3
+oc_command_retry_delay: 10

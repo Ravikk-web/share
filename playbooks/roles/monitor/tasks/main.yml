@@ -1,235 +1,149 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (set_fact, debug, fail, include_tasks,
-#                 include_role, pause) work on both versions.
-#                 | default('') guards are applied on all optional variables.
-#                 No `warn:` parameter is used on any task.
-#
-# monitor/tasks/main.yml — Live upgrade monitoring during each hop.
-#
-# Responsibilities:
-#   1. Initialize monitoring state (start epoch, previous state, heartbeat clock).
-#   2. Run bounded polling loop (include_tasks: poll_iteration.yml with loop).
-#   3. Post-loop settle-gate assertion (CV at target, COs healthy, MCP Updated).
-#   4. Send hop-complete email on settle-gate pass.
-#
-# The polling loop is bounded by max_poll_iterations = hop_timeout_minutes / poll_interval_minutes.
-# Each iteration queries CV/MCP/nodes, detects state changes, sends emails, and checks
-# for MCP completion or timeout. The loop breaks when monitor_mcp_complete is set true.
-#
-# Why include_tasks + loop (not a shell while-loop):
-#   Keeps all logic in Ansible tasks with proper register/set_fact/include_role flow.
-#   Deterministic bounded iteration; no infinite loops. Cadences from vars.
-#
-# Dependencies:
-#   - Unit 05 (sendmail), Unit 04 (progress-mail.j2)
-#   - Units 10/11 (mcp/node jq patterns reused)
-#   - oc, jq
-
 ---
-# ==============================================================================
-# INITIALIZE MONITORING STATE
-# ==============================================================================
-- name: "Monitor init — compute max poll iterations"
-  set_fact:
-    max_poll_iterations: "{{ ((hop_timeout_minutes | default(90) | int) / (poll_interval_minutes | default(2) | int)) | round(0) | int }}"
+# ============================================================================
+# Role Tasks: monitor
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses standard assert, set_fact, debug, include_tasks, fail, lineinfile;
+#                 compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Master driver for the live upgrade monitoring lifecycle:
+#          1. Validates target version and hop metadata inputs.
+#          2. Initializes tracking metrics (start epoch, iteration index, state signature).
+#          3. Displays monitoring initiation banner and logs to text run log.
+#          4. Drives bounded polling loop (2-minute intervals, 90-minute timeout guard)
+#             via dynamic include_tasks over range(1, max_iterations).
+#          5. Enforces HARD timeout guard if loop terminates without cluster settling.
+#          6. Strictly verifies settle-gate contract (CV at target, COs healthy, MCPs updated).
+#          7. Exports duration and settle facts for downstream hop completion notifications.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/smtp.yml,
+#               roles/monitor/tasks/poll_iteration.yml, roles/sendmail
+# Gate type: HARD (strictly gates on timeout guard and settle contract)
+# ============================================================================
 
-- name: "Monitor init — record start epoch and initial state"
+# ----------------------------------------------------------------------------
+# 1. Parameter Validation & Monitoring State Initialization
+# Why: Pre-computes normalized facts to avoid Jinja2 lazy-evaluation loops,
+#      asserts required target version, and sets initial tracking epochs.
+# ----------------------------------------------------------------------------
+- name: "Monitor: Resolve and normalize target hop parameters"
   set_fact:
-    monitor_start_epoch: "{{ ansible_date_time.epoch }}"
-    monitor_prev_state: ""
-    monitor_last_heartbeat_epoch: 0
-    monitor_mcp_complete: false
-    monitor_state_changed: false
+    resolved_target_version: "{{ hop_target_version | default(target_version | default('')) }}"
+    resolved_hop_label: "{{ hop_label | default('1/1') }}"
+    resolved_hop_number: "{{ hop_number | default(1) }}"
+    resolved_hop_total: "{{ hop_total | default(1) }}"
+    monitor_poll_interval: "{{ poll_interval_minutes | default(2) | int }}"
+    monitor_timeout_limit: "{{ hop_timeout_minutes | default(90) | int }}"
+    monitor_heartbeat_cadence: "{{ heartbeat_minutes | default(20) | int }}"
 
-- name: "Monitor init — display monitoring parameters"
+- name: "Monitor: Validate target version input parameter"
+  assert:
+    that:
+      - resolved_target_version is defined
+      - resolved_target_version | length > 0
+    fail_msg: "[HARD GATE FAILURE] monitor role requires a non-empty 'hop_target_version' or 'target_version'."
+    success_msg: "Monitor target version validated: {{ resolved_target_version }}"
+
+- name: "Monitor: Compute loop bounds and initialize state tracking metrics"
+  set_fact:
+    monitor_max_iterations: >-
+      {{ (((monitor_timeout_limit | int) + (monitor_poll_interval | int) - 1) // (monitor_poll_interval | int)) | int }}
+    monitor_start_epoch: "{{ ansible_date_time.epoch if (ansible_date_time is defined and ansible_date_time.epoch is defined) else lookup('pipe', 'date +%s') }}"
+    last_heartbeat_epoch: "{{ ansible_date_time.epoch if (ansible_date_time is defined and ansible_date_time.epoch is defined) else lookup('pipe', 'date +%s') }}"
+    stalled_tracking_start_epoch: "{{ ansible_date_time.epoch if (ansible_date_time is defined and ansible_date_time.epoch is defined) else lookup('pipe', 'date +%s') }}"
+    previous_state_signature: ""
+    hop_settled: false
+    stalled_tracking_node: ""
+    stalled_node_force_attempted: false
+    monitor_iterations_completed: 0
+
+- name: "Monitor: Display Live Monitoring Initiation Banner"
   debug:
     msg:
-      - "═══════════════════════════════════════════════════════════"
-      - "Live Monitoring — Hop {{ hop_label | default('?/?') }} → {{ hop_target_version | default('') }}"
-      - "Cluster: {{ cluster_name | default('UNKNOWN') }}"
-      - "Poll interval: {{ poll_interval_minutes | default(2) }}m"
-      - "Heartbeat interval: {{ heartbeat_minutes | default(20) }}m"
-      - "Timeout: {{ hop_timeout_minutes | default(90) }}m"
-      - "Max poll iterations: {{ max_poll_iterations }}"
-      - "═══════════════════════════════════════════════════════════"
+      - "============================================================================"
+      - "PHASE 04: LIVE UPGRADE MONITORING INITIATED"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name }}"
+      - "Target Version       : {{ resolved_target_version }}"
+      - "Hop Identifier       : {{ resolved_hop_label }} (Hop {{ resolved_hop_number }} of {{ resolved_hop_total }})"
+      - "Polling Cadence      : Every {{ monitor_poll_interval }} minutes"
+      - "Heartbeat Cadence    : Every {{ monitor_heartbeat_cadence }} minutes"
+      - "Hop Timeout Guard    : {{ monitor_timeout_limit }} minutes (Max {{ monitor_max_iterations }} poll iterations)"
+      - "Auto-Force Stalled   : {{ auto_force_stalled_node | default(false) | bool }} (Threshold: {{ node_stall_threshold_minutes | default(30) }}m)"
+      - "============================================================================"
 
-# ==============================================================================
-# BOUNDED POLLING LOOP
-# ==============================================================================
-# Each iteration queries CV/MCP/nodes, computes progress, detects state changes,
-# sends heartbeat/change-alert emails, and checks for completion or timeout.
-# The loop breaks when monitor_mcp_complete is set true in poll_iteration.yml.
-- name: "Monitor — execute polling loop (bounded by {{ max_poll_iterations }} iterations)"
+- name: "Monitor: Log monitoring start to text run log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+    line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [INFO] [HARD] Phase 04: Live monitoring tracking Hop {{ resolved_hop_label }} (Target: {{ resolved_target_version }}). Timeout guard: {{ monitor_timeout_limit }}m ({{ monitor_max_iterations }} iterations)."
+    create: true
+  when: not (dry_run | default(false) | bool)
+
+# ----------------------------------------------------------------------------
+# 2. Bounded Polling Loop Execution
+# Why: Executes poll_iteration.yml per iteration up to monitor_max_iterations.
+#      Skipping logic inside poll_iteration.yml ensures that as soon as hop_settled
+#      becomes true, remaining iterations terminate without delay.
+# ----------------------------------------------------------------------------
+- name: "Monitor: Execute bounded live upgrade polling loop"
   include_tasks: poll_iteration.yml
-  loop: "{{ range(max_poll_iterations | int) | list }}"
+  loop: "{{ range(1, (monitor_max_iterations | int) + 1) | list }}"
   loop_control:
-    loop_var: poll_iter
-  when: not (monitor_mcp_complete | default(false) | bool)
+    loop_var: poll_iteration_idx
 
-# ==============================================================================
-# POST-LOOP: SETTLE-GATE ASSERTION
-# ==============================================================================
-# After MCP rollout completes, assert the cluster is fully settled:
-#   - CV at target version
-#   - All ClusterOperators Available=True and not Progressing
-#   - All MCPs Updated=True
-# If the loop exhausted without completion, the timeout guard in poll_iteration.yml
-# would have already fired a fail:.
+# ----------------------------------------------------------------------------
+# 3. Timeout Guard & Settle-Gate Contract Enforcement
+# Why: If the loop finishes without achieving settled state, the upgrade hop has
+#      exceeded hop_timeout_minutes (default 90m). Strict HARD gate halts execution,
+#      triggers Phase 03 rescue block, dispatches failure alert, and logs out.
+# ----------------------------------------------------------------------------
+- name: "Monitor: Enforce hop timeout guard"
+  fail:
+    msg: >-
+      [HARD GATE FAILURE] Upgrade hop exceeded {{ monitor_timeout_limit }}m timeout without settling.
+      MCP or ClusterVersion rollout stalled for cluster '{{ cluster_name }}' (Hop {{ resolved_hop_label }} -> {{ resolved_target_version }}).
+      Current Version: {{ poll_cv_version | default('unknown') }} | Progressing: {{ poll_cv_progressing | default('unknown') }}.
+      Offending MCPs (Updating/Degraded): {{ ((poll_mcp_updating_list | default([])) + (poll_mcp_degraded_list | default([]))) | join(', ') }}.
+  when:
+    - monitor_enforce_gate | default(true) | bool
+    - not (hop_settled | default(false) | bool)
 
-- name: "Monitor settle-gate — query ClusterVersion for final state"
-  command: oc get clusterversion version -o json --kubeconfig {{ kubeconfig_path }}
-  register: settle_cv_raw
-  changed_when: false
-  failed_when: settle_cv_raw.rc != 0
-
-- name: "Monitor settle-gate — parse ClusterVersion"
-  set_fact:
-    settle_cv_version: "{{ (settle_cv_raw.stdout | from_json).status.desired.version | default('unknown') }}"
-    settle_cv_progressing: "{{ ((settle_cv_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first) | default('Unknown') }}"
-
-- name: "Monitor settle-gate — query ClusterOperators"
-  shell: >-
-    oc get clusteroperators -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-      {
-        "not_available": [.items[]? | select(([.status.conditions[]? | select(.type=="Available") | .status][0] // "True") != "True") | .metadata.name],
-        "progressing": [.items[]? | select(([.status.conditions[]? | select(.type=="Progressing") | .status][0] // "False") == "True") | .metadata.name],
-        "degraded": [.items[]? | select(([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "False") == "True") | .metadata.name]
-      }
-    '
-  register: settle_co_raw
-  changed_when: false
-  failed_when: false
-
-- name: "Monitor settle-gate — parse CO status"
-  set_fact:
-    settle_co_data: "{{ settle_co_raw.stdout | default('{}') | from_json }}"
-  when: (settle_co_raw.rc | default(1) == 0) and (settle_co_raw.stdout | default('') | trim != '')
-
-- name: "Monitor settle-gate — fallback CO status"
-  set_fact:
-    settle_co_data:
-      not_available: []
-      progressing: []
-      degraded: []
-  when: (settle_co_raw.rc | default(1) != 0) or (settle_co_raw.stdout | default('') | trim == '')
-
-- name: "Monitor settle-gate — query MachineConfigPools"
-  shell: >-
-    oc get mcp -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-      {
-        "not_updated": [.items[]? | select(([.status.conditions[]? | select(.type=="Updated") | .status][0] // "Unknown") != "True") | .metadata.name],
-        "degraded": [.items[]? | select(([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "False") == "True") | .metadata.name]
-      }
-    '
-  register: settle_mcp_raw
-  changed_when: false
-  failed_when: false
-
-- name: "Monitor settle-gate — parse MCP status"
-  set_fact:
-    settle_mcp_data: "{{ settle_mcp_raw.stdout | default('{}') | from_json }}"
-  when: (settle_mcp_raw.rc | default(1) == 0) and (settle_mcp_raw.stdout | default('') | trim != '')
-
-- name: "Monitor settle-gate — fallback MCP status"
-  set_fact:
-    settle_mcp_data:
-      not_updated: []
-      degraded: []
-  when: (settle_mcp_raw.rc | default(1) != 0) or (settle_mcp_raw.stdout | default('') | trim == '')
-
-- name: "Monitor settle-gate — display final cluster state"
+# ----------------------------------------------------------------------------
+# 4. Settle-Gate Confirmation & Fact Export
+# Why: Confirms cluster settled cleanly, displays success banner, logs to audit
+#      trails, and exports hop_elapsed_duration for hop.yml notifications.
+# ----------------------------------------------------------------------------
+- name: "Monitor: Display Settle-Gate Success Banner"
   debug:
     msg:
-      - "Settle-Gate Check for Hop {{ hop_label | default('?/?') }} → {{ hop_target_version | default('') }}"
-      - "CV Version:        {{ settle_cv_version }} (target: {{ hop_target_version }})"
-      - "CV Progressing:    {{ settle_cv_progressing }}"
-      - "CO Not Available:  {{ settle_co_data.not_available | default([]) | join(', ') if settle_co_data.not_available | default([]) | length > 0 else 'none' }}"
-      - "CO Progressing:    {{ settle_co_data.progressing | default([]) | join(', ') if settle_co_data.progressing | default([]) | length > 0 else 'none' }}"
-      - "CO Degraded:       {{ settle_co_data.degraded | default([]) | join(', ') if settle_co_data.degraded | default([]) | length > 0 else 'none' }}"
-      - "MCP Not Updated:   {{ settle_mcp_data.not_updated | default([]) | join(', ') if settle_mcp_data.not_updated | default([]) | length > 0 else 'none' }}"
-      - "MCP Degraded:      {{ settle_mcp_data.degraded | default([]) | join(', ') if settle_mcp_data.degraded | default([]) | length > 0 else 'none' }}"
+      - "============================================================================"
+      - "SETTLE-GATE PASSED: HOP {{ resolved_hop_label }} SETTLED CLEANLY"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name }}"
+      - "Target Version       : {{ resolved_target_version }}"
+      - "Achieved Version     : {{ poll_cv_version | default(resolved_target_version) }}"
+      - "Elapsed Duration     : {{ elapsed_formatted | default('00:00:00') }}"
+      - "Total Polls Run      : {{ monitor_iterations_completed | default(1) }} of {{ monitor_max_iterations }}"
+      - "ClusterVersion State : Completed (Available=True, Progressing=False)"
+      - "ClusterOperators     : 100% Settled (Zero Degraded, Zero Progressing)"
+      - "MachineConfigPools   : 100% Updated (Zero Updating, Zero Degraded)"
+      - "============================================================================"
 
-# --- Assert CV at target version ---
-- name: "Monitor settle-gate — assert CV at target version"
-  fail:
-    msg: >-
-      SETTLE-GATE FAILURE for Hop {{ hop_label | default('?/?') }} → {{ hop_target_version }}
-      on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      ClusterVersion desired version is '{{ settle_cv_version }}' but target is
-      '{{ hop_target_version }}'. The cluster has not reached the target version.
-  when: settle_cv_version != hop_target_version
+- name: "Monitor: Export settle metrics and duration facts for tasks/hop.yml"
+  set_fact:
+    hop_settled: true
+    hop_elapsed_duration: "{{ elapsed_formatted | default('00:00:00') }}"
+    settle_gate_passed: true
 
-# --- Assert COs healthy ---
-- name: "Monitor settle-gate — assert ClusterOperators healthy"
-  fail:
-    msg: >-
-      SETTLE-GATE FAILURE for Hop {{ hop_label | default('?/?') }} → {{ hop_target_version }}
-      on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      ClusterOperators not settled:
-      Not Available: {{ settle_co_data.not_available | default([]) | join(', ') if settle_co_data.not_available | default([]) | length > 0 else 'none' }};
-      Still Progressing: {{ settle_co_data.progressing | default([]) | join(', ') if settle_co_data.progressing | default([]) | length > 0 else 'none' }};
-      Degraded: {{ settle_co_data.degraded | default([]) | join(', ') if settle_co_data.degraded | default([]) | length > 0 else 'none' }}.
-  when: >-
-    (settle_co_data.not_available | default([]) | length > 0) or
-    (settle_co_data.progressing | default([]) | length > 0) or
-    (settle_co_data.degraded | default([]) | length > 0)
+- name: "Monitor: Log settle-gate pass to human-readable text run log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+    line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [PASS] [HARD] Phase 04: Live monitoring completed. Settle-gate verified for Hop {{ resolved_hop_label }} (Target: {{ resolved_target_version }}) in {{ elapsed_formatted | default('00:00:00') }}."
+    create: true
+  when: not (dry_run | default(false) | bool)
 
-# --- Assert MCPs Updated ---
-- name: "Monitor settle-gate — assert MachineConfigPools updated"
-  fail:
-    msg: >-
-      SETTLE-GATE FAILURE for Hop {{ hop_label | default('?/?') }} → {{ hop_target_version }}
-      on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      MachineConfigPools not settled:
-      Not Updated: {{ settle_mcp_data.not_updated | default([]) | join(', ') if settle_mcp_data.not_updated | default([]) | length > 0 else 'none' }};
-      Degraded: {{ settle_mcp_data.degraded | default([]) | join(', ') if settle_mcp_data.degraded | default([]) | length > 0 else 'none' }}.
-  when: >-
-    (settle_mcp_data.not_updated | default([]) | length > 0) or
-    (settle_mcp_data.degraded | default([]) | length > 0)
-
-# --- Settle-gate passed: send hop-complete email ---
-- name: "Monitor settle-gate — PASSED — hop {{ hop_label | default('?/?') }} complete"
-  debug:
-    msg: >-
-      ✔ Settle-gate PASSED for hop {{ hop_label | default('?/?') }} → {{ hop_target_version }}
-      on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      CV at target, all COs available, all MCPs updated.
-      Elapsed: {{ ((ansible_date_time.epoch | int) - (monitor_start_epoch | int)) / 60 | round(0) | int }}m.
-
-- name: "Monitor settle-gate — send hop-complete email"
-  include_role:
-    name: sendmail
-  vars:
-    mail_subject: >-
-      {% if (hop_number | default('1') | int) == 1 %}
-      {{ heartbeat_subject_prefix | default('[ARO Upgrade]') }} — Upgrade phase 1 completed ✔ — {{ cluster_name | default('UNKNOWN') }}
-      {% else %}
-      {{ heartbeat_subject_prefix | default('[ARO Upgrade]') }} — Hop {{ hop_label | default('?/?') }} COMPLETE ✔ — {{ hop_target_version | default('') }} — {{ cluster_name | default('UNKNOWN') }}
-      {% endif %}
-    mail_template: "progress-mail.j2"
-    current_hop: "{{ hop_number | default('1') }}"
-    total_hops: "{{ hop_total | default('1') }}"
-    target_version: "{{ hop_target_version | default('') }}"
-    percent_complete: "100%"
-    elapsed_time: "{{ ((ansible_date_time.epoch | int) - (monitor_start_epoch | int)) / 60 | round(0) | int }}m"
-    mcp_list: "{{ monitor_mcp_display_list | default([]) }}"
-    mcp_access_error: "{{ monitor_mcp_access_error | default('') }}"
-    current_working_node: {}
-    degraded_nodes: []
-    degraded_operators: []
-    cluster_version_status: "At {{ hop_target_version | default('target version') }} ✔"
-    status_pill_text: >-
-      {{ 'PHASE 1 COMPLETE ✔' if (hop_number | default('1') | int) == 1 else 'HOP COMPLETE ✔' }}
-    status_pill_color: "#1a7f37"
-    status_pill_bg: "#e6f4ea"
-    status_pill_border: "#b7eb8f"
-    next_update_note: >-
-      {% if (hop_number | default('1') | int) == 1 %}
-      Upgrade phase 1 completed. Upgraded from {{ hop_settle_cv_version | default('previous version') }} to {{ hop_target_version }}. {{ 'Next hop will begin shortly.' if (hop_number | default('1') | int) < (hop_total | default('1') | int) else 'All hops complete. Proceeding to postvalidation.' }}
-      {% else %}
-      Hop {{ hop_label | default('?/?') }} complete. {{ 'Next hop will begin shortly.' if (hop_number | default('1') | int) < (hop_total | default('1') | int) else 'All hops complete. Proceeding to postvalidation.' }}
-      {% endif %}
-    run_id: "{{ ansible_date_time.iso8601 | default('N/A') }}"
-    timestamp: "{{ ansible_date_time.iso8601 | default('N/A') }}"
-    log_path: "{{ log_dir | default('logs/') }}"
-
+- name: "Monitor: Log settle-gate pass to CSV audit log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+    line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name }}","Phase 04 Live Monitoring","HARD","PASS","Hop {{ resolved_hop_label }} settled","Duration: {{ elapsed_formatted | default(''00:00:00'') }}"'
+    create: true
+  when: not (dry_run | default(false) | bool)

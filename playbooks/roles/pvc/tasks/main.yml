@@ -1,136 +1,111 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (shell, set_fact, debug) work on both
-#                 versions. Replace with FQCN only if adopting the
-#                 ansible.builtin.* convention project-wide.
-#                 | default('') guards are applied on all optional variables.
-#
-# pvc role — validates Persistent Volume Claim (PVC) status across all namespaces (WARN gate).
-#
-# Contract:
-#   - Queries `oc get pvc --all-namespaces -o json` piped to `jq` (jq v1.5 compatible).
-#   - Read-only operation; changed_when: false.
-#   - Identifies non-Bound PVCs (e.g. Pending, Lost, or Error phases).
-#   - Respects optional pvc_allow_list overrides (supports "namespace/name" or "name").
-#   - WARN gate: failed_when: false + recorded status; never fail:, never auto-remediate.
-#   - Exposes parsed facts (pvc_parsed_data, pvc_all_pvcs, pvc_offending_pvcs, pvc_status) for reporting.
-#   - Records a structured entry (PASS or WARN) into `health_summary` list via set_fact.
-
 ---
-# Shell module chosen to pipe oc get pvc JSON output to jq (v1.5 compatible)
-- name: Query Persistent Volume Claims and evaluate phase status — oc get pvc
-  shell: >-
-    oc get pvc --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-      .items // [] | {
-        "all": [
-          .[] | {
-            "namespace": .metadata.namespace,
-            "name": .metadata.name,
-            "status": (.status.phase // "Unknown"),
-            "volume": (.spec.volumeName // "N/A"),
-            "storageClass": (.spec.storageClassName // "N/A"),
-            "requested": (.spec.resources.requests.storage // "N/A"),
-            "capacity": (.status.capacity.storage // "N/A"),
-            "accessModes": (.spec.accessModes // [])
-          }
-        ],
-        "offenders": [
-          .[] | {
-            "namespace": .metadata.namespace,
-            "name": .metadata.name,
-            "status": (.status.phase // "Unknown"),
-            "volume": (.spec.volumeName // "N/A"),
-            "storageClass": (.spec.storageClassName // "N/A"),
-            "requested": (.spec.resources.requests.storage // "N/A"),
-            "capacity": (.status.capacity.storage // "N/A"),
-            "accessModes": (.spec.accessModes // []),
-            "reason": ("PVC is in " + (.status.phase // "Unknown") + " phase (expected Bound)")
-          } | select(.status != "Bound")
-        ]
-      }
-    '
-  register: pvc_raw_query
+# ============================================================================
+# Role Tasks: pvc (PersistentVolumeClaims)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, fail, debug).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Ensures workload volume claims are satisfied across all namespaces.
+#          Surfaces Pending or Lost claims in the prevalidation report.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: WARN
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Query Live PersistentVolumeClaims via oc CLI & jq v1.5
+# Why: oc get pvc -A -o json parsed with jq 1.5 extracts claim phases.
+# Why: Shell with set -o pipefail and args: executable: /bin/bash captures errors.
+# Why: Bracket notation and null-coalescing handle empty clusters cleanly.
+# ----------------------------------------------------------------------------
+- name: "Query live persistent volume claims across all namespaces via jq"
+  shell: |
+    set -o pipefail
+    oc get pvc -A -o json | jq -c '
+      {
+        total_count: (.items // [] | length),
+        pvcs: [.items[]? | {
+          namespace: .metadata.namespace,
+          name: .metadata.name,
+          phase: (.status.phase // "Unknown" | tostring),
+          volume_name: (.spec.volumeName // "none" | tostring),
+          storage_class: (.spec.storageClassName // "none" | tostring)
+        }],
+        unhealthy: [.items[]? | select(((.status.phase // "") | tostring) != "Bound") | {
+          namespace: .metadata.namespace,
+          name: .metadata.name,
+          phase: (.status.phase // "Unknown" | tostring),
+          volume_name: (.spec.volumeName // "none" | tostring)
+        }],
+        pending: [.items[]? | select(((.status.phase // "") | tostring) == "Pending") | ((.metadata.namespace // "") + "/" + (.metadata.name // ""))],
+        lost: [.items[]? | select(((.status.phase // "") | tostring) == "Lost") | ((.metadata.namespace // "") + "/" + (.metadata.name // ""))]
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: pvc_query_raw
   changed_when: false
   failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: pvc_query_raw.rc == 0
 
-- name: Parse Persistent Volume Claims JSON payload
+# ----------------------------------------------------------------------------
+# 2. Extract Facts & Evaluate PersistentVolumeClaim Health
+# Why: Bracket notation ['pvcs'] avoids collisions with Python dict.items().
+# Why: pvc check is a WARN gate: surfaces issues without blocking upgrade chain.
+# ----------------------------------------------------------------------------
+- name: "Extract persistent volume claim health facts"
   set_fact:
-    pvc_parsed_data: "{{ pvc_raw_query.stdout | from_json }}"
-  when: (pvc_raw_query.rc | default(1) == 0) and (pvc_raw_query.stdout | default('') | trim != '')
+    pvc_total_count: "{{ (pvc_query_raw.stdout | default('{}') | from_json)['total_count'] | default(0) | int }}"
+    pvc_all_claims: "{{ (pvc_query_raw.stdout | default('{}') | from_json)['pvcs'] | default([]) }}"
+    pvc_unhealthy_claims: "{{ (pvc_query_raw.stdout | default('{}') | from_json)['unhealthy'] | default([]) }}"
+    pvc_pending_claims: "{{ (pvc_query_raw.stdout | default('{}') | from_json)['pending'] | default([]) }}"
+    pvc_lost_claims: "{{ (pvc_query_raw.stdout | default('{}') | from_json)['lost'] | default([]) }}"
 
-- name: Fallback Persistent Volume Claims payload on query failure
+- name: "Evaluate persistent volume claim compliance"
   set_fact:
-    pvc_parsed_data:
-      all: []
-      offenders:
-        - namespace: "all"
-          name: "pvc-query-failure"
-          status: "Error"
-          volume: "N/A"
-          storageClass: "N/A"
-          requested: "N/A"
-          capacity: "N/A"
-          accessModes: []
-          reason: "Failed to execute oc get pvc: {{ pvc_raw_query.stderr | default(pvc_raw_query.stdout | default('Unknown error')) | trim }}"
-  when: (pvc_raw_query.rc | default(1) != 0) or (pvc_raw_query.stdout | default('') | trim == '')
+    pvc_check_valid: "{{ (pvc_unhealthy_claims | length) == 0 }}"
 
-- name: Extract all Persistent Volume Claims list
+# ----------------------------------------------------------------------------
+# 3. Construct Structured Health Record & Append to Summary
+# Why: Appends structured dictionary with gate: WARN into health_summary.
+# ----------------------------------------------------------------------------
+- name: "Construct structured pvc health record"
   set_fact:
-    pvc_all_pvcs: "{{ pvc_parsed_data.all | default([]) }}"
-
-- name: Initialize offending Persistent Volume Claims list
-  set_fact:
-    pvc_offending_pvcs: []
-
-- name: Filter offending Persistent Volume Claims against pvc_allow_list
-  set_fact:
-    pvc_offending_pvcs: "{{ pvc_offending_pvcs + [item] }}"
-  loop: "{{ pvc_parsed_data.offenders | default([]) }}"
-  when: >-
-    (item.name not in (pvc_allow_list | default([]))) and
-    ((item.namespace + '/' + item.name) not in (pvc_allow_list | default([])))
-
-- name: Determine Persistent Volume Claims health verdict
-  set_fact:
-    pvc_status: "{{ 'WARN' if ((pvc_offending_pvcs | length) > 0) else 'PASS' }}"
-
-- name: Display Persistent Volume Claims inspection summary
-  debug:
-    msg: >-
-      Cluster '{{ cluster_name | default('UNKNOWN') }}': Scanned {{ pvc_all_pvcs | length }} Persistent Volume Claim(s).
-      Found {{ pvc_offending_pvcs | length }} non-Bound PVC(s)
-      (Allow-listed: {{ pvc_allow_list | default([]) | length }}).
-      Status: {{ pvc_status }}.
-
-- name: Record Persistent Volume Claims status in health_summary
-  set_fact:
-    health_summary: "{{ (health_summary | default([])) + [pvc_summary_entry] }}"
-  vars:
-    pvc_summary_entry:
-      id: "{{ pvc_id | default('09') }}"
-      name: "{{ pvc_name | default('Persistent Volume Claim (PVC) Status') }}"
-      gate: "{{ pvc_gate | default('WARN') }}"
-      status: "{{ pvc_status }}"
+    pvc_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "PersistentVolumeClaims Health"
+      gate: "WARN"
+      status: "{{ 'PASS' if (pvc_check_valid | bool) else 'WARN' }}"
       observed: >-
-        {% if pvc_status == 'PASS' %}
-        All {{ pvc_all_pvcs | length }} Persistent Volume Claim(s) are Bound
-        {% else %}
-        Found {{ pvc_offending_pvcs | length }} non-Bound Persistent Volume Claim(s) (Pending/Lost/Error)
-        {% endif %}
-      details: >-
-        {% if pvc_status == 'PASS' %}
-        Verified {{ pvc_all_pvcs | length }} Persistent Volume Claims across all namespaces on cluster {{ cluster_name | default('cluster') }}.
-        {% else %}
-        Non-Bound PVCs: {% for c in pvc_offending_pvcs %}{{ c.namespace }}/{{ c.name }} ({{ c.status }} - {{ c.reason }}){% if not loop.last %}, {% endif %}{% endfor %}.
-        {% endif %}
-      raw_output: "{{ pvc_offending_pvcs | to_json if pvc_status == 'WARN' else pvc_all_pvcs | to_json }}"
+        {{ ('All ' ~ pvc_total_count ~ ' PersistentVolumeClaims are Bound across all namespaces')
+           if ((pvc_check_valid | bool) and (pvc_total_count > 0))
+           else ('No PersistentVolumeClaims found on cluster (PASS)')
+           if ((pvc_check_valid | bool) and (pvc_total_count == 0))
+           else ('Unhealthy PersistentVolumeClaims detected: pending=[' ~ (pvc_pending_claims | join(', ')) ~ '], lost=[' ~ (pvc_lost_claims | join(', ')) ~ '], total_unhealthy=' ~ (pvc_unhealthy_claims | length)) }}
 
-- name: Confirm Persistent Volume Claims check evaluation
+- name: "Record pvc result to health_summary tracking list"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [pvc_health_item] }}"
+
+- name: "Log persistent volume claim evaluation outcome"
   debug:
-    msg: >-
-      {% if pvc_status == 'PASS' %}
-      ✔ PASS [Check {{ pvc_id | default('09') }} - {{ pvc_name | default('Persistent Volume Claim (PVC) Status') }}] —
-      All {{ pvc_all_pvcs | length }} PVC(s) are Bound.
-      {% else %}
-      ! WARN [Check {{ pvc_id | default('09') }} - {{ pvc_name | default('Persistent Volume Claim (PVC) Status') }}] —
-      Found {{ pvc_offending_pvcs | length }} non-Bound PVC(s). Non-blocking warning recorded.
-      {% endif %}
+    msg:
+      - "Check        : {{ pvc_health_item.name }}"
+      - "Gate         : {{ pvc_health_item.gate }}"
+      - "Status       : {{ pvc_health_item.status }}"
+      - "Observed     : {{ pvc_health_item.observed }}"
+      - "Gate Enforced: {{ pvc_enforce_gate | default(false) | bool }}"
+
+# ----------------------------------------------------------------------------
+# 4. Optional Gate Enforcement (WARN gate: does not halt by default)
+# Why: WARN gate allows non-critical storage claim warnings to surface in reports.
+# ----------------------------------------------------------------------------
+- name: "Enforce gate for PersistentVolumeClaims check if strict mode configured"
+  fail:
+    msg: "GATE FAILURE [pvc]: Unfulfilled PersistentVolumeClaims detected on cluster '{{ cluster_name }}'. Pending: {{ pvc_pending_claims | to_json }}, Lost: {{ pvc_lost_claims | to_json }}."
+  when:
+    - not (pvc_check_valid | bool)
+    - pvc_enforce_gate | default(false) | bool

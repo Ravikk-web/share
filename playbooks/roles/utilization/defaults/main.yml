@@ -1,21 +1,33 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names work on both versions.
-#                 | default('') guards are applied on all optional variables.
-#
-# Defaults for utilization role (Node & Cluster Resource Utilization check)
-
 ---
-# Kubeconfig path (derived from playbook_dir by default)
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+# ============================================================================
+# Role Defaults: utilization (Node Capacity Headroom)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar, percentage, and boolean values.
+#
+# Purpose: Defines default input parameters for the utilization role, which
+#          evaluates cluster-wide CPU and memory request allocations against
+#          total allocatable node capacity to guarantee safe workload eviction
+#          headroom during node reboots.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: HARD
+# ============================================================================
 
-# Cluster name for reporting and error messages
-cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+# Target cluster identifier (string, required)
+cluster_name: ""
 
-# Prevalidation check metadata
-utilization_id: "07"
-utilization_name: "Resource Utilization (Requests-based)"
-utilization_gate: "HARD"
-
-# Requests-based capacity thresholds (percentages, sourced from vars/upgrade.yml or defaults)
+# Maximum allowable cluster CPU request utilization percentage before failing
+# Sourced from vars/upgrade.yml (default: 90)
 max_cpu_percent: 90
+
+# Maximum allowable cluster memory request utilization percentage before failing
+# Sourced from vars/upgrade.yml (default: 90)
 max_memory_percent: 90
+
+# Master toggle for enforcing HARD gate failure on validation error
+# Set to false by prevalidation aggregator during diagnostic sweeps before remediation
+utilization_enforce_gate: true
+
+# Transient retry parameters for oc CLI execution
+oc_command_retries: 3
+oc_command_retry_delay: 10

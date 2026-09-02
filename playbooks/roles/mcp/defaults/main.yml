@@ -1,21 +1,24 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names work on both versions.
-#                 | default('') guards are applied on all optional variables.
-#
-# Defaults for mcp role (MachineConfigPool health check)
-
 ---
-# Kubeconfig path (derived from playbook_dir by default)
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+# ============================================================================
+# Role Defaults: mcp (MachineConfigPools)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar values.
+#
+# Purpose: Defines default input parameters for the mcp role, which validates
+#          that all MachineConfigPools are synchronized (Updated=True), healthy
+#          (Degraded=False), and unpaused (spec.paused=false).
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: HARD
+# ============================================================================
 
-# Cluster name for reporting and error messages
-cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+# Target cluster identifier (string, required)
+cluster_name: ""
 
-# Prevalidation check metadata
-mcp_id: "04"
-mcp_name: "Machine Config Pool (MCP) Health"
-mcp_gate: "HARD"
+# Master toggle for enforcing HARD gate failure on validation error
+# Set to false by prevalidation aggregator during diagnostic sweeps before remediation
+mcp_enforce_gate: true
 
-# Allow-list override for machine config pools (names of pools allowed to be non-Updated, Degraded, or paused)
-# Default is empty list (all pools must be Updated=True, Degraded=False, and paused=false)
-mcp_allow_list: []
+# Transient retry parameters for oc CLI execution
+oc_command_retries: 3
+oc_command_retry_delay: 10

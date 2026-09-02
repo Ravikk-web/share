@@ -1,86 +1,94 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Replace short module names with FQCN if adopting the
-#                 ansible.builtin.* convention. Short names work on both versions.
-#                 import_playbook has no FQCN equivalent — it stays as-is.
-#
-# Master orchestrator — chains all phases in fixed order.
-# Invoked by 00_Run.sh with extra-vars: cluster_name, upgrade_path, [dry_run].
-#
-# Phase ordering (fixed, do not reorder without explicit instruction):
-#   01_Policy_Check.yaml           → login + baseline snapshot + edge validation
-#   02_Pre_upgrade_check.yaml      → 13-check prevalidation hard gate
-#   03_Initiate_upgrade.yaml       → per-hop upgrade loop (include_tasks + loop)
-#   04_Live_monitoring_upgrade.yaml → polling + settle-gate + heartbeat
-#   05_post_Upgrade_Checks.yaml    → 10-check postvalidation + baseline diff
-#
-# NOTE: Phase imports are added by later units as each phase playbook is built.
-#       This skeleton validates the structure and prints a start banner only.
-
 ---
-- name: ARO Cluster Upgrade — Start
+# ============================================================================
+# main.yml — Master Orchestrator for ARO Cluster Upgrade Automation
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses import_playbook for isolated phase execution;
+#                 compatible without modification across Ansible 2.7 and 2.14.
+#
+# Process Surface:
+#   Phase 01: 01_Policy_Check.yaml
+#   Phase 02: 02_Pre_upgrade_check.yaml
+#   Phase 03: 03_Initiate_upgrade.yaml (includes hop.yml and 04 monitoring)
+#   Phase 05: 05_post_Upgrade_Checks.yaml
+#   Phase 06: 06_Operator_Upgrade.yaml
+# ============================================================================
+
+- name: "ARO Upgrade Automation — Initialization & Variable Loading"
   hosts: localhost
   connection: local
   gather_facts: true
-
   vars_files:
     - vars/upgrade.yml
-    - vars/paths.yml
     - vars/secrets.yml
+    - vars/paths.yml
     - vars/smtp.yml
     - vars/report_vars.yml
     - vars/api_regex.yml
-
   tasks:
-    - name: Print start banner
-      debug:
-        msg: >-
-          ═══════════════════════════════════════════════════════════
-          ARO Cluster Upgrade Automation — Starting
-          Cluster: {{ cluster_name | default('UNSET') }}
-          Upgrade path: {{ upgrade_path | default([]) }}
-          Dry run: {{ dry_run | default(false) }}
-          Ansible: {{ ansible_version.full | default('unknown') }}
-          Timestamp: {{ ansible_date_time.iso8601 | default('unknown') }}
-          ═══════════════════════════════════════════════════════════
+    - name: "Validate mandatory execution variables"
+      assert:
+        that:
+          - cluster_name is defined
+          - cluster_name | length > 0
+          - upgrade_path is defined
+          - upgrade_path | length > 0
+        fail_msg: "Mandatory parameters 'cluster_name' and 'upgrade_path' must be defined and non-empty."
+        success_msg: "Input validation passed for target cluster: {{ cluster_name }}"
 
-    - name: Validate cluster_name is provided
-      fail:
-        msg: "cluster_name must be defined in vars/upgrade.yml or provided via --extra-vars. Aborting."
-      when: cluster_name | default('') == ''
-
-    - name: Resolve cluster-specific upgrade path if configured
-      set_fact:
-        upgrade_path: "{{ cluster_upgrade_paths[cluster_name] }}"
-      when:
-        - cluster_upgrade_paths is defined
-        - cluster_name in (cluster_upgrade_paths | default({}))
-        - (cluster_upgrade_paths[cluster_name] | default([])) | length > 0
-
-    - name: Validate upgrade_path is a non-empty list
-      fail:
-        msg: >-
-          upgrade_path must be a non-empty list of target versions
-          (e.g. ["4.14.40","4.15.35"]). Please define it in vars/upgrade.yml
-          or provide via --path. Aborting.
-      when: upgrade_path | default([]) | length == 0
-
-    - name: Display validated run parameters
+    - name: "Display workflow initialization banner"
       debug:
         msg:
-          - "Cluster:       {{ cluster_name }}"
-          - "Upgrade path:  {{ upgrade_path | join(' → ') }}"
-          - "Total hops:    {{ upgrade_path | length }}"
-          - "Dry run:       {{ dry_run | default(false) }}"
-          - "Log dir:       {{ log_dir | default('') }}"
-          - "Output dir:    {{ output_dir | default('') }}"
-          - "Snapshot dir:  {{ snapshot_dir | default('') }}"
+          - "========================================================"
+          - "  ARO Cluster Upgrade Automation — One-Touch Engine"
+          - "========================================================"
+          - "Target Cluster : {{ cluster_name }}"
+          - "Upgrade Path   : {{ upgrade_path | join(' -> ') }}"
+          - "Dry Run Mode   : {{ dry_run | default(false) }}"
+          - "Auto-Remediate : {{ auto_remediation_enabled | default(true) }}"
+          - "Skip To Phase  : {{ skip_to_phase | default('None (Full Run)') }}"
+          - "========================================================"
 
-# --- Master Phase Execution Chain (Fixed Order: 01 → 02 → 03/04 looped → 05) ---
+# --- Phase 01: Policy Check, Baseline Snapshot & Edge Validation ---
 - import_playbook: 01_Policy_Check.yaml
+  when: skip_to_phase is not defined or (skip_to_phase | int) <= 1
+
+# --- Phase 02: 14-Check Prevalidation & Auto-Remediation ---
 - import_playbook: 02_Pre_upgrade_check.yaml
+  when: skip_to_phase is not defined or (skip_to_phase | int) <= 2
+
+# --- Dry-Run Intercept: Clean Stop after Prevalidation ---
+- name: "Dry-Run Intercept & Early Teardown"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: "Halt workflow cleanly when dry-run is requested"
+      block:
+        - name: "Log dry-run completion"
+          debug:
+            msg: "✔ Dry-run validation complete. Prevalidation report generated. Stopping before Phase 03."
+        - name: "Teardown cluster session"
+          include_role:
+            name: logout
+        - name: "Terminate execution cleanly"
+          meta: end_play
+      when: dry_run | default(false) | bool
+
+# --- Phase 03 & 04: Sequential Upgrade Hops & Live Monitoring ---
 - import_playbook: 03_Initiate_upgrade.yaml
-# (Phase 03 loops tasks/hop.yml internally, which calls 04_Live_monitoring_upgrade.yaml per hop)
+  when:
+    - not (dry_run | default(false) | bool)
+    - skip_to_phase is not defined or (skip_to_phase | int) <= 3
+
+# --- Phase 05: 10-Check Postvalidation & Baseline Diff ---
 - import_playbook: 05_post_Upgrade_Checks.yaml
-- import_playbook: 08_operator_upgrade.yml
+  when:
+    - not (dry_run | default(false) | bool)
+    - skip_to_phase is not defined or (skip_to_phase | int) <= 5
 
-
+# --- Phase 06: Operator Compatibility, Upgrades & Closeout ---
+- import_playbook: 06_Operator_Upgrade.yaml
+  when:
+    - not (dry_run | default(false) | bool)
+    - skip_to_phase is not defined or (skip_to_phase | int) <= 6

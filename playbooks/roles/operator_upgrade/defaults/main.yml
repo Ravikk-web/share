@@ -1,0 +1,38 @@
+---
+# ============================================================================
+# Role Defaults: operator_upgrade
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Standard YAML key-value pairs; fully compatible.
+#
+# Purpose: Default configuration variables for the OLM operator upgrade role.
+#          Discovers and approves manual InstallPlans, polls ClusterServiceVersions
+#          (CSVs) for Succeeded phase, and executes one-shot recovery on failure.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/paths.yml
+# Gate type: HARD (Blocks Phase 06 if CSVs fail to settle)
+# ============================================================================
+
+# Maximum wait timeout for all operator CSVs to reach Succeeded (seconds)
+# Default: 600 seconds (10 minutes)
+operator_upgrade_timeout_seconds: 600
+
+# Polling interval between CSV phase evaluations (seconds)
+# Default: 15 seconds
+operator_upgrade_poll_interval_seconds: 15
+
+# Whether to execute Tier 2 automated recovery on failed/stalled CSVs (boolean)
+# If true, deletes a failed/stalled CSV once to trigger OLM re-reconciliation
+operator_auto_recover_csv: true
+
+# Dry-run simulation switch (boolean)
+# Sourced from --dry-run or vars/upgrade.yml
+dry_run: false
+
+# Transient oc CLI retry parameters
+oc_command_retries: 3
+oc_command_retry_delay: 10
+
+# Internal state containers
+approved_installplans: []
+recovered_csvs: []
+all_csvs_succeeded: false

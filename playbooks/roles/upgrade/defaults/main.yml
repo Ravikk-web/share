@@ -1,38 +1,47 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable definitions.
-#
-# upgrade role defaults — per-hop upgrade trigger.
-#
-# This role executes the core upgrade sequence for a single hop:
-#   1. Set the update channel to stable-<major>.<minor> for the target version
-#   2. Re-verify the target version is a live available/conditional edge
-#   3. Apply required admin-ack ConfigMap if the target requires it
-#   4. Trigger the upgrade: oc adm upgrade --to=<version>
-#
-# The only cluster write is `oc adm upgrade --to`. The `--to-image ... --force`
-# path exists only as a hard-gated manual last resort, never automatic.
-#
-# Required variables (supplied by caller — hop.yml via loop_var):
-#   - hop_target_version    — the version to upgrade to in this hop
-#   - cluster_name          — target cluster identifier
-#   - kubeconfig_path       — path to the active kubeconfig
-#
-# Optional variables:
-#   - force_upgrade         — manual last-resort flag (default: false, hard-gated)
-#   - force_upgrade_image   — digest for --to-image (default: '', requires force_upgrade)
-
 ---
-# --- Target hop version (supplied by caller) ----------------------------------
-hop_target_version: ""
+# ============================================================================
+# Role Defaults: upgrade
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar strings and booleans.
+#
+# Purpose: Default configuration parameters for the cluster upgrade role.
+#          Drives minor version channel updates, live update edge validation,
+#          dynamic administrator acknowledgement application, and cluster
+#          upgrade triggering via 'oc adm upgrade --to'.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/paths.yml
+# Gate type: HARD (strictly validates version, channel, and upgrade edge)
+# ============================================================================
 
-# --- Cluster identifier (supplied by caller or vars_files) --------------------
-# cluster_name: "" — inherited from vars/upgrade.yml
+# Target OpenShift version for this upgrade hop (string, required, e.g. "4.15.35")
+# Typically passed from tasks/hop.yml during sequential upgrade loop execution
+target_version: ""
 
-# --- Kubeconfig path (inherited from vars/paths.yml) --------------------------
-# kubeconfig_path: "" — inherited from vars/paths.yml
+# Target upgrade channel name (string, optional, e.g. "stable-4.15" or "fast-4.15")
+# If omitted or empty, dynamically computed from target_version prefix:
+# "{{ target_channel_prefix }}-{{ major.minor }}"
+target_channel: ""
 
-# --- Last-resort force upgrade (NEVER automatic) -----------------------------
-# Setting force_upgrade: true requires explicit manual opt-in.
-# A fail: guard blocks execution unless the operator deliberately sets this.
-force_upgrade: false
-force_upgrade_image: ""
+# Default channel tier prefix (string, default: "stable")
+# Options: "stable", "fast", "candidate"
+target_channel_prefix: "stable"
+
+# Safety guard toggle for emergency forced upgrades (boolean, default: false)
+# In standard automation, this must remain false. Setting to true allows the
+# '--to-image' path, but fails unconditionally without explicit token confirmation.
+allow_force_upgrade: false
+
+# Container image pullspec digest for emergency upgrades (string, default: empty)
+# Only evaluated if allow_force_upgrade is explicitly true
+force_image_pullspec: ""
+
+# Explicit confirmation token required to activate emergency force upgrade
+# Must match "CONFIRM_FORCE_UPGRADE" to prevent unintended automated force upgrades
+force_upgrade_confirm_token: ""
+
+# Maximum retry attempts for oc CLI queries to withstand transient API hiccups
+# Sourced from vars/upgrade.yml or defaulted locally
+oc_command_retries: 3
+
+# Delay in seconds between oc CLI retry attempts
+oc_command_retry_delay: 10

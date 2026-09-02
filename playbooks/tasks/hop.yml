@@ -1,275 +1,485 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (set_fact, fail, debug, include_role)
-#                 work on both versions.
-#                 | default('') guards are applied on all optional variables.
-#                 No `warn:` parameter is used on any task.
-#
-# tasks/hop.yml — Per-hop upgrade sequence.
-#
-# Called from 03_Initiate_upgrade.yaml via `include_tasks: tasks/hop.yml`
-# with `loop:` over `upgrade_path` and `loop_var: hop_item`.
-#
-# Why include_tasks + loop (not import_playbook):
-#   import_playbook cannot loop on Ansible 2.7.17. Per-hop iteration must use
-#   a play with `include_tasks:` + `loop:` per the hybrid chaining architecture.
-#
-# Per-hop sequence:
-#   1. Pre-hop settle assertion (entry condition — CO, MCP, CV checks)
-#   2. Call upgrade role (set channel → edge verify → admin-ack → oc adm upgrade --to)
-#   3. Hand off to monitor (Phase 04 — live monitoring, settle-gate)
-#
-# rescue: → error_handle (alert) → logout → stop
-#
-# Dependencies:
-#   - Unit 07 (edge validation), Unit 03 (login/logout), Unit 06 (error_handle)
-#   - Unit 18 provides the monitor called inside the hop
-#   - oc, jq
-
 ---
-# ==============================================================================
-# COMPUTE HOP CONTEXT
-# ==============================================================================
-- name: Compute hop {{ hop_index | default(0) + 1 }}/{{ upgrade_path | default([]) | length }} context
-  set_fact:
-    hop_target_version: "{{ hop_item }}"
-    hop_number: "{{ hop_index | default(0) + 1 }}"
-    hop_total: "{{ upgrade_path | default([]) | length }}"
-    hop_label: "{{ hop_index | default(0) + 1 }}/{{ upgrade_path | default([]) | length }}"
-    hop_failed: false
+# ============================================================================
+# Task Workflow: hop.yml — Sequential Upgrade Hop Execution
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses standard block/rescue, set_fact, include_role, include_tasks;
+#                 compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Orchestrates the sequential lifecycle of a single minor-version upgrade hop:
+#          1. Computes hop iteration metadata (hop_number, hop_total, hop_label).
+#          2. Logs hop initiation banner to console, text run log, and CSV audit log.
+#          3. Evaluates pre-hop settle state (validates cluster is stable & unblocked).
+#          4. Invokes roles/upgrade to update channel, verify edge, and trigger upgrade.
+#          5. Hands off to live monitoring via 04_Live_monitoring_upgrade.yaml.
+#          6. Enforces settle-gate verification (cv at target, COs available/settled, MCPs updated).
+#          7. Dispatches hop-complete email notification with Prevalidation HTML report attached.
+#          Enclosed in a robust block/rescue with error extraction, alert dispatch, and fail-safe logout.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/smtp.yml,
+#               roles/upgrade, roles/sendmail, roles/error_handle, roles/logout
+# Gate type: HARD (strictly gates on pre-hop stability, upgrade trigger, and settle state)
+# ============================================================================
 
-- name: Display hop {{ hop_label | default('?/?') }} banner — target {{ hop_target_version | default('') }}
-  debug:
-    msg: >-
-      ═══════════════════════════════════════════════════════════
-      Upgrade Hop {{ hop_label }} — Target: {{ hop_target_version }}
-      Cluster: {{ cluster_name | default('UNKNOWN') }}
-      ═══════════════════════════════════════════════════════════
-
-# ==============================================================================
-# PER-HOP BLOCK: settle → upgrade → monitor
-# ==============================================================================
-- name: Hop {{ hop_label | default('?/?') }} Execution Block
+- name: "Phase 03: Execute Upgrade Hop {{ (hop_index | default(0) | int) + 1 }}/{{ upgrade_path | length }} ({{ hop_item }})"
   block:
-    # ========================================================================
-    # PRE-HOP SETTLE ASSERTION (Entry Condition)
-    # ========================================================================
-    # Before starting this hop, assert that the cluster is in a settled state:
-    #   - ClusterVersion is at the expected version (previous hop or starting)
-    #   - ClusterOperators are Available=True and not Progressing
-    #   - MachineConfigPools are Updated=True and not Degraded
-
-    - name: "Hop {{ hop_label }} — Pre-hop settle: query ClusterVersion"
-      command: oc get clusterversion version -o json --kubeconfig {{ kubeconfig_path }}
-      register: hop_settle_cv_raw
-      changed_when: false
-      failed_when: hop_settle_cv_raw.rc != 0
-
-    - name: "Hop {{ hop_label }} — Pre-hop settle: parse ClusterVersion"
+    # ------------------------------------------------------------------------
+    # 1. Hop Metadata Computation
+    # ------------------------------------------------------------------------
+    - name: "Compute hop iteration metadata"
       set_fact:
-        hop_settle_cv_version: "{{ (hop_settle_cv_raw.stdout | from_json).status.desired.version | default('unknown') }}"
-        hop_settle_cv_progressing: "{{ ((hop_settle_cv_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first) | default('False') }}"
+        hop_number: "{{ (hop_index | default(0) | int) + 1 }}"
+        hop_total: "{{ upgrade_path | length }}"
+        hop_label: "{{ (hop_index | default(0) | int) + 1 }}/{{ upgrade_path | length }}"
+        current_hop_target: "{{ hop_item }}"
+        current_step_no: "03"
+        current_task_name: "Phase 03 Upgrade Hop {{ (hop_index | default(0) | int) + 1 }}/{{ upgrade_path | length }} ({{ hop_item }})"
+        current_gate_type: "HARD"
 
-    - name: "Hop {{ hop_label }} — Pre-hop settle: query ClusterOperators"
-      shell: >-
-        oc get clusteroperators -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-          [.items[]? | {
-            "name": .metadata.name,
-            "available": ([.status.conditions[]? | select(.type=="Available") | .status][0] // "Unknown"),
-            "progressing": ([.status.conditions[]? | select(.type=="Progressing") | .status][0] // "Unknown"),
-            "degraded": ([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "Unknown")
-          }] | {
-            "total": length,
-            "not_available": [.[] | select(.available != "True")] | length,
-            "progressing": [.[] | select(.progressing == "True")] | length,
-            "degraded": [.[] | select(.degraded == "True")] | length
-          }
-        '
-      register: hop_settle_co_raw
-      changed_when: false
-      failed_when: false
-
-    - name: "Hop {{ hop_label }} — Pre-hop settle: parse CO status"
-      set_fact:
-        hop_settle_co_data: "{{ hop_settle_co_raw.stdout | default('{}') | from_json }}"
-      when: (hop_settle_co_raw.rc | default(1) == 0) and (hop_settle_co_raw.stdout | default('') | trim != '')
-
-    - name: "Hop {{ hop_label }} — Pre-hop settle: fallback CO status"
-      set_fact:
-        hop_settle_co_data:
-          total: 0
-          not_available: 0
-          progressing: 0
-          degraded: 0
-      when: (hop_settle_co_raw.rc | default(1) != 0) or (hop_settle_co_raw.stdout | default('') | trim == '')
-
-    - name: "Hop {{ hop_label }} — Pre-hop settle: query MachineConfigPools"
-      shell: >-
-        oc get mcp -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-          [.items[]? | {
-            "name": .metadata.name,
-            "updated": ([.status.conditions[]? | select(.type=="Updated") | .status][0] // "Unknown"),
-            "updating": ([.status.conditions[]? | select(.type=="Updating") | .status][0] // "Unknown"),
-            "degraded": ([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "Unknown")
-          }] | {
-            "total": length,
-            "not_updated": [.[] | select(.updated != "True")] | length,
-            "updating": [.[] | select(.updating == "True")] | length,
-            "degraded": [.[] | select(.degraded == "True")] | length
-          }
-        '
-      register: hop_settle_mcp_raw
-      changed_when: false
-      failed_when: false
-
-    - name: "Hop {{ hop_label }} — Pre-hop settle: parse MCP status"
-      set_fact:
-        hop_settle_mcp_data: "{{ hop_settle_mcp_raw.stdout | default('{}') | from_json }}"
-      when: (hop_settle_mcp_raw.rc | default(1) == 0) and (hop_settle_mcp_raw.stdout | default('') | trim != '')
-
-    - name: "Hop {{ hop_label }} — Pre-hop settle: fallback MCP status"
-      set_fact:
-        hop_settle_mcp_data:
-          total: 0
-          not_updated: 0
-          updating: 0
-          degraded: 0
-      when: (hop_settle_mcp_raw.rc | default(1) != 0) or (hop_settle_mcp_raw.stdout | default('') | trim == '')
-
-    - name: "Hop {{ hop_label }} — Pre-hop settle: display cluster state"
+    # ------------------------------------------------------------------------
+    # 2. Log Hop Initiation Banner
+    # ------------------------------------------------------------------------
+    - name: "Display Phase 03 Hop initiation banner"
       debug:
         msg:
-          - "Pre-hop Settle Check for Hop {{ hop_label }} → {{ hop_target_version }}"
-          - "CV Version:        {{ hop_settle_cv_version }}"
-          - "CV Progressing:    {{ hop_settle_cv_progressing }}"
-          - "CO Not Available:  {{ hop_settle_co_data.not_available | default(0) }}"
-          - "CO Progressing:    {{ hop_settle_co_data.progressing | default(0) }}"
-          - "CO Degraded:       {{ hop_settle_co_data.degraded | default(0) }}"
-          - "MCP Not Updated:   {{ hop_settle_mcp_data.not_updated | default(0) }}"
-          - "MCP Updating:      {{ hop_settle_mcp_data.updating | default(0) }}"
-          - "MCP Degraded:      {{ hop_settle_mcp_data.degraded | default(0) }}"
+          - "============================================================================"
+          - "PHASE 03: UPGRADE HOP {{ hop_label }} INITIATED (Target: {{ hop_item }})"
+          - "============================================================================"
+          - "Target Cluster       : {{ cluster_name }}"
+          - "Hop Sequence         : {{ hop_number }} of {{ hop_total }}"
+          - "Target Version       : {{ hop_item }}"
+          - "Timestamp            : {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}"
+          - "============================================================================"
 
-    - name: "Hop {{ hop_label }} — Enforce pre-hop settle gate"
+    - name: "Log hop start to human-readable text run log"
+      lineinfile:
+        path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+        line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [INFO] [HARD] Phase 03: Initiating Upgrade Hop {{ hop_label }} to version '{{ hop_item }}' on cluster '{{ cluster_name }}'."
+        create: true
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Check if CSV run log exists"
+      stat:
+        path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+      register: p03_csv_stat
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Initialize CSV run log header if new"
+      lineinfile:
+        path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+        line: "timestamp,cluster,task_name,gate_type,status,reason,observed"
+        create: true
+      when:
+        - not (dry_run | default(false) | bool)
+        - not (p03_csv_stat.stat.exists | default(false))
+
+    - name: "Log hop start to CSV audit log"
+      lineinfile:
+        path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+        line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name }}","Phase 03 Upgrade Hop {{ hop_label }}","HARD","START","Target: {{ hop_item }}","Hop {{ hop_number }} of {{ hop_total }}"'
+        create: true
+      when: not (dry_run | default(false) | bool)
+
+    # ------------------------------------------------------------------------
+    # 3. Pre-Hop Settle Assertion
+    # Why: Confirm cluster is in a stable, unblocked state before triggering mutation.
+    #      Verifies that no previous upgrade is actively progressing, no MCP is degraded,
+    #      and no ClusterOperator is degraded.
+    # ------------------------------------------------------------------------
+    - name: "Pre-Hop Settle: Query ClusterVersion progressing status"
+      shell: |
+        set -o pipefail
+        oc get clusterversion version -o json | jq -r '
+          {
+            progressing: ([.status.conditions[]? | select(.type=="Progressing") | .status // "False"] | first // "False"),
+            current_version: (.status.history[0]?.version // "")
+          } | tojson
+        '
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: prehop_cv_raw
+      changed_when: false
+      retries: "{{ oc_command_retries | default(3) }}"
+      delay: "{{ oc_command_retry_delay | default(10) }}"
+      until: prehop_cv_raw.rc == 0
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Pre-Hop Settle: Query MachineConfigPool conditions"
+      shell: |
+        set -o pipefail
+        oc get mcp -o json | jq -r '
+          {
+            degraded: ([.items[]? | select((.status.conditions[]? | select(.type=="Degraded") | .status // "False") == "True") | .metadata.name]),
+            updating: ([.items[]? | select((.status.conditions[]? | select(.type=="Updating") | .status // "False") == "True") | .metadata.name])
+          } | tojson
+        '
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: prehop_mcp_raw
+      changed_when: false
+      retries: "{{ oc_command_retries | default(3) }}"
+      delay: "{{ oc_command_retry_delay | default(10) }}"
+      until: prehop_mcp_raw.rc == 0
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Pre-Hop Settle: Query ClusterOperator degraded conditions"
+      shell: |
+        set -o pipefail
+        oc get clusteroperators -o json | jq -r --argjson allow '{{ co_allow_list | default([]) | to_json }}' '
+          [.items[]? | select((.status.conditions[]? | select(.type=="Degraded") | .status // "False") == "True") | .metadata.name] - $allow
+        '
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: prehop_co_raw
+      changed_when: false
+      retries: "{{ oc_command_retries | default(3) }}"
+      delay: "{{ oc_command_retry_delay | default(10) }}"
+      until: prehop_co_raw.rc == 0
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Pre-Hop Settle: Parse pre-hop stability facts"
+      set_fact:
+        prehop_cv_progressing: "{{ (prehop_cv_raw.stdout | from_json).progressing | string | trim }}"
+        prehop_cv_version: "{{ (prehop_cv_raw.stdout | from_json).current_version | string | trim }}"
+        prehop_mcp_degraded: "{{ (prehop_mcp_raw.stdout | from_json).degraded | default([]) }}"
+        prehop_mcp_updating: "{{ (prehop_mcp_raw.stdout | from_json).updating | default([]) }}"
+        prehop_co_degraded: "{{ prehop_co_raw.stdout | from_json | default([]) }}"
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Pre-Hop Settle: Mock pre-hop stability facts for dry-run mode"
+      set_fact:
+        prehop_cv_progressing: "False"
+        prehop_cv_version: "4.14.30"
+        prehop_mcp_degraded: []
+        prehop_mcp_updating: []
+        prehop_co_degraded: []
+      when: dry_run | default(false) | bool
+
+    - name: "HARD Gate: Enforce cluster is in a stable, settled state prior to triggering hop"
       fail:
         msg: >-
-          PRE-HOP SETTLE GATE FAILURE for Hop {{ hop_label }} → {{ hop_target_version }}
-          on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-          The cluster is not in a settled state — cannot proceed with this hop.
-          CV Progressing: {{ hop_settle_cv_progressing }};
-          CO not available: {{ hop_settle_co_data.not_available | default(0) }},
-          progressing: {{ hop_settle_co_data.progressing | default(0) }},
-          degraded: {{ hop_settle_co_data.degraded | default(0) }};
-          MCP not updated: {{ hop_settle_mcp_data.not_updated | default(0) }},
-          updating: {{ hop_settle_mcp_data.updating | default(0) }},
-          degraded: {{ hop_settle_mcp_data.degraded | default(0) }}.
+          [HARD GATE FAILURE] Cluster '{{ cluster_name }}' is NOT in a stable, settled state
+          prior to triggering Hop {{ hop_label }} (Target: {{ hop_item }}).
+          {% if (prehop_cv_progressing | bool) and (prehop_cv_version != hop_item) %}
+          - ClusterVersion is actively Progressing upgrade for version '{{ prehop_cv_version }}'.
+          {% endif %}
+          {% if prehop_mcp_degraded | length > 0 %}
+          - MachineConfigPools in Degraded state: {{ prehop_mcp_degraded | join(', ') }}.
+          {% endif %}
+          {% if prehop_mcp_updating | length > 0 %}
+          - MachineConfigPools actively Updating: {{ prehop_mcp_updating | join(', ') }}.
+          {% endif %}
+          {% if prehop_co_degraded | length > 0 %}
+          - ClusterOperators in Degraded state: {{ prehop_co_degraded | join(', ') }}.
+          {% endif %}
+          Cannot initiate upgrade mutation while cluster components are unstable.
       when: >-
-        (hop_settle_cv_progressing | default('False') == 'True') or
-        (hop_settle_co_data.not_available | default(0) | int > 0) or
-        (hop_settle_co_data.progressing | default(0) | int > 0) or
-        (hop_settle_co_data.degraded | default(0) | int > 0) or
-        (hop_settle_mcp_data.not_updated | default(0) | int > 0) or
-        (hop_settle_mcp_data.updating | default(0) | int > 0) or
-        (hop_settle_mcp_data.degraded | default(0) | int > 0)
+        ((prehop_cv_progressing | bool) and (prehop_cv_version != hop_item)) or
+        ((prehop_mcp_degraded | length) > 0) or
+        ((prehop_mcp_updating | length) > 0) or
+        ((prehop_co_degraded | length) > 0)
 
-    - name: "Hop {{ hop_label }} — Pre-hop settle gate passed"
-      debug:
-        msg: "✔ Pre-hop settle assertion passed — cluster is settled and ready for hop {{ hop_label }}."
+    # ------------------------------------------------------------------------
+    # 4. Invoke roles/upgrade
+    # Why: Pre-computes target_version fact to avoid Jinja2 variable recursion,
+    #      then includes the upgrade role to drive the version mutation.
+    # ------------------------------------------------------------------------
+    - name: "Set target version fact for upgrade role"
+      set_fact:
+        target_version: "{{ hop_item }}"
 
-    # ========================================================================
-    # EXECUTE UPGRADE ROLE
-    # ========================================================================
-    - name: "Hop {{ hop_label }} — Execute upgrade role (channel → edge → admin-ack → trigger)"
+    - name: "Invoke upgrade role to initiate version transition to {{ hop_item }}"
       include_role:
         name: upgrade
 
-    - name: "Hop {{ hop_label }} — Upgrade trigger confirmed"
-      debug:
+    # ------------------------------------------------------------------------
+    # 5. Hand off to Live Monitoring
+    # Why: Hands off to Phase 04 tasks to track ClusterVersion rollout, MCP node
+    #      updates, polling cadences, and periodic heartbeat notifications.
+    # ------------------------------------------------------------------------
+    - name: "Hand off Hop {{ hop_label }} to live monitoring (Phase 04)"
+      include_tasks: "{{ playbook_dir }}/04_Live_monitoring_upgrade.yaml"
+
+    # ------------------------------------------------------------------------
+    # 6. Settle-Gate Verification
+    # Why: Strictly asserts that the cluster has fully settled at target_version:
+    #      - ClusterVersion current version matches target version.
+    #      - ClusterVersion is Available=True and Progressing=False.
+    #      - All ClusterOperators are Available=True, Progressing=False, Degraded=False.
+    #      - All MachineConfigPools are Updated=True, Updating=False, Degraded=False.
+    # ------------------------------------------------------------------------
+    - name: "Settle-Gate: Query ClusterVersion condition states"
+      shell: |
+        set -o pipefail
+        oc get clusterversion version -o json | jq -r '
+          {
+            current_version: (.status.history[0]?.version // ""),
+            available: ([.status.conditions[]? | select(.type=="Available") | .status // "False"] | first // "False"),
+            progressing: ([.status.conditions[]? | select(.type=="Progressing") | .status // "False"] | first // "False"),
+            degraded: ([.status.conditions[]? | select((.type=="Failing") or (.type=="Degraded")) | .status // "False"] | first // "False")
+          } | tojson
+        '
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: settle_cv_raw
+      changed_when: false
+      retries: "{{ oc_command_retries | default(3) }}"
+      delay: "{{ oc_command_retry_delay | default(10) }}"
+      until: settle_cv_raw.rc == 0
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Settle-Gate: Query ClusterOperators settle states"
+      shell: |
+        set -o pipefail
+        oc get clusteroperators -o json | jq -r --argjson allow '{{ co_allow_list | default([]) | to_json }}' '
+          {
+            degraded: ([.items[]? | select((.status.conditions[]? | select(.type=="Degraded") | .status // "False") == "True") | .metadata.name] - $allow),
+            progressing: ([.items[]? | select((.status.conditions[]? | select(.type=="Progressing") | .status // "False") == "True") | .metadata.name] - $allow),
+            unavailable: ([.items[]? | select((.status.conditions[]? | select(.type=="Available") | .status // "False") != "True") | .metadata.name] - $allow)
+          } | tojson
+        '
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: settle_co_raw
+      changed_when: false
+      retries: "{{ oc_command_retries | default(3) }}"
+      delay: "{{ oc_command_retry_delay | default(10) }}"
+      until: settle_co_raw.rc == 0
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Settle-Gate: Query MachineConfigPools settle states"
+      shell: |
+        set -o pipefail
+        oc get mcp -o json | jq -r '
+          {
+            degraded: ([.items[]? | select((.status.conditions[]? | select(.type=="Degraded") | .status // "False") == "True") | .metadata.name]),
+            updating: ([.items[]? | select((.status.conditions[]? | select(.type=="Updating") | .status // "False") == "True") | .metadata.name]),
+            not_updated: ([.items[]? | select((.status.conditions[]? | select(.type=="Updated") | .status // "False") != "True") | .metadata.name]),
+            summary_list: [.items[]? | {
+              name: .metadata.name,
+              machineCount: (.status.machineCount // 0),
+              readyMachineCount: (.status.readyMachineCount // 0),
+              updatedMachineCount: (.status.updatedMachineCount // 0),
+              updatingMachineCount: (.status.updatingMachineCount // 0),
+              degradedMachineCount: (.status.degradedMachineCount // 0)
+            }]
+          } | tojson
+        '
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: settle_mcp_raw
+      changed_when: false
+      retries: "{{ oc_command_retries | default(3) }}"
+      delay: "{{ oc_command_retry_delay | default(10) }}"
+      until: settle_mcp_raw.rc == 0
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Settle-Gate: Parse live settle state facts"
+      set_fact:
+        settle_cv_version: "{{ (settle_cv_raw.stdout | from_json).current_version | string | trim }}"
+        settle_cv_available: "{{ (settle_cv_raw.stdout | from_json).available | string | trim }}"
+        settle_cv_progressing: "{{ (settle_cv_raw.stdout | from_json).progressing | string | trim }}"
+        settle_cv_degraded: "{{ (settle_cv_raw.stdout | from_json).degraded | string | trim }}"
+        settle_co_degraded: "{{ (settle_co_raw.stdout | from_json).degraded | default([]) }}"
+        settle_co_progressing: "{{ (settle_co_raw.stdout | from_json).progressing | default([]) }}"
+        settle_co_unavailable: "{{ (settle_co_raw.stdout | from_json).unavailable | default([]) }}"
+        settle_mcp_degraded: "{{ (settle_mcp_raw.stdout | from_json).degraded | default([]) }}"
+        settle_mcp_updating: "{{ (settle_mcp_raw.stdout | from_json).updating | default([]) }}"
+        settle_mcp_not_updated: "{{ (settle_mcp_raw.stdout | from_json).not_updated | default([]) }}"
+        settle_mcp_status_list: "{{ (settle_mcp_raw.stdout | from_json).summary_list | default([]) }}"
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Settle-Gate: Mock settle state facts for dry-run mode"
+      set_fact:
+        settle_cv_version: "{{ hop_item }}"
+        settle_cv_available: "True"
+        settle_cv_progressing: "False"
+        settle_cv_degraded: "False"
+        settle_co_degraded: []
+        settle_co_progressing: []
+        settle_co_unavailable: []
+        settle_mcp_degraded: []
+        settle_mcp_updating: []
+        settle_mcp_not_updated: []
+        settle_mcp_status_list:
+          - name: "master"
+            machineCount: 3
+            readyMachineCount: 3
+            updatedMachineCount: 3
+            updatingMachineCount: 0
+            degradedMachineCount: 0
+          - name: "worker"
+            machineCount: 6
+            readyMachineCount: 6
+            updatedMachineCount: 6
+            updatingMachineCount: 0
+            degradedMachineCount: 0
+      when: dry_run | default(false) | bool
+
+    - name: "HARD Gate: Enforce cluster settle-gate contract"
+      fail:
         msg: >-
-          ✔ Upgrade triggered for hop {{ hop_label }} → {{ hop_target_version }}
-          on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-          Handing off to monitor phase.
+          [HARD GATE FAILURE] Cluster '{{ cluster_name }}' failed to settle after Hop {{ hop_label }} (Target: {{ hop_item }}).
+          {% if settle_cv_version != hop_item %}
+          - ClusterVersion version '{{ settle_cv_version }}' does not match target '{{ hop_item }}'.
+          {% endif %}
+          {% if not (settle_cv_available | bool) %}
+          - ClusterVersion Available condition is False.
+          {% endif %}
+          {% if settle_cv_progressing | bool %}
+          - ClusterVersion Progressing condition is still True.
+          {% endif %}
+          {% if settle_co_degraded | length > 0 %}
+          - ClusterOperators degraded: {{ settle_co_degraded | join(', ') }}.
+          {% endif %}
+          {% if settle_co_progressing | length > 0 %}
+          - ClusterOperators progressing: {{ settle_co_progressing | join(', ') }}.
+          {% endif %}
+          {% if settle_co_unavailable | length > 0 %}
+          - ClusterOperators unavailable: {{ settle_co_unavailable | join(', ') }}.
+          {% endif %}
+          {% if settle_mcp_degraded | length > 0 %}
+          - MachineConfigPools degraded: {{ settle_mcp_degraded | join(', ') }}.
+          {% endif %}
+          {% if settle_mcp_updating | length > 0 %}
+          - MachineConfigPools still updating: {{ settle_mcp_updating | join(', ') }}.
+          {% endif %}
+          {% if settle_mcp_not_updated | length > 0 %}
+          - MachineConfigPools not fully updated: {{ settle_mcp_not_updated | join(', ') }}.
+          {% endif %}
+          Execution halted before proceeding to subsequent hops.
+      when: >-
+        (settle_cv_version != hop_item) or
+        (not (settle_cv_available | bool)) or
+        (settle_cv_progressing | bool) or
+        ((settle_co_degraded | length) > 0) or
+        ((settle_co_progressing | length) > 0) or
+        ((settle_co_unavailable | length) > 0) or
+        ((settle_mcp_degraded | length) > 0) or
+        ((settle_mcp_updating | length) > 0) or
+        ((settle_mcp_not_updated | length) > 0)
 
-    # ========================================================================
-    # HAND OFF TO MONITOR (Phase 04 — Live Monitoring)
-    # ========================================================================
-    # Polls CV/MCP/nodes every 2 minutes, sends heartbeat emails every 20 min,
-    # sends immediate emails on state change, enforces a 90-min timeout guard,
-    # and asserts the settle-gate (CV at target, COs healthy, MCPs updated)
-    # before the next hop can proceed. All cadences from vars/upgrade.yml.
-    - name: "Hop {{ hop_label }} — Execute live monitoring (Phase 04)"
-      include_tasks: 04_Live_monitoring_upgrade.yaml
+    # ------------------------------------------------------------------------
+    # 7. Dispatch Hop-Complete Notification via sendmail Role
+    # Why: Dispatches progress-mail.j2 formatted as a hop completion card
+    #      with the Prevalidation HTML audit report attached.
+    # ------------------------------------------------------------------------
+    - name: "Locate Prevalidation HTML report for email attachment"
+      set_fact:
+        resolved_report_attachment: >-
+          {{ report_file_path
+             if (report_file_path is defined and report_file_path | length > 0)
+             else (preval_report_path
+                   if (preval_report_path is defined and preval_report_path | length > 0)
+                   else '') }}
 
+    - name: "Configure hop-complete notification parameters"
+      set_fact:
+        mail_template: "progress-mail.j2"
+        mail_subject: "{{ heartbeat_subject_prefix | default('[ARO Upgrade]') }} {{ cluster_name }} Hop {{ hop_label }} Complete: {{ hop_item }}"
+        mail_to: "{{ mail_to | default(['platform-team@example.com']) }}"
+        is_hop_complete: true
+        current_hop: "{{ hop_number }}"
+        total_hops: "{{ hop_total }}"
+        target_version: "{{ hop_item }}"
+        progress_percent: 100
+        percent_complete: 100
+        elapsed_time: "{{ hop_elapsed_duration | default('Completed') }}"
+        elapsed_duration: "{{ hop_elapsed_duration | default('Completed') }}"
+        attachment_note: "Prevalidation HTML audit report attached for historical compliance."
+        mcp_status_list: "{{ settle_mcp_status_list | default([]) }}"
+        updating_nodes: []
+        degraded_nodes: []
+        mail_attachments: "{{ [resolved_report_attachment] if (resolved_report_attachment | length > 0) else [] }}"
+
+    - name: "Dispatch hop-complete notification email via sendmail role"
+      include_role:
+        name: sendmail
+      when:
+        - not (dry_run | default(false) | bool)
+        - (mail_to | default([]) | length) > 0
+
+    - name: "Log hop completion confirmation to human-readable text run log"
+      lineinfile:
+        path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+        line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [PASS] [HARD] Phase 03: Upgrade Hop {{ hop_label }} to '{{ hop_item }}' completed successfully. Settle-gate verified."
+        create: true
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Log hop completion confirmation to CSV audit log"
+      lineinfile:
+        path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+        line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name }}","Phase 03 Upgrade Hop {{ hop_label }}","HARD","PASS","Hop completed to {{ hop_item }}","Settle-gate passed; completion notification dispatched"'
+        create: true
+      when: not (dry_run | default(false) | bool)
+
+    - name: "Display Phase 03 Hop completion banner"
+      debug:
+        msg:
+          - "============================================================================"
+          - "PHASE 03: UPGRADE HOP {{ hop_label }} COMPLETED SUCCESSFULLY"
+          - "============================================================================"
+          - "Target Cluster       : {{ cluster_name }}"
+          - "Achieved Version     : {{ hop_item }}"
+          - "Settle-Gate Status   : VERIFIED (All COs Available, MCPs Updated)"
+          - "Notification         : Dispatched to {{ mail_to | default(['platform-team@example.com']) | join(', ') }}"
+          - "============================================================================"
+
+  # --------------------------------------------------------------------------
+  # Rescue Block: Error Extraction, Alert Dispatch & Clean Session Logout
+  # Why: Catches any failure in pre-hop checks, upgrade trigger, monitoring handoff,
+  #      or settle-gate. Extracts errors hierarchically, detects RBAC errors,
+  #      dispatches alert email, and performs fail-safe session teardown.
+  # --------------------------------------------------------------------------
   rescue:
-    - name: "Hop {{ hop_label }} — Resolve failure context object"
+    - name: "Extract sanitized error message from failure result in Phase 03 hop"
       set_fact:
-        hop_failed: true
-        failed_phase: "03_Initiate_upgrade"
-        current_step_no: "{{ hop_number | default(1) }}"
-        current_task_name: "Upgrade Hop {{ hop_label }} → {{ hop_target_version }}"
+        resolved_error: >-
+          {{ ansible_failed_result.stderr | default('')
+             if (ansible_failed_result.stderr | default('') | length > 0)
+             else (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+             if (ansible_failed_result.stderr_lines | default([]) | length > 0)
+             else ansible_failed_result.msg | default('Unknown error — inspect logs') }}
+
+    - name: "Evaluate whether failure is an RBAC / authorization error in Phase 03 hop"
+      set_fact:
+        is_rbac_error: >-
+          {{ (resolved_error | lower is search('forbidden'))
+             or (resolved_error | lower is search('cannot patch'))
+             or (resolved_error | lower is search('unauthorized'))
+             or (resolved_error | lower is search('cannot get'))
+             or (resolved_error | lower is search('cannot list'))
+             or (resolved_error | lower is search('cannot create')) }}
+
+    - name: "Configure Phase 03 hop error context facts"
+      set_fact:
+        current_step_no: "Phase 03 Hop {{ hop_label | default('N/A') }}"
+        current_task_name: "Phase 03 Upgrade Hop {{ hop_label | default('N/A') }} ({{ hop_item | default('unknown') }})"
         current_gate_type: "HARD"
-        hop_failure_obj: >-
-          {{
-            upgrade_trigger_result
-            if (upgrade_trigger_result is defined and (upgrade_trigger_result.rc | default(0) != 0 or upgrade_trigger_result.failed | default(false)))
-            else (
-              force_upgrade_result
-              if (force_upgrade_result is defined and (force_upgrade_result.rc | default(0) != 0 or force_upgrade_result.failed | default(false)))
-              else (
-                upgrade_ack_apply_result
-                if (upgrade_ack_apply_result is defined and (upgrade_ack_apply_result.rc | default(0) != 0 or upgrade_ack_apply_result.failed | default(false)))
-                else (
-                  channel_set_result
-                  if (channel_set_result is defined and (channel_set_result.rc | default(0) != 0 or channel_set_result.failed | default(false)))
-                  else (
-                    upgrade_cv_raw
-                    if (upgrade_cv_raw is defined and (upgrade_cv_raw.rc | default(0) != 0 or upgrade_cv_raw.failed | default(false)))
-                    else (ansible_failed_result | default({}))
-                  )
-                )
-              )
-            )
-          }}
+        failure_reason: "Upgrade hop {{ hop_label | default('N/A') }} failed transitioning to {{ hop_item | default('target') }}"
+        failure_observed: "{{ resolved_error }}"
+        phase_03_failed: true
 
-    - name: "Hop {{ hop_label }} — Record failure details"
-      set_fact:
-        failure_reason: >-
-          {{
-            ((hop_failure_obj | default({})).stderr | default('') | trim)
-            if (((hop_failure_obj | default({})).stderr | default('') | trim) != '')
-            else (
-              (((hop_failure_obj | default({})).stderr_lines | default([])) | join(' ') | trim)
-              if ((((hop_failure_obj | default({})).stderr_lines | default([])) | length) > 0)
-              else (
-                ((hop_failure_obj | default({})).msg | default('') | trim)
-                if (((hop_failure_obj | default({})).msg | default('') | trim) != '' and ((hop_failure_obj | default({})).msg | default('') | trim) != 'non-zero return code')
-                else (
-                  ((hop_failure_obj | default({})).message | default('') | trim)
-                  if (((hop_failure_obj | default({})).message | default('') | trim) != '')
-                  else 'Hop upgrade sequence failed.'
-                )
-              )
-            )
-          }}
-        failure_observed: >-
-          {{
-            'RBAC Permission Denied (Forbidden) during Hop ' ~ (hop_label | default('1/1')) ~ ' trigger'
-            if (('forbidden' in ((hop_failure_obj | default({})).stderr | default('') | lower)) or
-                ('cannot patch' in ((hop_failure_obj | default({})).stderr | default('') | lower)) or
-                ('cannot get' in ((hop_failure_obj | default({})).stderr | default('') | lower)) or
-                ('unauthorized' in ((hop_failure_obj | default({})).stderr | default('') | lower)) or
-                ('forbidden' in ((hop_failure_obj | default({})).msg | default('') | lower)))
-            else ('FAILED at Hop ' ~ (hop_label | default('1/1')) ~ ': ' ~ (hop_target_version | default('target')) ~ ' — Upgrade sequence failure')
-          }}
-
-    - name: "Hop {{ hop_label }} — Trigger error handling and alert"
+    - name: "Record Phase 03 failure and dispatch alert via error_handle role"
       include_role:
         name: error_handle
 
-    - name: "Hop {{ hop_label }} — Tear down cluster session on failure"
+    - name: "Execute session logout on Phase 03 failure"
       include_role:
         name: logout
+      failed_when: false
 
-    - name: "Hop {{ hop_label }} — Halt execution due to hop failure"
+    - name: "Halt execution on Phase 03 failure"
       fail:
-        msg: >-
-          Upgrade hop {{ hop_label }} ({{ hop_target_version }}) FAILED on cluster
-          '{{ cluster_name | default('UNKNOWN') }}'. Alert dispatched. Session torn down.
+        msg: "Phase 03 Upgrade Hop {{ hop_label | default('N/A') }} failed for cluster '{{ cluster_name }}': {{ resolved_error }}"

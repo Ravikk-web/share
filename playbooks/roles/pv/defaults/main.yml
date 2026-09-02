@@ -1,20 +1,23 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable defaults.
-#                 | default('') guards are applied on all optional variables.
-#
-# pv role defaults — validates Persistent Volume (PV) status across the cluster (WARN gate).
-
 ---
-# Kubeconfig path — defaults to the session kubeconfig established in Phase 01.
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
+# ============================================================================
+# Role Defaults: pv (PersistentVolumes)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar and boolean values.
+#
+# Purpose: Defines default parameters for the pv role, which audits cluster
+#          PersistentVolumes to verify that all volumes are in Bound or Available
+#          phase, alerting on Failed or Released volumes prior to upgrading.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: WARN
+# ============================================================================
 
-# Cluster name used in log messages and report entries.
-cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
+# Target cluster identifier (string, required)
+cluster_name: ""
 
-# Prevalidation check metadata for health_summary reporting.
-pv_id: "08"
-pv_name: "Persistent Volume (PV) Status"
-pv_gate: "WARN"
+# Master toggle for enforcing gate failure on validation error (WARN gate does not fail by default)
+pv_enforce_gate: false
 
-# Optional list of PV names permitted to be in non-healthy status without triggering WARN.
-pv_allow_list: []
+# Transient retry parameters for oc CLI execution
+oc_command_retries: 3
+oc_command_retry_delay: 10

@@ -1,60 +1,81 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (command, fail, set_fact, debug) work
-#                 on both versions. Replace with FQCN only if adopting the
-#                 ansible.builtin.* convention project-wide.
-#                 | default('') is already applied on all optional variables.
-#
-# api_readiness role — validates API server responsiveness and readiness.
-#
-# Contract:
-#   - Queries `oc get --raw='/readyz' --kubeconfig {{ kubeconfig_path }}`.
-#   - Read-only operation; changed_when: false.
-#   - Asserts healthy response ('ok').
-#   - HARD gate: fails if /readyz returns non-zero rc or non-ok body.
-#   - Records a structured entry in `health_summary` list via set_fact.
-
 ---
-- name: Query API server readiness endpoint — oc get --raw={{ api_readiness_endpoint | default('/readyz') }}
-  command: >-
-    oc get --raw={{ api_readiness_endpoint | default('/readyz') }}
-    --kubeconfig {{ kubeconfig_path }}
-  register: api_readiness_result
+# ============================================================================
+# Role Tasks: api_readiness
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (command, set_fact, fail, debug).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Verifies OpenShift API server readiness status via raw endpoint query
+#          (e.g. /readyz). Enforces HARD gate if the endpoint fails to return 'ok'.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: HARD
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Query Raw Readiness Endpoint via oc CLI
+# Why: oc get --raw=/readyz returns the raw healthz/readyz payload from kube-apiserver.
+# Why: Retry loop with delay absorbs transient 503 Service Unavailable or restarts.
+# Why: changed_when: false keeps audit reports honest since queries are read-only.
+# ----------------------------------------------------------------------------
+- name: "Query cluster API readiness endpoint via oc CLI"
+  command: "oc get --raw={{ api_readiness_endpoint | default('/readyz') }}"
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: api_readyz_query
   changed_when: false
   failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: api_readyz_query.rc == 0 and ((api_readyz_query.stdout | default('') | trim) == 'ok')
 
-- name: Evaluate API server readiness endpoint response
-  fail:
-    msg: >-
-      API readiness check FAILED (HARD gate) for cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      Endpoint: '{{ api_readiness_endpoint | default('/readyz') }}'.
-      Exit code: {{ api_readiness_result.rc | default(1) }}.
-      Response: '{{ api_readiness_result.stdout | default('') | trim }}'.
-      Error: '{{ api_readiness_result.stderr | default('') | trim }}'.
-      Expected response: '{{ api_readiness_expected_response | default('ok') }}'.
-      The API server is not ready to process upgrade operations.
-  when: >
-    (api_readiness_result.rc | default(1) != 0) or
-    (api_readiness_result.stdout | default('') | trim != (api_readiness_expected_response | default('ok')))
-
-- name: Store API server readiness status
+# ----------------------------------------------------------------------------
+# 2. Extract & Validate Readiness Output
+# Why: Normalizes output with trim and ensures strict equality with 'ok' and rc 0.
+# ----------------------------------------------------------------------------
+- name: "Extract API readiness endpoint payload fact"
   set_fact:
-    api_readiness_status: "{{ api_readiness_result.stdout | trim }}"
+    readyz_payload: "{{ api_readyz_query.stdout | default('') | trim }}"
 
-- name: Record api_readiness PASS in health_summary
+- name: "Evaluate API readiness validation result"
   set_fact:
-    health_summary: "{{ (health_summary | default([])) + [api_readiness_summary_entry] }}"
-  vars:
-    api_readiness_summary_entry:
-      id: "{{ api_readiness_id | default('02') }}"
-      name: "{{ api_readiness_name | default('API Server Readiness (/readyz)') }}"
-      gate: "{{ api_readiness_gate | default('HARD') }}"
-      status: "PASS"
-      observed: "Endpoint {{ api_readiness_endpoint | default('/readyz') }} responded with '{{ api_readiness_status }}'"
-      details: "API server is healthy and responding with ok on {{ cluster_name | default('cluster') }}"
-      raw_output: "{{ api_readiness_result.stdout | trim | default('') }}"
+    api_readiness_valid: "{{ (api_readyz_query.rc == 0) and (readyz_payload == 'ok') }}"
 
-- name: Confirm api_readiness passed
+# ----------------------------------------------------------------------------
+# 3. Construct Structured Health Record & Append to Summary
+# Why: Records structured dictionary into health_summary for reporting.
+# ----------------------------------------------------------------------------
+- name: "Construct structured api_readiness health record"
+  set_fact:
+    api_readiness_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "API Server Readiness"
+      gate: "HARD"
+      status: "{{ 'PASS' if (api_readiness_valid | bool) else 'FAIL' }}"
+      observed: >-
+        {{ ('Readiness endpoint ' ~ (api_readiness_endpoint | default('/readyz')) ~ ' responded with ok')
+           if (api_readiness_valid | bool)
+           else ('Readiness endpoint ' ~ (api_readiness_endpoint | default('/readyz')) ~ ' returned payload: ' ~ (readyz_payload | default(api_readyz_query.stderr | default('unresponsive')))) }}
+
+- name: "Record api_readiness result to health_summary tracking list"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [api_readiness_item] }}"
+
+- name: "Log api_readiness evaluation outcome"
   debug:
-    msg: >-
-      ✔ PASS [Check {{ api_readiness_id | default('02') }} - {{ api_readiness_name | default('API Server Readiness (/readyz)') }}] —
-      API server endpoint '{{ api_readiness_endpoint | default('/readyz') }}' is ready ('{{ api_readiness_status }}').
+    msg:
+      - "Check        : {{ api_readiness_item.name }}"
+      - "Status       : {{ api_readiness_item.status }}"
+      - "Observed     : {{ api_readiness_item.observed }}"
+      - "Gate Enforced: {{ api_readiness_enforce_gate | default(true) | bool }}"
+
+# ----------------------------------------------------------------------------
+# 4. Enforce HARD Gate
+# Why: Halts execution immediately if the API readiness endpoint is unhealthy.
+# ----------------------------------------------------------------------------
+- name: "Enforce HARD gate for API readiness check"
+  fail:
+    msg: "HARD GATE FAILURE [api_readiness]: API endpoint '{{ api_readiness_endpoint }}' on cluster '{{ cluster_name }}' is NOT ready. Observed: '{{ readyz_payload | default(api_readyz_query.stderr | default('failed query')) }}' (rc: {{ api_readyz_query.rc }})."
+  when:
+    - not (api_readiness_valid | bool)
+    - api_readiness_enforce_gate | default(true) | bool

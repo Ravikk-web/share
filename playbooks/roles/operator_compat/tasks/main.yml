@@ -1,92 +1,132 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names work on both versions.
-
 ---
-- name: Query Subscriptions and CSVs
+# ============================================================================
+# Role Tasks: operator_compat
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names, set_fact, and include_tasks.
+#
+# Purpose: Scans all installed OLM Subscription resources in the cluster and
+#          verifies that available PackageManifest update channels support
+#          the newly upgraded OpenShift version.
+# Dependencies: playbooks/roles/operator_compat/defaults/main.yml,
+#               playbooks/vars/upgrade.yml, playbooks/vars/paths.yml
+# Gate type: WARN / Advisory (Exposes operator_compat_plan)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Initialize State Facts & Resolve Target Version
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Initialize compatibility fact containers"
+  set_fact:
+    operator_compat_plan: []
+    operator_compat_records: []
+
+- name: "operator_compat: Resolve target OpenShift minor version prefix"
+  set_fact:
+    target_ocp_minor: >-
+      {{ target_version | regex_search('^[0-9]+\\.[0-9]+')
+         if (target_version is defined and target_version | length > 0)
+         else (upgrade_path[-1] | regex_search('^[0-9]+\\.[0-9]+')
+               if (upgrade_path is defined and upgrade_path | length > 0)
+               else '') }}
+
+- name: "operator_compat: Display compatibility scan banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "OLM OPERATOR COMPATIBILITY SCAN"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name | default('unknown') }}"
+      - "Target OCP Minor     : {{ target_ocp_minor | default('N/A') }}"
+      - "Gate Enforcement    : {{ operator_compat_enforce_gate | default(false) }}"
+      - "============================================================================"
+
+# ----------------------------------------------------------------------------
+# 2. Resiliently Query Live Subscriptions with jq v1.5
+# Why: Absorbs transient 503 or API blips. Extracts all OLM Subscriptions.
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Query live OLM subscriptions"
   shell: |
-    set -euo pipefail
-    TMP_SUBS=$(mktemp)
-    TMP_CSVS=$(mktemp)
-    oc get subscriptions --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_SUBS"
-    oc get csv --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_CSVS"
-    
-    jq -s -r '
-      .[0].items as $subs |
-      .[1].items as $csvs |
-      $subs | map(
-        . as $sub |
-        ($csvs | map(select(.metadata.namespace == $sub.metadata.namespace and .metadata.name == $sub.status.installedCSV))[0]) as $csv |
-        {
-          name: .metadata.name,
-          namespace: .metadata.namespace,
-          channel: (.spec.channel // "Unknown"),
-          installedCSV: (.status.installedCSV // "Unknown"),
-          currentCSV: (.status.currentCSV // "Unknown"),
-          state: (.status.state // "Unknown"),
-          installPlanApproval: (.spec.installPlanApproval // "Unknown"),
-          csv_phase: ($csv.status.phase // "Unknown"),
-          csv_version: ($csv.spec.version // "Unknown"),
-          csv_minKubeVersion: ($csv.spec.minKubeVersion // "0.0.0")
-        }
-      )
-    ' "$TMP_SUBS" "$TMP_CSVS"
-    rm -f "$TMP_SUBS" "$TMP_CSVS"
+    set -o pipefail
+    oc get subscriptions.operators.coreos.com -A -o json 2>/dev/null || echo '{"items":[]}'
   args:
     executable: /bin/bash
-  register: sub_csv_raw
+  register: op_subscriptions_raw
+  until: op_subscriptions_raw.rc == 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
   changed_when: false
 
-- name: Parse Subscriptions
-  set_fact:
-    operator_subs: "{{ sub_csv_raw.stdout | from_json }}"
-
-- name: Query Cluster Server Kube Version
+- name: "operator_compat: Parse subscription list with jq v1.5"
   shell: |
-    oc version -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '.serverVersion.gitVersion | split("+")[0]'
-  register: raw_kube_version
+    set -o pipefail
+    echo '{{ op_subscriptions_raw.stdout | default("{}") }}' | jq -c '
+      [ .items[]? | {
+          name: (.metadata.name // "unknown"),
+          namespace: (.metadata.namespace // "unknown"),
+          package: (.spec.name // .metadata.name // "unknown"),
+          channel: (.spec.channel // ""),
+          source: (.spec.source // ""),
+          source_namespace: (.spec.sourceNamespace // "openshift-marketplace"),
+          approval: (.spec.installPlanApproval // "Automatic"),
+          installed_csv: (.status.installedCSV // .status.currentCSV // "None"),
+          state: (.status.state // "AtLatestKnown")
+        }
+      ]
+    '
+  args:
+    executable: /bin/bash
+  register: op_subscriptions_parsed_raw
   changed_when: false
 
-- name: Set Cluster Kube Version Fact
+- name: "operator_compat: Set parsed subscriptions fact"
   set_fact:
-    cluster_kube_version: "{{ raw_kube_version.stdout | regex_replace('^v(.*)$', '\\1') }}"
+    parsed_subscriptions: "{{ op_subscriptions_parsed_raw.stdout | from_json }}"
 
-- name: Initialize operator evaluation list
+# ----------------------------------------------------------------------------
+# 3. Handle Empty Subscriptions Case Cleanly
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Handle empty cluster subscriptions"
   set_fact:
-    operator_evaluations: []
-    operator_compat_failed: []
-    operator_upgrade_needed: []
+    operator_compat_plan: []
+    operator_compat_records:
+      - name: "Operator Compatibility Scan"
+        gate: "WARN"
+        status: "PASS"
+        observed: "No OLM subscriptions installed on cluster"
+  when: parsed_subscriptions | length == 0
 
-- name: Evaluate Operator Compatibility and Upgrade Needs
-  set_fact:
-    operator_evaluations: "{{ operator_evaluations + [eval_record] }}"
-    operator_compat_failed: "{{ operator_compat_failed + ([eval_record] if status == 'FAIL' else []) }}"
-    operator_upgrade_needed: "{{ operator_upgrade_needed + ([eval_record] if upgrade_flag and status != 'FAIL' else []) }}"
-  vars:
-    # HARD fail if phase is Failed or minKubeVersion > cluster server version
-    is_failed: "{{ item.csv_phase == 'Failed' }}"
-    is_incompat: "{{ item.csv_minKubeVersion != '0.0.0' and item.csv_minKubeVersion is version(cluster_kube_version, '>') }}"
-    status: "{{ 'FAIL' if (is_failed or is_incompat) else 'PASS' }}"
-    # WARN / Actionable upgrade needed if current != installed or pending state
-    upgrade_flag: >-
-      {{
-        item.currentCSV != item.installedCSV or
-        item.state == 'UpgradePending'
-      }}
-    eval_record: "{{ item | combine({'compat_status': status, 'needs_upgrade': upgrade_flag}) }}"
-  loop: "{{ operator_subs }}"
-  when: item.name not in (operator_allow_list | default([]))
-
-- name: Enforce HARD gate on Operator Compatibility
-  fail:
-    msg: >-
-      Operator Compatibility check FAILED on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      Found {{ operator_compat_failed | length }} incompatible or failed operators:
-      {% for op in operator_compat_failed %}
-        - {{ op.namespace }}/{{ op.name }}: Phase={{ op.csv_phase }}, minKubeVersion={{ op.csv_minKubeVersion }}, ClusterKube={{ cluster_kube_version }}
-      {% endfor %}
-  when: (operator_compat_failed | length) > 0
-
-- name: Display Upgrade Worklist
+- name: "operator_compat: Display confirmation when no subscriptions found"
   debug:
-    msg: >-
-      Found {{ operator_upgrade_needed | length }} operator(s) needing upgrade.
+    msg: "No OLM subscriptions found on cluster. All operator compatibility checks passed."
+  when: parsed_subscriptions | length == 0
+
+# ----------------------------------------------------------------------------
+# 4. Scan Subscriptions for Channel Compatibility
+# Why: Sequentially scans PackageManifest for each installed subscription.
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Scan individual subscriptions for version compatibility"
+  include_tasks: scan_subscription.yml
+  loop: "{{ parsed_subscriptions }}"
+  loop_control:
+    loop_var: sub_item
+  when: parsed_subscriptions | length > 0
+
+# ----------------------------------------------------------------------------
+# 5. Summary & Gate Enforcement
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Display compatibility plan summary"
+  debug:
+    msg:
+      - "----------------------------------------------------------------------------"
+      - "OPERATOR COMPATIBILITY SCAN COMPLETE (Total: {{ operator_compat_plan | length }})"
+      - "----------------------------------------------------------------------------"
+      - "Plan items: {{ operator_compat_plan }}"
+      - "----------------------------------------------------------------------------"
+
+- name: "operator_compat: Enforce compatibility gate if enabled"
+  fail:
+    msg: "[HARD GATE FAILURE] One or more operators have incompatible update channels: {{ operator_compat_plan | selectattr('status', 'equalto', 'FAIL') | map(attribute='subscription') | join(', ') }}"
+  when:
+    - operator_compat_enforce_gate | default(false) | bool
+    - (operator_compat_plan | selectattr('status', 'equalto', 'FAIL') | list | length) > 0

@@ -1,29 +1,35 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names work on both versions.
-#                 | default('') guards are applied on all optional variables.
-#                 No `warn:` parameter is used on any task.
-#
-# Defaults for postvalidation role (Phase 05 10-Check Aggregator + Baseline Diff).
-
 ---
-# Cluster session & environment paths
-kubeconfig_path: "{{ playbook_dir }}/.kubeconfig"
-cluster_name: "{{ vault_cluster_name | default('UNKNOWN') }}"
-snapshot_dir: "{{ playbook_dir }}/snapshots"
-baseline_snapshot_file_path: ""
+# ============================================================================
+# Role Defaults: postvalidation (10-Check Postvalidation & Baseline Diff)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Standard YAML dictionary mapping; fully compatible across
+#                 Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Default configuration parameters for the 10-check postvalidation
+#          contract, baseline snapshot location, and gate enforcement rules.
+# Dependencies: vars/upgrade.yml, vars/paths.yml
+# Gate type: HARD (Checks 01–06) / WARN (Checks 07–10)
+# ============================================================================
 
-# Target version (defaults to last element in upgrade_path)
-final_target_version: "{{ (upgrade_path | default([])) | last | default('') }}"
+# Path to the Phase 01 baseline snapshot JSON file
+# Ingested by Check 10 to compute baseline diffing
+baseline_snapshot_file: "{{ baseline_snapshot_file_path | default('') }}"
 
-# Allow-lists for permitted cluster exceptions (empty by default)
+# Target final version (defaults to last element in upgrade_path or empty string)
+# Check 01 asserts that the cluster has settled at this version
+final_target_version: "{{ (upgrade_path[-1] if (upgrade_path is defined and (upgrade_path | length > 0)) else '') }}"
+
+# Flag controlling whether HARD gates trigger fail:
+# Set to false to perform a non-blocking diagnostic sweep
+postval_enforce_gate: true
+
+# Operator allow list to exclude from degraded/unavailable checks
 co_allow_list: []
-mcp_allow_list: []
-node_allow_list: []
-allowed_unschedulable_nodes: []
-etcd_allow_list: []
-alert_allow_list: []
-critical_pod_allow_list: []
-csr_allow_list: []
 
-# Pattern for critical namespaces inspected in Check 07
-critical_namespace_pattern: "openshift-|kube-system"
+# Allowed unschedulable nodes threshold
+allowed_unschedulable_nodes: 0
+
+# Transient query retry parameters for oc CLI calls
+oc_command_retries: 3
+oc_command_retry_delay: 10

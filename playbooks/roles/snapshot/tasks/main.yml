@@ -1,188 +1,177 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (file, set_fact, command, copy, debug, fail)
-#                 work on both versions.
-#                 # MIGRATION 2.14: Retest to_nice_json and from_json filters
-#                 under Python 3 during migration.
-#                 | default('') guards are applied on all optional variables.
-#
-# Snapshot role — captures cluster baseline state and writes
-# snapshots/<cluster>_<timestamp>_baseline.json.
-#
-# Contract:
-#   - Baseline JSON is the single sanctioned cross-phase persistence.
-#   - Captures: clusterversion, clusteroperators, nodes, routes.
-#   - Read later only by Phase 05 for baseline diffing.
-#   - All reads are changed_when: false.
-#   - Paths derive from playbook_dir / snapshot_dir.
-
 ---
-- name: Ensure snapshots directory exists
+# ============================================================================
+# Role Tasks: snapshot
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (file, set_fact, shell, copy);
+#                 compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Queries live cluster state via oc CLI with retry protection and jq 1.5
+#          parsing, constructs a structured baseline dictionary (cluster metadata,
+#          nodes, cluster operators, and routes), and writes an immutable
+#          JSON snapshot to disk for downstream postvalidation diffing.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: HARD (fails immediately if cluster queries fail)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Directory & Path Initialization
+# ----------------------------------------------------------------------------
+# Why: Ensures destination snapshot directory exists prior to file operations.
+- name: "Ensure baseline snapshot directory exists"
   file:
     path: "{{ snapshot_dir | default(playbook_dir ~ '/snapshots') }}"
     state: directory
     mode: "0755"
 
-- name: Resolve snapshot timestamp
+# Why: Dynamically derives snapshot file path incorporating cluster_name and run_timestamp.
+- name: "Establish snapshot output file path"
   set_fact:
-    resolved_snapshot_timestamp: >-
-      {{
-        snapshot_timestamp
-        if (snapshot_timestamp | default('') != '')
-        else (
-          (ansible_date_time.year | default('1970')) ~
-          (ansible_date_time.month | default('01')) ~
-          (ansible_date_time.day | default('01')) ~ '_' ~
-          (ansible_date_time.hour | default('00')) ~
-          (ansible_date_time.minute | default('00')) ~
-          (ansible_date_time.second | default('00'))
-        )
-      }}
+    snapshot_file: "{{ (snapshot_dir | default(playbook_dir ~ '/snapshots')) }}/{{ cluster_name }}_{{ run_timestamp | default('baseline') }}_baseline.json"
 
-- name: Resolve snapshot destination file path
-  set_fact:
-    resolved_snapshot_file: >-
-      {{
-        snapshot_file
-        if (snapshot_file | default('') != '')
-        else (
-          (snapshot_dir | default(playbook_dir ~ '/snapshots')) ~ '/' ~
-          (cluster_name | default('unknown_cluster')) ~ '_' ~
-          resolved_snapshot_timestamp ~ '_baseline.json'
-        )
-      }}
+# ----------------------------------------------------------------------------
+# 2. Query Live Cluster Resources via oc CLI & jq 1.5
+# ----------------------------------------------------------------------------
+# Why: oc CLI with retry logic (3 retries, 10s delay) absorbs transient network
+#      blips, API server restarts, or 503 Service Unavailable responses.
+# Why: set -o pipefail + executable: /bin/bash guarantees failure detection across pipes.
+# Why: changed_when: false keeps audit reports honest since queries are read-only.
 
-- name: Capture ClusterVersion resource (oc get clusterversion version -o json)
-  command: oc get clusterversion version -o json --kubeconfig {{ kubeconfig_path }}
-  register: oc_cv_raw
+# Why: Extract current version, active channel, and cluster ID from ClusterVersion.
+# Why: Parentheses around // operands satisfy jq 1.5 operator precedence rules.
+- name: "Query and extract live clusterversion metadata"
+  shell: |
+    set -o pipefail
+    oc get clusterversion version -o json | jq -c '
+      {
+        current_version: (((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // (.status.desired.version // "unknown")),
+        channel: (.spec.channel // "unknown"),
+        cluster_id: (.spec.clusterID // "unknown")
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: cv_query_raw
   changed_when: false
-  failed_when: oc_cv_raw.rc != 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: cv_query_raw.rc == 0
 
-- name: Parse ClusterVersion JSON data
-  set_fact:
-    cv_raw_json: "{{ oc_cv_raw.stdout | from_json }}"
-
-- name: Extract ClusterVersion metadata and conditions
-  set_fact:
-    baseline_clusterversion:
-      desired_version: "{{ cv_raw_json.status.desired.version | default(cv_raw_json.spec.desiredUpdate.version | default('unknown')) }}"
-      current_version: "{{ (cv_raw_json.status.history | default([{}]) | first).version | default(cv_raw_json.status.desired.version | default('unknown')) }}"
-      channel: "{{ cv_raw_json.spec.channel | default('') }}"
-      available_updates: "{{ cv_raw_json.status.availableUpdates | default([]) }}"
-      history: "{{ cv_raw_json.status.history | default([]) }}"
-      conditions: "{{ cv_raw_json.status.conditions | default([]) }}"
-
-- name: Capture ClusterOperators (oc get clusteroperators -o json)
-  command: oc get clusteroperators -o json --kubeconfig {{ kubeconfig_path }}
-  register: oc_co_raw
+# Why: Extract operator names, versions, and health conditions (Available, Progressing, Degraded).
+# Why: Parentheses around 'or' operands ensure jq 1.5 evaluates boolean conditions correctly.
+- name: "Query and extract live clusteroperators snapshot"
+  shell: |
+    set -o pipefail
+    oc get clusteroperators -o json | jq -c '
+      [.items[]? | {
+        name: .metadata.name,
+        version: (([.status.versions[]? | select((.name == "operator") or (.name == "cluster-version-operator") or (.name == .metadata.name)) | .version] | first) // ([.status.versions[]?.version] | first) // "unknown"),
+        available: (([.status.conditions[]? | select(.type == "Available") | .status] | first) // "Unknown"),
+        progressing: (([.status.conditions[]? | select(.type == "Progressing") | .status] | first) // "Unknown"),
+        degraded: (([.status.conditions[]? | select(.type == "Degraded") | .status] | first) // "Unknown")
+      }] | sort_by(.name)'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: co_query_raw
   changed_when: false
-  failed_when: oc_co_raw.rc != 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: co_query_raw.rc == 0
 
-- name: Parse ClusterOperators JSON data
-  set_fact:
-    co_raw_json: "{{ oc_co_raw.stdout | from_json }}"
-
-- name: Assemble structured ClusterOperators list
-  set_fact:
-    baseline_clusteroperators: >-
-      [
-        {% for item in co_raw_json['items'] | default([]) %}
-        {
-          "name": "{{ item.metadata.name | default('') }}",
-          "available": "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first) | default('Unknown') }}",
-          "progressing": "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first) | default('Unknown') }}",
-          "degraded": "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | list | first) | default('Unknown') }}",
-          "versions": {{ item.status.versions | default([]) | to_json }}
-        }{{ '' if loop.last else ',' }}
-        {% endfor %}
-      ]
-
-- name: Capture Nodes (oc get nodes -o json)
-  command: oc get nodes -o json --kubeconfig {{ kubeconfig_path }}
-  register: oc_nodes_raw
+# Why: Extract node names, roles, kubelet versions, readiness status, and scheduling state.
+# Why: Extracts roles from labels prefixed with node-role.kubernetes.io/.
+- name: "Query and extract live node snapshot"
+  shell: |
+    set -o pipefail
+    oc get nodes -o json | jq -c '
+      [.items[]? | {
+        name: .metadata.name,
+        roles: ([.metadata.labels // {} | to_entries[]? | select(.key | startswith("node-role.kubernetes.io/")) | .key | split("/")[1]] | sort),
+        kubelet_version: (.status.nodeInfo.kubeletVersion // "unknown"),
+        ready: (([.status.conditions[]? | select(.type == "Ready") | .status] | first) // "Unknown"),
+        unschedulable: (.spec.unschedulable // false)
+      }] | sort_by(.name)'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: nodes_query_raw
   changed_when: false
-  failed_when: oc_nodes_raw.rc != 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: nodes_query_raw.rc == 0
 
-- name: Parse Nodes JSON data
-  set_fact:
-    nodes_raw_json: "{{ oc_nodes_raw.stdout | from_json }}"
-
-- name: Assemble structured Nodes list
-  set_fact:
-    baseline_nodes: >-
-      [
-        {% for item in nodes_raw_json['items'] | default([]) %}
-        {
-          "name": "{{ item.metadata.name | default('') }}",
-          "ready": "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | list | first) | default('Unknown') }}",
-          "kubelet_version": "{{ item.status.nodeInfo.kubeletVersion | default('unknown') }}",
-          "kernel_version": "{{ item.status.nodeInfo.kernelVersion | default('unknown') }}",
-          "os_image": "{{ item.status.nodeInfo.osImage | default('unknown') }}",
-          "unschedulable": {{ (item.spec.unschedulable | default(false)) | to_json }},
-          "roles": {{ item.metadata.labels | default({}) | list | select('match', 'node-role.kubernetes.io/.*') | map('regex_replace', 'node-role.kubernetes.io/', '') | list | to_json }},
-        }{{ '' if loop.last else ',' }}
-        {% endfor %}
-      ]
-
-- name: Capture Routes across all namespaces (oc get routes --all-namespaces -o json)
-  command: oc get routes --all-namespaces -o json --kubeconfig {{ kubeconfig_path }}
-  register: oc_routes_raw
+# Why: Extract route names, namespaces, and exposed hostnames across all namespaces.
+- name: "Query and extract live cluster routes snapshot"
+  shell: |
+    set -o pipefail
+    oc get routes -A -o json | jq -c '
+      [.items[]? | {
+        name: .metadata.name,
+        namespace: .metadata.namespace,
+        host: (.spec.host // "")
+      }] | sort_by(.namespace, .name)'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: routes_query_raw
   changed_when: false
-  failed_when: oc_routes_raw.rc != 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: routes_query_raw.rc == 0
 
-- name: Parse Routes JSON data
+# ----------------------------------------------------------------------------
+# 3. Assemble Baseline Data Structures
+# ----------------------------------------------------------------------------
+# Why: Converts JSON stdout from queries into native Ansible dictionary and list facts.
+- name: "Parse queried JSON outputs into structured facts"
   set_fact:
-    routes_raw_json: "{{ oc_routes_raw.stdout | from_json }}"
+    baseline_cv_parsed: "{{ cv_query_raw.stdout | from_json }}"
+    baseline_operators_parsed: "{{ co_query_raw.stdout | from_json }}"
+    baseline_nodes_parsed: "{{ nodes_query_raw.stdout | from_json }}"
+    baseline_routes_parsed: "{{ routes_query_raw.stdout | from_json }}"
 
-- name: Assemble structured Routes list
+# Why: Constructs the unified baseline snapshot dictionary conforming to the
+#      single cross-phase persistence schema.
+- name: "Assemble structured cluster baseline dictionary"
   set_fact:
-    baseline_routes: >-
-      [
-        {% for item in routes_raw_json['items'] | default([]) %}
-        {
-          "namespace": "{{ item.metadata.namespace | default('') }}",
-          "name": "{{ item.metadata.name | default('') }}",
-          "host": "{{ item.spec.host | default('') }}",
-          "to": "{{ item.spec.to.name | default('') }}",
-          "tls_termination": "{{ (item.spec.tls | default({})).termination | default('none') }}"
-        }{{ '' if loop.last else ',' }}
-        {% endfor %}
-      ]
+    baseline_dict:
+      cluster_metadata:
+        name: "{{ cluster_name }}"
+        api_url: "{{ active_cluster_server | default(cluster_api_url | default('')) }}"
+        current_version: "{{ baseline_cv_parsed.current_version }}"
+        channel: "{{ baseline_cv_parsed.channel }}"
+        cluster_id: "{{ baseline_cv_parsed.cluster_id }}"
+        captured_at: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+      nodes: "{{ baseline_nodes_parsed }}"
+      cluster_operators: "{{ baseline_operators_parsed }}"
+      routes: "{{ baseline_routes_parsed }}"
 
-- name: Assemble complete baseline JSON payload
-  set_fact:
-    baseline_snapshot_payload:
-      metadata:
-        cluster_name: "{{ cluster_name | default('UNKNOWN') }}"
-        timestamp: "{{ resolved_snapshot_timestamp }}"
-        captured_at: "{{ ansible_date_time.iso8601 | default('unknown') }}"
-        kubeconfig_path: "{{ kubeconfig_path }}"
-        ansible_version: "{{ ansible_version.full | default('unknown') }}"
-      clusterversion: "{{ baseline_clusterversion }}"
-      clusteroperators: "{{ baseline_clusteroperators }}"
-      nodes: "{{ baseline_nodes }}"
-      routes: "{{ baseline_routes }}"
-      summary:
-        total_nodes: "{{ baseline_nodes | length }}"
-        total_clusteroperators: "{{ baseline_clusteroperators | length }}"
-        total_routes: "{{ baseline_routes | length }}"
-
-# MIGRATION 2.14: Retest to_nice_json / to_json filter serialization under Python 3
-- name: Write baseline snapshot to {{ resolved_snapshot_file }}
+# ----------------------------------------------------------------------------
+# 4. Persist Snapshot Artifact
+# ----------------------------------------------------------------------------
+# Why: Persists the structured baseline JSON snapshot to disk.
+# Why: This file is the ONLY cross-phase state artifact permitted by architecture.
+- name: "Write immutable baseline JSON snapshot to disk"
   copy:
-    content: "{{ baseline_snapshot_payload | to_nice_json }}"
-    dest: "{{ resolved_snapshot_file }}"
+    content: "{{ baseline_dict | to_nice_json }}"
+    dest: "{{ snapshot_file }}"
     mode: "0644"
 
-- name: Export baseline snapshot path fact for downstream phases
+# ----------------------------------------------------------------------------
+# 5. Export Baseline Facts for Downstream Phases
+# ----------------------------------------------------------------------------
+# Why: Exports facts required by Phase 01 edge check, logging, and Phase 05 diffing.
+- name: "Export baseline snapshot file path and summary facts"
   set_fact:
-    baseline_snapshot_file_path: "{{ resolved_snapshot_file }}"
-    baseline_captured_version: "{{ baseline_clusterversion.desired_version | default('unknown') }}"
-
-- name: Confirm baseline snapshot capture
-  debug:
-    msg: >-
-      ✔ Baseline snapshot written to {{ resolved_snapshot_file }}
-      (Nodes: {{ baseline_nodes | length }},
-       Operators: {{ baseline_clusteroperators | length }},
-       Routes: {{ baseline_routes | length }},
-       Current version: {{ baseline_captured_version }}).
+    baseline_snapshot_file_path: "{{ snapshot_file }}"
+    baseline_current_version: "{{ baseline_cv_parsed.current_version }}"
+    baseline_channel: "{{ baseline_cv_parsed.channel }}"
+    baseline_cluster_id: "{{ baseline_cv_parsed.cluster_id }}"
+    baseline_nodes_count: "{{ baseline_nodes_parsed | length }}"
+    baseline_operators_count: "{{ baseline_operators_parsed | length }}"
+    baseline_routes_count: "{{ baseline_routes_parsed | length }}"

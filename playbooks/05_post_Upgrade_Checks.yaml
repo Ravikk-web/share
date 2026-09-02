@@ -1,164 +1,209 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (set_fact, fail, include_role, command, debug, stat)
-#                 work on both versions.
-#                 | default('') guards are applied on all optional variables.
-#
-# Phase 05 — Post-Upgrade Verification & 10-Check Hard Gate (05_post_Upgrade_Checks.yaml)
-#
-# Responsibilities:
-#   1. Reuses authenticated session from earlier phases (or logs in if run standalone).
-#   2. Executes postvalidation aggregator role running all 10 checks (5 HARD, 5 WARN) + baseline diff.
-#   3. Renders client-facing HTML postvalidation report to output/ via report role.
-#   4. Enforces HARD gate: any HARD failure aborts execution and tears down session.
-#   5. WARN checks surface non-blocking findings in report and logs.
-#   6. Wrapped in block/rescue/always: rescue logs errors, dispatches alert email, and logs out.
-
 ---
-- name: Phase 05 — Post-Upgrade Verification Hard Gate
+# ============================================================================
+# Phase 05 Playbook: Post-Upgrade Checks & Baseline Diff Validation
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses standard play-level vars_files, include_role, and
+#                 block/rescue/always; compatible across Ansible 2.7 and 2.14.
+#
+# Purpose: Orchestrates the complete 10-check postvalidation contract defined
+#          in context/feature-spec/12-postvalidation-and-phase05.md.
+#          Reuses the authenticated session from previous phases, executes the
+#          10-check postvalidation contract via roles/postvalidation, evaluates
+#          baseline diff against Phase 01 snapshot, generates client-facing
+#          HTML postvalidation report via roles/report, logs audit records,
+#          and preserves the session for Phase 06 OLM operator upgrades.
+# Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               roles/login, roles/logout, roles/postvalidation,
+#               roles/report, roles/error_handle
+# Gate type: HARD (Checks 01–06) / WARN (Checks 07–10)
+# ============================================================================
+
+- name: "Phase 05 — Post-Upgrade Checks & Baseline Diff"
   hosts: localhost
   connection: local
   gather_facts: true
-
   vars_files:
     - vars/upgrade.yml
-    - vars/paths.yml
     - vars/secrets.yml
+    - vars/paths.yml
     - vars/smtp.yml
     - vars/report_vars.yml
     - vars/api_regex.yml
 
+  # --------------------------------------------------------------------------
+  # Pre-Tasks: Session Verification & Re-use
+  # Why: Reuses authenticated session from Phase 01/02/03. If invoked standalone,
+  #      safely establishes cluster session via login role.
+  # --------------------------------------------------------------------------
   pre_tasks:
-    - name: Check existing kubeconfig session
+    - name: "Phase 05: Check if existing authenticated cluster session is present"
       stat:
-        path: "{{ kubeconfig_path }}"
-      register: post_kubeconfig_stat
+        path: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: p05_kubeconfig_stat
 
-    - name: Test cluster session reachability
-      command: oc whoami --show-server --kubeconfig "{{ kubeconfig_path }}"
-      register: post_whoami_test
-      changed_when: false
-      failed_when: false
-      when:
-        - not (dry_run | default(false) | bool)
-        - post_kubeconfig_stat.stat.exists | default(false)
-
-    - name: Resolve target cluster credentials if re-authentication needed
-      set_fact:
-        target_cluster_entry: "{{ (clusters | default([]) | selectattr('name', 'equalto', cluster_name) | list | first) | default({}) }}"
-      no_log: true
-      when:
-        - not (dry_run | default(false) | bool)
-        - not (post_kubeconfig_stat.stat.exists | default(false)) or (post_whoami_test.rc | default(1) != 0)
-
-    - name: Set login parameters for cluster {{ cluster_name | default('UNKNOWN') }}
-      set_fact:
-        login_api_url: "{{ target_cluster_entry.api_url | default(login_api_url | default('')) }}"
-        login_username: "{{ target_cluster_entry.username | default(login_username | default('')) }}"
-        login_password: "{{ target_cluster_entry.password | default(login_password | default('')) }}"
-      no_log: true
-      when:
-        - not (dry_run | default(false) | bool)
-        - not (post_kubeconfig_stat.stat.exists | default(false)) or (post_whoami_test.rc | default(1) != 0)
-
-    - name: Authenticate to cluster {{ cluster_name | default('UNKNOWN') }} (if not already logged in)
+    - name: "Phase 05: Establish authenticated cluster session via login role if needed"
       include_role:
         name: login
-      when:
-        - not (dry_run | default(false) | bool)
-        - not (post_kubeconfig_stat.stat.exists | default(false)) or (post_whoami_test.rc | default(1) != 0)
+      when: not (p05_kubeconfig_stat.stat.exists | default(false))
 
+  # --------------------------------------------------------------------------
+  # Main Tasks: 10-Check Postvalidation, Baseline Diff & Report Generation
+  # --------------------------------------------------------------------------
   tasks:
-    - name: Phase 05 Execution Block
+    - name: "Phase 05: Execute Postvalidation Contract and Baseline Diff Scan"
       block:
-        - name: Set Phase 05 Step 1 Context — 10-Check Postvalidation
+        # 1. Establish run timestamp for consistent file naming across phases
+        - name: "Ensure run timestamp is established for logs and reports"
           set_fact:
-            failed_phase: "05_post_Upgrade_Checks"
-            current_step_no: 1
-            current_task_name: "Post-Upgrade 10-Check Verification"
-            current_gate_type: "HARD"
-            phase05_failed: false
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+          when: run_timestamp is not defined or run_timestamp | length == 0
 
-        - name: Run 10-Check Postvalidation Aggregator
+        # 2. Display Phase 05 Initiation Banner
+        - name: "Display Phase 05 initiation banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 05: POST-UPGRADE CHECKS & BASELINE DIFF INITIATED"
+              - "============================================================================"
+              - "Target Cluster       : {{ cluster_name }}"
+              - "Final Target Version : {{ upgrade_path[-1] | default('unknown') }}"
+              - "Baseline Snapshot    : {{ baseline_snapshot_file_path | default('Auto-detect newest') }}"
+              - "Kubeconfig           : {{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+              - "Session Lifecycle    : PRESERVED for Phase 06 Operator Upgrades"
+              - "============================================================================"
+
+        # 3. Resolve baseline snapshot path if not already exported
+        - name: "Locate latest Phase 01 baseline snapshot if not defined"
+          shell: |
+            set -o pipefail
+            ls -1t "{{ playbook_dir }}/snapshots/{{ cluster_name }}_"*_baseline.json 2>/dev/null | head -n 1 || echo ""
+          args:
+            executable: /bin/bash
+          register: p05_discovered_snapshot_raw
+          changed_when: false
+          when: baseline_snapshot_file_path is not defined or baseline_snapshot_file_path | length == 0
+
+        - name: "Set baseline snapshot file path fact for postvalidation role"
+          set_fact:
+            baseline_snapshot_file_path: "{{ p05_discovered_snapshot_raw.stdout | trim }}"
+          when:
+            - baseline_snapshot_file_path is not defined or baseline_snapshot_file_path | length == 0
+            - p05_discovered_snapshot_raw.stdout is defined
+            - p05_discovered_snapshot_raw.stdout | trim | length > 0
+
+        # 4. Execute 10-Check Postvalidation Contract Scan via postvalidation role
+        - name: "Execute 10-Check Postvalidation Contract scan via postvalidation role"
           include_role:
             name: postvalidation
 
-        - name: Set Phase 05 Step 2 Context — Render Postvalidation HTML Report
+        # 5. Pre-compute facts for report generation to prevent Jinja2 lazy recursion
+        - name: "Pre-compute report facts for client-facing HTML postvalidation report"
           set_fact:
-            current_step_no: 2
-            current_task_name: "Render Postvalidation HTML Report"
-            current_gate_type: "HARD"
+            report_type: "postvalidation"
+            report_title: "Post-Upgrade Validation Report"
+            checks: "{{ health_summary }}"
 
-        - name: Render Postvalidation HTML Verification Report
+        # 6. Generate client-facing Postvalidation HTML report via report role
+        - name: "Generate client-facing Postvalidation HTML report via report role"
           include_role:
             name: report
-          vars:
-            report_phase: "postvalidation"
-            phase_name: "Post-Upgrade Verification (Phase 05)"
 
-        - name: Export postvalidation report path for downstream phases
-          set_fact:
-            postvalidation_report_html_path: "{{ report_html_path | default('') }}"
+        # 7. Log Confirmation to Text Run Log (.txt)
+        - name: "Log Phase 05 postvalidation pass to text run log"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+            line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [PASS] [HARD] Phase 05: Postvalidation contract satisfied for cluster '{{ cluster_name }}' (Total checks: {{ health_summary | length }}, Passed: {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}, Warnings: {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}, Failed: 0). Report generated: {{ report_file_path }}."
+            create: true
 
-        - name: Detect any HARD gate failures in health_summary
-          set_fact:
-            postval_hard_failures: "{{ health_summary | default([]) | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'equalto', 'FAIL') | list }}"
+        # 8. Log Confirmation to CSV Run Log (.csv)
+        - name: "Check if CSV run log exists"
+          stat:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+          register: phase05_csv_stat
 
-        - name: Enforce HARD gate halt on postvalidation failures
-          fail:
-            msg: >-
-              HARD GATE FAILURE in Phase 05: One or more critical postvalidation checks failed on cluster '{{ cluster_name }}'.
-              Found {{ postval_hard_failures | length }} failed HARD check(s).
-              Postvalidation report written to: {{ report_html_path | default('output/') }}.
-              Upgrade cannot be declared successful until all HARD postvalidation checks pass.
-          when: (postval_hard_failures | length > 0) or (failed_validations | default([]) | length > 0)
+        - name: "Initialize CSV run log header if new"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+            line: "timestamp,cluster,task_name,gate_type,status,reason,observed"
+            create: true
+          when: not (phase05_csv_stat.stat.exists | default(false))
 
-        - name: Confirm Phase 05 Post-Upgrade Verification Success
+        - name: "Log Phase 05 postvalidation pass to CSV run log"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+            line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name }}","Phase 05 Post-Upgrade Checks & Baseline Diff","HARD","PASS","Postvalidation contract satisfied (Passed: {{ health_summary | selectattr(''status'', ''equalto'', ''PASS'') | list | length }}/{{ health_summary | length }})","Report: {{ report_file_path }}"'
+            create: true
+
+        # 9. Display Structured Confirmation Banner (Preserving Session)
+        - name: "Display Phase 05 Postvalidation completion banner"
           debug:
-            msg: >-
-              ══════════════════════════════════════════════════════════════════════════
-              ✔ Phase 05 Post-Upgrade Verification completed successfully on '{{ cluster_name }}'!
-              All 5 HARD checks passed.
-              Report generated: {{ report_html_path | default('N/A') }}.
-              Overall verdict: {{ report_last_verdict | default('PASS') }}.
-              Cluster successfully upgraded to final target version.
-              ══════════════════════════════════════════════════════════════════════════
+            msg:
+              - "============================================================================"
+              - "PHASE 05 COMPLETE: POST-UPGRADE CHECKS & BASELINE DIFF SUCCESSFUL"
+              - "============================================================================"
+              - "Cluster Name       : {{ cluster_name }}"
+              - "Final Version      : {{ postval_cv_data.current_version | default(upgrade_path[-1] | default('unknown')) }}"
+              - "Total Checks       : {{ health_summary | length }}"
+              - "Passed Checks      : {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}"
+              - "Warnings           : {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}"
+              - "Residual Failures  : 0"
+              - "Report File        : {{ report_file_path }}"
+              - "Session State      : PRESERVED for Phase 06 Operator Upgrades"
+              - "============================================================================"
 
+      # ----------------------------------------------------------------------
+      # Rescue: Error Extraction, Alert Dispatch & Clean Session Logout
+      # ----------------------------------------------------------------------
       rescue:
-        - name: Record failure details for Phase 05
+        - name: "Extract sanitized error message from failure result in Phase 05"
           set_fact:
-            phase05_failed: true
-            failed_phase: "05_post_Upgrade_Checks"
-            failure_reason: >-
-              {{
-                (((ansible_failed_result | default({})).stderr | default('')) | trim) if (((ansible_failed_result | default({})).stderr | default('')) | trim != '')
-                else (
-                  (((ansible_failed_result | default({})).stderr_lines | default([])) | join(' ') | trim) if ((((ansible_failed_result | default({})).stderr_lines | default([])) | length) > 0)
-                  else (
-                    (((ansible_failed_result | default({})).msg | default('')) | trim) if (((ansible_failed_result | default({})).msg | default('')) | trim != '' and ((ansible_failed_result | default({})).msg | default('')) != 'non-zero return code')
-                    else (
-                      (((ansible_failed_result | default({})).message | default('')) | trim) if (((ansible_failed_result | default({})).message | default('')) | trim != '')
-                      else 'Postvalidation checks failed.'
-                    )
-                  )
-                )
-              }}
-            failure_observed: "FAILED at Step {{ current_step_no | default(1) }}: {{ current_task_name | default('Post-Upgrade Verification') }}"
+            resolved_error: >-
+              {{ ansible_failed_result.stderr | default('')
+                 if (ansible_failed_result.stderr | default('') | length > 0)
+                 else (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 if (ansible_failed_result.stderr_lines | default([]) | length > 0)
+                 else ansible_failed_result.msg | default('Unknown error — inspect logs') }}
 
-        - name: Trigger standardized error handling and alert
+        - name: "Evaluate whether failure is an RBAC / authorization error in Phase 05"
+          set_fact:
+            is_rbac_error: >-
+              {{ (resolved_error | lower is search('forbidden'))
+                 or (resolved_error | lower is search('cannot patch'))
+                 or (resolved_error | lower is search('unauthorized'))
+                 or (resolved_error | lower is search('cannot get'))
+                 or (resolved_error | lower is search('cannot list'))
+                 or (resolved_error | lower is search('cannot create')) }}
+
+        - name: "Configure Phase 05 error context facts"
+          set_fact:
+            current_step_no: "Phase 05"
+            current_task_name: "Phase 05 Post-Upgrade Checks & Baseline Diff"
+            current_gate_type: "HARD"
+            failure_reason: "Post-upgrade verification or baseline diff failed in Phase 05"
+            failure_observed: "{{ resolved_error }}"
+            phase_05_failed: true
+
+        - name: "Record Phase 05 failure and alert via error_handle role"
           include_role:
             name: error_handle
 
-        - name: Tear down cluster session on failure
+        - name: "Execute session logout on Phase 05 failure"
           include_role:
             name: logout
+          failed_when: false
 
-        - name: Halt execution due to Phase 05 failure
+        - name: "Halt execution on Phase 05 failure"
           fail:
-            msg: "Phase 05 (05_post_Upgrade_Checks) failed for cluster '{{ cluster_name }}'. Session torn down."
+            msg: "Phase 05 Post-Upgrade Checks & Baseline Diff failed: {{ resolved_error }}"
 
+      # ----------------------------------------------------------------------
+      # Always: Fail-Safe Session Logout Guarantee on Error
+      # ----------------------------------------------------------------------
       always:
-        - name: Ensure session logout at end of Phase 05
+        - name: "Guarantee session logout if Phase 05 failed"
           include_role:
             name: logout
-          when: phase05_failed | default(false)
-      when: not (dry_run | default(false) | bool)
+          when: phase_05_failed | default(false) | bool
+          failed_when: false

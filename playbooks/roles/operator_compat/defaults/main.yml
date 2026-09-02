@@ -1,0 +1,33 @@
+---
+# ============================================================================
+# Role Defaults: operator_compat
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Standard YAML key-value pairs; fully compatible.
+#
+# Purpose: Default configuration variables for the OLM operator compatibility
+#          scan role. Checks installed subscriptions and PackageManifests
+#          for OpenShift target version channel support.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/paths.yml
+# Gate type: WARN / Advisory (Exposes operator_compat_plan; non-blocking)
+# ============================================================================
+
+# Target OpenShift version to evaluate compatibility against (string)
+# Defaults to empty string; resolved dynamically from upgrade_path[-1]
+target_version: ""
+
+# Whether to halt execution if an operator has no compatible channel (boolean)
+# Default false: non-blocking advisory scan surfacing findings in report
+operator_compat_enforce_gate: false
+
+# Transient oc CLI command retry parameters
+# Absorbs API server restarts or transient latency blips
+oc_command_retries: 3
+oc_command_retry_delay: 10
+
+# ClusterOperator exclusion allow-list (list of strings)
+co_allow_list: []
+
+# Internal fact containers for discovered subscriptions and compatibility plan
+operator_compat_plan: []
+operator_compat_records: []

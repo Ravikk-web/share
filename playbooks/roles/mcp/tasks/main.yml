@@ -1,132 +1,109 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (shell, command, fail, set_fact, debug)
-#                 work on both versions. Replace with FQCN only if adopting the
-#                 ansible.builtin.* convention project-wide.
-#                 | default('') guards are applied on all optional variables.
-#
-# mcp role — validates MachineConfigPool (MCP) health (HARD gate).
-#
-# Contract:
-#   - Queries `oc get mcp -o json` piped to `jq`.
-#   - Read-only operation; changed_when: false.
-#   - Asserts every MachineConfigPool is Updated=True, Degraded=False, and spec.paused=false.
-#   - Respects optional mcp_allow_list override for permitted exceptions.
-#   - HARD gate: fails with explicit error naming cluster and failing pools.
-#   - Exposes parsed MCP facts (mcp_parsed_data, mcp_all_pools, mcp_offending_pools)
-#     for direct reuse by monitor / settle-gate without logic duplication.
-#   - Records a structured PASS entry into `health_summary` list via set_fact.
-
 ---
-# Shell module chosen to pipe oc get mcp JSON output to jq (v1.5 compatible)
-- name: Query MachineConfigPools and evaluate health conditions — oc get mcp
-  shell: >-
-    oc get mcp -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-      .items // [] | {
-        "pools": [
-          .[] | {
-            "name": .metadata.name,
-            "paused": (.spec.paused // false),
-            "machine_count": (.status.machineCount // 0),
-            "ready_machine_count": (.status.readyMachineCount // 0),
-            "updated_machine_count": (.status.updatedMachineCount // 0),
-            "updating_machine_count": (.status.updatingMachineCount // 0),
-            "degraded_machine_count": (.status.degradedMachineCount // 0),
-            "updated": ([.status.conditions[]? | select(.type=="Updated") | .status][0] // "Unknown"),
-            "updating": ([.status.conditions[]? | select(.type=="Updating") | .status][0] // "Unknown"),
-            "degraded": ([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "Unknown"),
-            "node_degraded": ([.status.conditions[]? | select(.type=="NodeDegraded") | .status][0] // "Unknown"),
-            "render_degraded": ([.status.conditions[]? | select(.type=="RenderDegraded") | .status][0] // "Unknown")
-          }
-        ],
-        "offenders": [
-          .[] | {
-            "name": .metadata.name,
-            "paused": (.spec.paused // false),
-            "machine_count": (.status.machineCount // 0),
-            "ready_machine_count": (.status.readyMachineCount // 0),
-            "updated_machine_count": (.status.updatedMachineCount // 0),
-            "updating_machine_count": (.status.updatingMachineCount // 0),
-            "degraded_machine_count": (.status.degradedMachineCount // 0),
-            "updated": ([.status.conditions[]? | select(.type=="Updated") | .status][0] // "Unknown"),
-            "updating": ([.status.conditions[]? | select(.type=="Updating") | .status][0] // "Unknown"),
-            "degraded": ([.status.conditions[]? | select(.type=="Degraded") | .status][0] // "Unknown"),
-            "node_degraded": ([.status.conditions[]? | select(.type=="NodeDegraded") | .status][0] // "Unknown"),
-            "render_degraded": ([.status.conditions[]? | select(.type=="RenderDegraded") | .status][0] // "Unknown")
-          } | select(.updated != "True" or .degraded != "False" or .paused == true)
-        ]
-      }
-    '
-  register: mcp_raw_query
+# ============================================================================
+# Role Tasks: mcp (MachineConfigPools)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, fail, debug).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Verifies that all MachineConfigPools are synchronized (Updated=True),
+#          unpaused (spec.paused=false), and not degraded prior to upgrade.
+#          Exports mcp_parsed_data and mcp_all_pools for monitor/remediate roles.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: HARD
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Query MachineConfigPools via oc CLI & jq v1.5
+# Why: oc get mcp -o json parsed with jq 1.5 extracts conditions and machine counts.
+# Why: Shell with set -o pipefail and executable: /bin/bash captures pipeline errors.
+# Why: Parentheses around // operands satisfy jq 1.5 operator precedence rules.
+# ----------------------------------------------------------------------------
+- name: "Query live MachineConfigPools and parse status conditions via jq"
+  shell: |
+    set -o pipefail
+    oc get mcp -o json | jq -c '
+      {
+        pools: [.items[] | {
+          name: .metadata.name,
+          paused: (.spec.paused // false),
+          updated: (((.status.conditions // []) | map(select(.type == "Updated")) | .[0].status) // "False" | tostring),
+          updating: (((.status.conditions // []) | map(select(.type == "Updating")) | .[0].status) // "False" | tostring),
+          degraded: (((.status.conditions // []) | map(select(.type == "Degraded")) | .[0].status) // "True" | tostring),
+          machine_count: (.status.machineCount // 0),
+          updated_machine_count: (.status.updatedMachineCount // 0),
+          ready_machine_count: (.status.readyMachineCount // 0),
+          unavailable_machine_count: (.status.unavailableMachineCount // 0),
+          degraded_machine_count: (.status.degradedMachineCount // 0)
+        }],
+        paused_pools: [.items[] | select((.spec.paused // false) == true) | .metadata.name],
+        degraded_pools: [.items[] | select((((.status.conditions // []) | map(select(.type == "Degraded")) | .[0].status) // "True" | tostring) == "True") | .metadata.name],
+        not_updated_pools: [.items[] | select((((.status.conditions // []) | map(select(.type == "Updated")) | .[0].status) // "False" | tostring) != "True") | .metadata.name]
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: mcp_query_raw
   changed_when: false
   failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: mcp_query_raw.rc == 0
 
-- name: Evaluate MachineConfigPools query execution
-  fail:
-    msg: >-
-      Failed to query MachineConfigPools for cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      Command exited with code {{ mcp_raw_query.rc | default(1) }}.
-      Error: {{ mcp_raw_query.stderr | default(mcp_raw_query.stdout | default('No output')) | trim }}.
-      Check kubeconfig path ({{ kubeconfig_path }}) and cluster reachability.
-  when: (mcp_raw_query.rc | default(1) != 0) or (mcp_raw_query.stdout | default('') | trim == '')
-
-- name: Parse MachineConfigPools JSON payload
+# ----------------------------------------------------------------------------
+# 2. Export Facts for Monitor and Remediate Roles
+# Why: Exports mcp_parsed_data and mcp_all_pools as mandated by system contract.
+# Why: Bracket notation ['pools'] avoids collision with Python dict.items().
+# ----------------------------------------------------------------------------
+- name: "Export MachineConfigPool facts for monitor and remediate roles"
   set_fact:
-    mcp_parsed_data: "{{ mcp_raw_query.stdout | from_json }}"
+    mcp_parsed_data: "{{ (mcp_query_raw.stdout | default('{}') | from_json)['pools'] | default([]) }}"
+    mcp_all_pools: "{{ (mcp_query_raw.stdout | default('{}') | from_json)['pools'] | default([]) | map(attribute='name') | list }}"
+    mcp_paused_pools: "{{ (mcp_query_raw.stdout | default('{}') | from_json)['paused_pools'] | default([]) }}"
+    mcp_degraded_pools: "{{ (mcp_query_raw.stdout | default('{}') | from_json)['degraded_pools'] | default([]) }}"
+    mcp_not_updated_pools: "{{ (mcp_query_raw.stdout | default('{}') | from_json)['not_updated_pools'] | default([]) }}"
 
-- name: Extract all MachineConfigPools list
+- name: "Identify combined list of offending MachineConfigPools"
   set_fact:
-    mcp_all_pools: "{{ mcp_parsed_data.pools | default([]) }}"
+    mcp_offending_pools: "{{ (mcp_paused_pools + mcp_degraded_pools + mcp_not_updated_pools) | unique }}"
+    mcp_check_valid: "{{ ((mcp_paused_pools + mcp_degraded_pools + mcp_not_updated_pools) | unique | length) == 0 }}"
 
-- name: Validate at least one MachineConfigPool was discovered
-  fail:
-    msg: >-
-      MachineConfigPool check FAILED (HARD gate) for cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      No MachineConfigPools found in cluster response.
-  when: (mcp_all_pools | length) == 0
-
-- name: Initialize offending MachineConfigPools list
+# ----------------------------------------------------------------------------
+# 3. Construct Structured Health Record & Append to Summary
+# Why: Appends structured dictionary into health_summary for reporting.
+# ----------------------------------------------------------------------------
+- name: "Construct structured mcp health record"
   set_fact:
-    mcp_offending_pools: []
+    mcp_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "MachineConfigPools Synchronization"
+      gate: "HARD"
+      status: "{{ 'PASS' if (mcp_check_valid | bool) else 'FAIL' }}"
+      observed: >-
+        {{ ('All ' ~ (mcp_all_pools | length) ~ ' MCPs synchronized and unpaused (' ~ (mcp_all_pools | join(', ')) ~ ')')
+           if (mcp_check_valid | bool)
+           else ('Offending MCPs: paused=[' ~ (mcp_paused_pools | join(', ')) ~ '], degraded=[' ~ (mcp_degraded_pools | join(', ')) ~ '], not_updated=[' ~ (mcp_not_updated_pools | join(', ')) ~ ']') }}
 
-- name: Filter offending MachineConfigPools against mcp_allow_list
+- name: "Record mcp result to health_summary tracking list"
   set_fact:
-    mcp_offending_pools: "{{ mcp_offending_pools + [item] }}"
-  loop: "{{ mcp_parsed_data.offenders | default([]) }}"
-  when: item.name not in (mcp_allow_list | default([]))
+    health_summary: "{{ (health_summary | default([])) + [mcp_health_item] }}"
 
-- name: Display MachineConfigPools inspection summary
+- name: "Log MachineConfigPool evaluation outcome"
   debug:
-    msg: >-
-      Cluster '{{ cluster_name | default('UNKNOWN') }}': Scanned {{ mcp_all_pools | length }} pool(s).
-      Found {{ mcp_offending_pools | length }} failing pool(s)
-      (Allow-listed: {{ mcp_allow_list | default([]) | length }}).
+    msg:
+      - "Check        : {{ mcp_health_item.name }}"
+      - "Status       : {{ mcp_health_item.status }}"
+      - "Observed     : {{ mcp_health_item.observed }}"
+      - "Gate Enforced: {{ mcp_enforce_gate | default(true) | bool }}"
 
-- name: Enforce HARD gate on MachineConfigPools health
+# ----------------------------------------------------------------------------
+# 4. Enforce HARD Gate
+# Why: Halts execution immediately if any MCP is paused, degraded, or not updated.
+# ----------------------------------------------------------------------------
+- name: "Enforce HARD gate for MachineConfigPools check"
   fail:
-    msg: >-
-      MachineConfigPool check FAILED (HARD gate) on cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      Found {{ mcp_offending_pools | length }} unhealthy/unready/paused MachineConfigPool(s):
-      {% for pool in mcp_offending_pools %}
-        - {{ pool.name }}: Updated={{ pool.updated | default('Unknown') }}, Degraded={{ pool.degraded | default('Unknown') }}, Paused={{ pool.paused | default(false) }}, Ready={{ pool.ready_machine_count | default(0) }}/{{ pool.machine_count | default(0) }}
-      {% endfor %}
-      All MachineConfigPools must report Updated=True, Degraded=False, and Paused=False before upgrade operations can proceed.
-  when: (mcp_offending_pools | length) > 0
-
-- name: Record mcp PASS in health_summary
-  set_fact:
-    health_summary: "{{ (health_summary | default([])) + [mcp_summary_entry] }}"
-  vars:
-    mcp_summary_entry:
-      id: "{{ mcp_id | default('04') }}"
-      name: "{{ mcp_name | default('Machine Config Pool (MCP) Health') }}"
-      gate: "{{ mcp_gate | default('HARD') }}"
-      status: "PASS"
-      observed: "All {{ mcp_all_pools | length }} pools are Updated=True, Degraded=False, and not paused"
-      details: "Verified {{ mcp_all_pools | length }} machine config pools on {{ cluster_name | default('cluster') }}"
-      raw_output: "{{ mcp_all_pools | to_json }}"
-
-- name: Confirm MachineConfigPools health passed
-  debug:
-    msg: >-
-      ✔ PASS [Check {{ mcp_id | default('04') }} - {{ mcp_name | default('Machine Config Pool (MCP) Health') }}] —
-      All {{ mcp_all_pools | length }} MachineConfigPools healthy (Updated=True, Degraded=False, Paused=False).
+    msg: "HARD GATE FAILURE [mcp]: One or more MachineConfigPools are unhealthy or paused on cluster '{{ cluster_name }}'. Paused: {{ mcp_paused_pools | to_json }}, Degraded: {{ mcp_degraded_pools | to_json }}, Not Updated: {{ mcp_not_updated_pools | to_json }}."
+  when:
+    - not (mcp_check_valid | bool)
+    - mcp_enforce_gate | default(true) | bool

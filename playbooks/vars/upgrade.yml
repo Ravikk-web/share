@@ -1,79 +1,105 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable definitions.
+# ============================================================================
+# Global Upgrade Configuration & Auto-Remediation Controls
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar, list, and dictionary values.
 #
-# =============================================================================
-# Upgrade Target Cluster & Version Sequence Configuration
-# =============================================================================
-# Manually enter your target cluster name and ordered sequence of target
-# OpenShift / ARO cluster versions below. All automation actions dynamically
-# refer to the cluster name and versions configured here.
-#
-# Supports:
-#   - Dynamic target cluster selection (credentials resolved from vars/secrets.yml)
-#   - Y-stream (minor) sequential hops (e.g. 4.14.40 -> 4.15.35 -> 4.16.20)
-#   - Z-stream (patch) updates (e.g. 4.14.38 -> 4.14.40)
-# =============================================================================
+# Purpose: Defines the target cluster name, target sequential upgrade path,
+#          per-cluster pre-configured paths, health check & capacity thresholds,
+#          monitoring polling cadences, timeout limits, and feature toggles
+#          for the one-touch automated remediation engine.
+# Dependencies: None (base input configuration)
+# Gate type: N/A
+# ============================================================================
 
----
-# --- Target Cluster Name -----------------------------------------------------
-# Enter the target cluster identifier below (must match an entry in vars/secrets.yml).
-# All upgrade lifecycle actions (login, snapshot, prevalidation, monitoring,
-# reporting, and logs) will dynamically target this cluster.
-#
-# Examples: "cluster-d01", "cluster-s01", "cluster-p01", "aro-prod-01"
-cluster_name: "cluster-d01"
+# Target cluster identifier (string, required).
+# Can be set here, passed via CLI flag (--cluster <name>), or selected interactively.
+cluster_name: ""
 
-# --- Upgrade Path (Enter target cluster versions here) ------------------------
-# Ordered list of target OpenShift versions to upgrade through sequentially.
-# Each version is validated against available update edges prior to upgrading.
-#
-# Example Y-stream hops:
-#   upgrade_path:
-#     - "4.14.40"
-#     - "4.15.35"
-#
-# Example Z-stream patch:
-#   upgrade_path:
-#     - "4.14.40"
-upgrade_path:
-  - "4.14.40"
-  - "4.15.35"
+# Target sequential upgrade path (list of strings, e.g. ["4.14.40", "4.15.35"]).
+# Must adhere to strict minor version sequential hops (never skip Y-stream versions).
+upgrade_path: []
 
-# --- Optional: Per-Cluster Version Overrides ---------------------------------
-# If you manage multiple clusters and want distinct version sequences per
-# cluster, define them below. If defined for a cluster, it takes precedence
-# over the global upgrade_path.
-cluster_upgrade_paths: {}
-#   cluster-d01:
-#     - "4.14.40"
-#     - "4.15.35"
-#   cluster-p01:
-#     - "4.15.35"
+# Pre-configured upgrade paths per cluster.
+# Consumed by the CLI interactive menu to suggest default or recommended hop journeys.
+cluster_upgrade_paths:
+  cluster_d01:
+    - "4.14.40"
+    - "4.15.35"
+    - "4.16.18"
+  cluster_s01:
+    - "4.14.40"
+    - "4.15.35"
+    - "4.16.18"
+  cluster_p01:
+    - "4.14.40"
+    - "4.15.35"
 
-# --- Capacity Thresholds (Requests-based) ------------------------------------
-# Prevalidation HARD gate: node and cluster capacity requests must remain
-# strictly below these percentages before an upgrade can begin.
+# ----------------------------------------------------------------------------
+# Health Check & Capacity Thresholds
+# ----------------------------------------------------------------------------
+# Maximum node CPU utilization percentage allowed before flagging a warning
 max_cpu_percent: 90
+
+# Maximum node memory utilization percentage allowed before flagging a warning
 max_memory_percent: 90
 
-# Prevalidation WARN threshold: projected remaining capacity during 1-node drain
-max_drain_headroom_percent: 95
+# Enforce strict PodDisruptionBudget check (fail if any PDB allows 0 disruptions)
+fail_on_zero_disruption_pdb: true
 
-# --- Monitoring Cadences -----------------------------------------------------
-# poll_interval_minutes: how often to poll oc get clusterversion/mcp/nodes (Phase 04)
-# hop_timeout_minutes:   maximum allowed time for a single hop MCP to complete
-# heartbeat_minutes:     interval between HTML heartbeat emails (Phase 04)
+# ----------------------------------------------------------------------------
+# Monitoring Cadences & Timeout Protection (Phase 04)
+# ----------------------------------------------------------------------------
+# Polling interval in minutes between clusterversion/MCP/node health queries
 poll_interval_minutes: 2
+
+# Maximum duration in minutes to wait for a single hop to reach settle-gate
 hop_timeout_minutes: 90
+
+# Cadence in minutes for dispatching progress heartbeat status emails
 heartbeat_minutes: 20
 
-# --- Pod Disruption Budget (PDB) Gate ----------------------------------------
-# If true, a PodDisruptionBudget with maxUnavailable=0 (or minAvailable=replicas)
-# is treated as a HARD failure in prevalidation. If false, treated as WARN.
-fail_on_zero_disruption_pdb: false
+# ----------------------------------------------------------------------------
+# Auto-Remediation Engine Controls (One-Touch Automation)
+# ----------------------------------------------------------------------------
+# Master toggle: enables automated blocker detection and remediation
+auto_remediation_enabled: true
 
-# --- Allowed Unschedulable Nodes ---------------------------------------------
-# Nodes listed here are permitted to be SchedulingDisabled / cordoned
-# during prevalidation without triggering a HARD failure.
-# Note: NotReady nodes are NEVER permitted, even if listed here.
-allowed_unschedulable_nodes: []
+# Tier 1 Auto-Fix: Automatically patch nodes.config/cluster to spec.cgroupMode: "v2"
+# when upgrading to OpenShift 4.19 or higher if currently on cgroup v1.
+auto_fix_cgroup_v2: true
+
+# Tier 1 Auto-Fix: Dynamically extract pending admin acknowledgements from
+# ClusterVersion conditions and apply them to openshift-config/admin-acks ConfigMap.
+auto_apply_admin_acks: true
+
+# Tier 1 Auto-Fix: Automatically unpause MachineConfigPools present in the allow-list.
+auto_unpause_mcp: true
+
+# Allow-list of MachineConfigPool names permitted for automated unpausing.
+mcp_auto_unpause_list:
+  - "worker"
+  - "master"
+
+# Tier 2 Guided: Attempt restart of degraded ClusterOperator pods during prevalidation
+# (Default false; requires explicit cluster-level opt-in).
+auto_restart_degraded_operators: false
+
+# Tier 2 Guided: Force MachineConfigDaemon progress on stalled nodes via force file
+# (Default false; requires explicit cluster-level opt-in).
+auto_force_stalled_node: false
+
+# Threshold in minutes a node can remain in updating state before being marked stalled
+node_stall_threshold_minutes: 30
+
+# Maximum retry attempts for failed OLM ClusterServiceVersion rollouts in Phase 06
+operator_upgrade_retry_count: 1
+
+# ----------------------------------------------------------------------------
+# Transient Fault Tolerance & Command Retries
+# ----------------------------------------------------------------------------
+# Maximum retries for oc CLI queries to absorb transient network / API server hiccups
+oc_command_retries: 3
+
+# Delay in seconds between oc CLI retry attempts
+oc_command_retry_delay: 10

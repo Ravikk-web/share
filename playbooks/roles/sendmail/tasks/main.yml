@@ -1,91 +1,80 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (mail, set_fact, debug, fail) work
-#                 identically on both 2.7.17 and 2.14.18.
-#                 | default('') guards are applied on all optional variables.
-#
-# Sendmail role — renders HTML email templates (progress-mail.j2, error-report.j2)
-# and dispatches colour-coded HTML MIME emails via Ansible's native mail module.
-#
-# Contract:
-#   - Accepts either `mail_html_body` directly or `mail_template` to render.
-#   - Formats `mail_to` (list or string) into a valid comma-separated RFC 5322 header.
-#   - Uses native `mail` module connecting directly to smtp_host:smtp_port over SMTP.
-#   - Supports optional file attachments via `mail_attach` list or path.
-#   - Never outputs credentials or secrets in email bodies or logs.
-#
-# Required variables (supplied by caller or vars/smtp.yml):
-#   - mail_to      — recipient email address (string) or list of addresses
-#   - mail_from    — sender email address
-#   - mail_subject — subject line for the email
-#   - mail_template OR mail_html_body — template file or pre-rendered HTML content
-
 ---
-# --- 1. Validate required email parameters -----------------------------------
-- name: Validate email recipients (mail_to) are provided
-  fail:
-    msg: >-
-      Sendmail role failed: 'mail_to' is empty or not defined.
-      Please supply at least one recipient address in vars/smtp.yml or role params.
-  when: (mail_to | default([]) | length) == 0
+# ============================================================================
+# Role Tasks: sendmail
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (mail, set_fact, assert).
+#
+# Purpose: Renders Jinja2 HTML templates and dispatches notification emails via
+#          Ansible's native direct SMTP mail module (Python smtplib). Enforces
+#          a strict template rendering lifecycle with mandatory post-dispatch
+#          fact resets to prevent stale body caching across upgrade hops.
+# Dependencies: playbooks/vars/smtp.yml, playbooks/vars/report_vars.yml
+# Gate type: N/A (Notification dispatch)
+# ============================================================================
 
-- name: Validate email subject (mail_subject) is provided
-  fail:
-    msg: >-
-      Sendmail role failed: 'mail_subject' is empty or not defined.
-  when: (mail_subject | default('') | length) == 0
-
-# --- 2. Format recipient list ------------------------------------------------
-- name: Format recipient list into comma-separated string for MIME header
+# ----------------------------------------------------------------------------
+# 1. Template Path Resolution
+# ----------------------------------------------------------------------------
+- name: "Resolve email template path"
   set_fact:
-    mail_to_formatted: "{{ mail_to if (mail_to is string) else (mail_to | default([]) | join(', ')) }}"
+    resolved_template_path: >-
+      {{ mail_template
+         if (mail_template.startswith('/') or (mail_template | length > 1 and mail_template[1] == ':'))
+         else (playbook_dir ~ '/templates/' ~ (mail_template | regex_replace('^templates/', ''))) }}
+  when: mail_template | default('') | length > 0
 
-# --- 3. Resolve and render template if mail_template is provided -------------
-- name: Resolve email template path
+# ----------------------------------------------------------------------------
+# 2. Template Rendering Lifecycle
+# Always render fresh HTML from disk — never reuse cached mail_html_body
+# ----------------------------------------------------------------------------
+- name: "Render email HTML template"
   set_fact:
-    mail_template_resolved: "{{ mail_template if ('/' in (mail_template | default(''))) else (playbook_dir ~ '/templates/' ~ (mail_template | default(''))) }}"
-  when: (mail_template | default('') | length) > 0
+    mail_html_body: "{{ lookup('template', resolved_template_path) }}"
+  when: mail_template | default('') | length > 0
 
-- name: Render HTML body from template ({{ mail_template | default('none') }})
-  set_fact:
-    mail_rendered_content: "{{ lookup('template', mail_template_resolved) }}"
-  when: (mail_template | default('') | length) > 0
+# ----------------------------------------------------------------------------
+# 3. Pre-Dispatch Validation
+# ----------------------------------------------------------------------------
+- name: "Validate email parameters prior to dispatch"
+  assert:
+    that:
+      - mail_html_body | default('') | length > 0
+      - mail_to | default([]) | length > 0
+    fail_msg: >-
+      Email dispatch aborted: either mail_html_body is empty
+      (resolved_template_path: {{ resolved_template_path | default('none') }})
+      or mail_to recipient list is empty.
 
-- name: Set final email body
-  set_fact:
-    mail_final_body: "{{ mail_rendered_content if (mail_template | default('') | length > 0) else (mail_html_body | default('')) }}"
-
-- name: Validate email HTML body is populated
-  fail:
-    msg: >-
-      Sendmail role failed: neither 'mail_html_body' nor a valid 'mail_template'
-      produced an email body to send.
-  when: (mail_final_body | default('') | length) == 0
-
-# --- 4. Native SMTP delivery via Ansible mail module -------------------------
-- name: Send HTML email via SMTP
+# ----------------------------------------------------------------------------
+# 4. Native SMTP Dispatch
+# Dispatched on localhost via Python smtplib (no local MTA / sendmail binary)
+# ----------------------------------------------------------------------------
+- name: "Dispatch email notification via direct SMTP"
   mail:
-    host: "{{ smtp_host | default('smtp.example.com') }}"
-    port: "{{ smtp_port | default(25) | int }}"
-    from: "{{ mail_from | default('aro-upgrade@example.com') }}"
-    to: "{{ mail_to_formatted }}"
+    host: "{{ smtp_host }}"
+    port: "{{ smtp_port | int }}"
+    from: "{{ mail_from }}"
+    to: "{{ mail_to }}"
     subject: "{{ mail_subject }}"
-    subtype: "{{ mail_subtype | default('html') }}"
-    charset: "{{ mail_charset | default('UTF-8') }}"
-    body: "{{ mail_final_body }}"
-    attach: "{{ (mail_attach if (mail_attach is sequence and mail_attach is not string) else [mail_attach]) if (mail_attach is defined and mail_attach | length > 0) else omit }}"
+    body: "{{ mail_html_body }}"
+    subtype: html
+    charset: "{{ mail_charset | default('utf-8') }}"
+    attach: "{{ mail_attachments | default([]) }}"
+    username: "{{ smtp_username if (smtp_username | default('') | length > 0) else omit }}"
+    password: "{{ smtp_password if (smtp_password | default('') | length > 0) else omit }}"
+    secure: "{{ smtp_secure if (smtp_secure | default('') | length > 0) else omit }}"
   delegate_to: localhost
 
-- name: Confirm HTML email dispatched
-  debug:
-    msg: >-
-      ✔ HTML email dispatched via SMTP ({{ smtp_host | default('smtp.example.com') }}:{{ smtp_port | default(25) }})
-      to '{{ mail_to_formatted }}' with subject '{{ mail_subject }}'.
-
-# --- 5. Clean up per-dispatch facts to prevent bleed across calls ------------
-- name: Reset per-dispatch email facts
+# ----------------------------------------------------------------------------
+# 5. Post-Dispatch Fact Cleanup (Anti-Pattern Prevention)
+# Clears body, attachment, and template facts to guarantee subsequent hops
+# or alert dispatches never inherit stale data from previous executions.
+# ----------------------------------------------------------------------------
+- name: "Reset email body facts to prevent cross-hop caching"
   set_fact:
     mail_html_body: ""
-    mail_rendered_content: ""
     mail_final_body: ""
-    mail_template_resolved: ""
-
+    mail_attachments: []
+    mail_template: ""
+    resolved_template_path: ""

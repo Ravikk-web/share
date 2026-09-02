@@ -1,0 +1,239 @@
+---
+# ============================================================================
+# Role Tasks: remediate - cgroup_v2 (Blocker 1)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, debug, fail, lineinfile, stat).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Detects and automatically remediates CGroup v1 configurations on
+#          OpenShift clusters. OpenShift 4.19+ deprecates and removes cgroup v1,
+#          causing upgrades to halt with Upgradeable=False. Patches
+#          nodes.config/cluster to spec.cgroupMode: "v2" and verifies update.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/paths.yml
+# Gate type: HARD (Remediated: AUTO-FIXED / FIX-FAILED)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Detect Condition: Query live nodes.config/cluster via oc CLI & jq v1.5
+# Why: Resilient oc query with retry protection handles transient API server blips.
+# Why: jq 1.5 expression extracts spec.cgroupMode with fallback to "v1".
+# ----------------------------------------------------------------------------
+- name: "Query cluster nodes.config to detect current cgroupMode"
+  shell: |
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "v1") | tostring'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: cgroup_detect_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: cgroup_detect_raw.rc == 0
+
+- name: "Evaluate whether cgroupMode requires v2 migration"
+  set_fact:
+    detected_cgroup_mode: "{{ cgroup_detect_raw.stdout | default('v1') | trim }}"
+    cgroup_needs_patch: "{{ (cgroup_detect_raw.stdout | default('v1') | trim) != 'v2' }}"
+
+- name: "Log current CGroup mode status"
+  debug:
+    msg:
+      - "Component    : nodes.config/cluster"
+      - "Current Mode : {{ detected_cgroup_mode }}"
+      - "Patch Needed : {{ cgroup_needs_patch | bool }}"
+      - "Toggle State : {{ auto_fix_cgroup_v2 | default(true) | bool }}"
+
+# ----------------------------------------------------------------------------
+# 2. Skip if Already CGroup v2
+# ----------------------------------------------------------------------------
+- name: "Confirm cluster already configured for cgroupMode v2"
+  debug:
+    msg: "[PASS] Cluster is already configured with cgroupMode: v2. No remediation required."
+  when: not (cgroup_needs_patch | bool)
+
+# ----------------------------------------------------------------------------
+# 3. Apply Deterministic Remediation: Patch nodes.config/cluster to v2
+# Why: Gated behind master auto_remediation_enabled and specific auto_fix_cgroup_v2.
+# ----------------------------------------------------------------------------
+- name: "[AUTO-FIX] Patch cluster cgroupMode to v2"
+  shell: "oc patch nodes.config/cluster -p '{\"spec\":{\"cgroupMode\":\"v2\"}}' --type=merge"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: cgroup_patch_result
+  changed_when: true
+  failed_when: false
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+
+# ----------------------------------------------------------------------------
+# 4. Re-Verify Condition: Query nodes.config/cluster for spec.cgroupMode
+# Why: Confirms deterministic patch was accepted by the Kubernetes API server.
+# ----------------------------------------------------------------------------
+- name: "Verify cgroupMode configuration updated on cluster"
+  shell: "oc get nodes.config/cluster -o jsonpath='{.spec.cgroupMode}'"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: verified_cgroup
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: verified_cgroup.rc == 0
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+
+- name: "Evaluate cgroupMode re-verification outcome"
+  set_fact:
+    cgroup_patch_verified: "{{ (verified_cgroup.stdout | default('') | trim) == 'v2' }}"
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+
+# ----------------------------------------------------------------------------
+# 5. Handle Disabled Auto-Fix State
+# ----------------------------------------------------------------------------
+- name: "Log warning if cgroup remediation is disabled but patch is required"
+  debug:
+    msg: "[WARN] Cluster is running cgroupMode: {{ detected_cgroup_mode }}, but auto_fix_cgroup_v2 is disabled. Blocker remains unmitigated."
+  when:
+    - cgroup_needs_patch | bool
+    - not (auto_remediation_enabled | default(true) | bool) or not (auto_fix_cgroup_v2 | default(true) | bool)
+
+# ----------------------------------------------------------------------------
+# 6. Update Tracking Facts: autofix_items & health_summary
+# Why: Records structured outcome for downstream HTML reports and email digests.
+# ----------------------------------------------------------------------------
+- name: "Append CGroup v2 remediation record to autofix_items"
+  set_fact:
+    autofix_items: >-
+      {{ (autofix_items | default([])) + [{
+        'name': 'CGroup v2 Mode Migration',
+        'action': 'Patched nodes.config/cluster spec.cgroupMode to v2; node updates will roll out naturally during subsequent MachineConfigPool updates.',
+        'reference': 'https://docs.openshift.com/container-platform/4.19/nodes/clusters/nodes-cluster-cgroups-2.html'
+      }] }}
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+    - cgroup_patch_verified | bool
+
+- name: "Update health_summary tracking list with CGroup remediation result"
+  set_fact:
+    health_summary: >-
+      {%- set updated = [] -%}
+      {%- set matching = [] -%}
+      {%- for item in health_summary | default([]) -%}
+        {%- if 'CGroup' in (item.name | default('')) -%}
+          {%- set _ = matching.append(1) -%}
+          {%- set _ = updated.append({
+            'num': item.num,
+            'name': item.name,
+            'gate': item.gate,
+            'status': ('AUTO-FIXED' if (cgroup_patch_verified | default(false) | bool) else 'FIX-FAILED'),
+            'observed': ('cgroupMode patched to v2 and verified' if (cgroup_patch_verified | default(false) | bool) else ('cgroupMode patch failed; observed: ' ~ (verified_cgroup.stdout | default('unknown') | trim)))
+          }) -%}
+        {%- else -%}
+          {%- set _ = updated.append(item) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if matching | length == 0 -%}
+        {%- set _ = updated.append({
+          'num': ((health_summary | default([]) | length) + 1),
+          'name': 'CGroup Mode Compatibility',
+          'gate': 'HARD',
+          'status': ('AUTO-FIXED' if (cgroup_patch_verified | default(false) | bool) else 'FIX-FAILED'),
+          'observed': ('cgroupMode patched to v2 and verified' if (cgroup_patch_verified | default(false) | bool) else ('cgroupMode patch failed; observed: ' ~ (verified_cgroup.stdout | default('unknown') | trim)))
+        }) -%}
+      {%- endif -%}
+      {{ updated }}
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+
+# ----------------------------------------------------------------------------
+# 7. Dual Audit Logging: Human-Readable (.txt) and Machine-Parseable (.csv)
+# ----------------------------------------------------------------------------
+- name: "Log CGroup v2 remediation outcome to text run log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.txt"
+    line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [{{ 'AUTO-FIX' if (cgroup_patch_verified | bool) else 'FIX-FAILED' }}] [HARD] Task 'CGroup v2 Mode Migration': {{ 'Successfully patched nodes.config/cluster spec.cgroupMode to v2' if (cgroup_patch_verified | bool) else 'Failed to verify cgroupMode v2 on nodes.config/cluster' }} | Observed: {{ verified_cgroup.stdout | default('unknown') | trim }}"
+    create: true
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+
+- name: "Check if CSV run log exists"
+  stat:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.csv"
+  register: cgroup_csv_stat
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+
+- name: "Initialize CSV run log header if new"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.csv"
+    line: "timestamp,cluster,task_name,gate_type,status,reason,observed"
+    create: true
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+    - not (cgroup_csv_stat.stat.exists | default(false))
+
+- name: "Log CGroup v2 remediation outcome to CSV run log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.csv"
+    line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name | default(''cluster'') }}","CGroup v2 Mode Migration","HARD","{{ ''AUTO-FIXED'' if (cgroup_patch_verified | bool) else ''FIX-FAILED'' }}","{{ ''Patched spec.cgroupMode to v2'' if (cgroup_patch_verified | bool) else ''Patch re-verification failed'' }}","{{ verified_cgroup.stdout | default(''unknown'') | trim }}"'
+    create: true
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+
+# ----------------------------------------------------------------------------
+# 8. Console Feedback & Optional Gate Enforcement
+# ----------------------------------------------------------------------------
+- name: "Display CGroup remediation confirmation banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "[AUTO-FIX] CGROUP V2 MIGRATION APPLIED & VERIFIED"
+      - "============================================================================"
+      - "Cluster       : {{ cluster_name | default('cluster') }}"
+      - "Previous Mode : {{ detected_cgroup_mode }}"
+      - "Verified Mode : {{ verified_cgroup.stdout | default('unknown') | trim }}"
+      - "Status        : AUTO-FIXED"
+      - "Impact        : Node reboots will roll out naturally during subsequent MCP updates."
+      - "============================================================================"
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+    - cgroup_patch_verified | bool
+
+- name: "Halt execution if CGroup remediation failed and gate enforcement is enabled"
+  fail:
+    msg: "AUTO-REMEDIATION HALT: Attempted to patch nodes.config/cluster spec.cgroupMode to 'v2', but re-verification returned '{{ verified_cgroup.stdout | default('unknown') | trim }}'. Halting upgrade."
+  when:
+    - cgroup_needs_patch | bool
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+    - not (cgroup_patch_verified | bool)
+    - remediate_enforce_gate | default(false) | bool

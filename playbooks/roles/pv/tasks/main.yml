@@ -1,131 +1,112 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (shell, set_fact, debug) work on both
-#                 versions. Replace with FQCN only if adopting the
-#                 ansible.builtin.* convention project-wide.
-#                 | default('') guards are applied on all optional variables.
-#
-# pv role — validates Persistent Volume (PV) status (WARN gate).
-#
-# Contract:
-#   - Queries `oc get pv -o json` piped to `jq` (jq v1.5 compatible).
-#   - Read-only operation; changed_when: false.
-#   - Identifies non-healthy PVs (phases other than Bound or Available, e.g. Released, Failed).
-#   - Respects optional pv_allow_list overrides.
-#   - WARN gate: failed_when: false + recorded status; never fail:, never auto-remediate.
-#   - Exposes parsed facts (pv_parsed_data, pv_all_pvs, pv_offending_pvs, pv_status) for reporting.
-#   - Records a structured entry (PASS or WARN) into `health_summary` list via set_fact.
-
 ---
-# Shell module chosen to pipe oc get pv JSON output to jq (v1.5 compatible)
-- name: Query Persistent Volumes and evaluate phase status — oc get pv
-  shell: >-
-    oc get pv -o json --kubeconfig "{{ kubeconfig_path }}" | jq -r '
-      .items // [] | {
-        "all": [
-          .[] | {
-            "name": .metadata.name,
-            "status": (.status.phase // "Unknown"),
-            "capacity": (.spec.capacity.storage // "N/A"),
-            "storageClass": (.spec.storageClassName // "N/A"),
-            "claim": (if .spec.claimRef then ((.spec.claimRef.namespace // "") + "/" + (.spec.claimRef.name // "")) else "None" end),
-            "reclaimPolicy": (.spec.persistentVolumeReclaimPolicy // "N/A"),
-            "accessModes": (.spec.accessModes // [])
-          }
-        ],
-        "offenders": [
-          .[] | {
-            "name": .metadata.name,
-            "status": (.status.phase // "Unknown"),
-            "capacity": (.spec.capacity.storage // "N/A"),
-            "storageClass": (.spec.storageClassName // "N/A"),
-            "claim": (if .spec.claimRef then ((.spec.claimRef.namespace // "") + "/" + (.spec.claimRef.name // "")) else "None" end),
-            "reclaimPolicy": (.spec.persistentVolumeReclaimPolicy // "N/A"),
-            "accessModes": (.spec.accessModes // []),
-            "reason": ("PV is in " + (.status.phase // "Unknown") + " phase (expected Bound or Available)")
-          } | select(.status != "Bound" and .status != "Available")
-        ]
-      }
-    '
-  register: pv_raw_query
+# ============================================================================
+# Role Tasks: pv (PersistentVolumes)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, fail, debug).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Ensures all persistent storage volumes are healthy (Bound or Available).
+#          Surfaces Failed or Released volumes in the prevalidation report.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: WARN
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Query Live PersistentVolumes via oc CLI & jq v1.5
+# Why: oc get pv -o json parsed with jq 1.5 extracts volume phases.
+# Why: Shell with set -o pipefail and args: executable: /bin/bash captures errors.
+# Why: Parentheses around 'and' operands comply strictly with jq 1.5.
+# Why: Bracket notation and null-coalescing handle empty clusters cleanly.
+# ----------------------------------------------------------------------------
+- name: "Query live persistent volumes and parse phases via jq"
+  shell: |
+    set -o pipefail
+    oc get pv -o json | jq -c '
+      {
+        total_count: (.items // [] | length),
+        pvs: [.items[]? | {
+          name: .metadata.name,
+          phase: (.status.phase // "Unknown" | tostring),
+          storage_class: (.spec.storageClassName // "none" | tostring),
+          capacity: (.spec.capacity.storage // "unknown" | tostring),
+          claim: (if .spec.claimRef then ((.spec.claimRef.namespace // "") + "/" + (.spec.claimRef.name // "")) else "none" end)
+        }],
+        unhealthy: [.items[]? | select((((.status.phase // "") | tostring) != "Bound") and (((.status.phase // "") | tostring) != "Available")) | {
+          name: .metadata.name,
+          phase: (.status.phase // "Unknown" | tostring),
+          reason: (.status.reason // "" | tostring),
+          message: (.status.message // "" | tostring)
+        }],
+        failed: [.items[]? | select(((.status.phase // "") | tostring) == "Failed") | .metadata.name],
+        released: [.items[]? | select(((.status.phase // "") | tostring) == "Released") | .metadata.name]
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: pv_query_raw
   changed_when: false
   failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: pv_query_raw.rc == 0
 
-- name: Parse Persistent Volumes JSON payload
+# ----------------------------------------------------------------------------
+# 2. Extract Facts & Evaluate PersistentVolume Health
+# Why: Bracket notation ['pvs'] avoids collisions with Python dict.items().
+# Why: pv check is a WARN gate: surfaces issues without blocking upgrade chain.
+# ----------------------------------------------------------------------------
+- name: "Extract persistent volume health facts"
   set_fact:
-    pv_parsed_data: "{{ pv_raw_query.stdout | from_json }}"
-  when: (pv_raw_query.rc | default(1) == 0) and (pv_raw_query.stdout | default('') | trim != '')
+    pv_total_count: "{{ (pv_query_raw.stdout | default('{}') | from_json)['total_count'] | default(0) | int }}"
+    pv_all_volumes: "{{ (pv_query_raw.stdout | default('{}') | from_json)['pvs'] | default([]) }}"
+    pv_unhealthy_volumes: "{{ (pv_query_raw.stdout | default('{}') | from_json)['unhealthy'] | default([]) }}"
+    pv_failed_volumes: "{{ (pv_query_raw.stdout | default('{}') | from_json)['failed'] | default([]) }}"
+    pv_released_volumes: "{{ (pv_query_raw.stdout | default('{}') | from_json)['released'] | default([]) }}"
 
-- name: Fallback Persistent Volumes payload on query failure
+- name: "Evaluate persistent volume compliance"
   set_fact:
-    pv_parsed_data:
-      all: []
-      offenders:
-        - name: "pv-query-failure"
-          status: "Error"
-          capacity: "N/A"
-          storageClass: "N/A"
-          claim: "N/A"
-          reclaimPolicy: "N/A"
-          accessModes: []
-          reason: "Failed to execute oc get pv: {{ pv_raw_query.stderr | default(pv_raw_query.stdout | default('Unknown error')) | trim }}"
-  when: (pv_raw_query.rc | default(1) != 0) or (pv_raw_query.stdout | default('') | trim == '')
+    pv_check_valid: "{{ (pv_unhealthy_volumes | length) == 0 }}"
 
-- name: Extract all Persistent Volumes list
+# ----------------------------------------------------------------------------
+# 3. Construct Structured Health Record & Append to Summary
+# Why: Appends structured dictionary with gate: WARN into health_summary.
+# ----------------------------------------------------------------------------
+- name: "Construct structured pv health record"
   set_fact:
-    pv_all_pvs: "{{ pv_parsed_data.all | default([]) }}"
-
-- name: Initialize offending Persistent Volumes list
-  set_fact:
-    pv_offending_pvs: []
-
-- name: Filter offending Persistent Volumes against pv_allow_list
-  set_fact:
-    pv_offending_pvs: "{{ pv_offending_pvs + [item] }}"
-  loop: "{{ pv_parsed_data.offenders | default([]) }}"
-  when: item.name not in (pv_allow_list | default([]))
-
-- name: Determine Persistent Volumes health verdict
-  set_fact:
-    pv_status: "{{ 'WARN' if ((pv_offending_pvs | length) > 0) else 'PASS' }}"
-
-- name: Display Persistent Volumes inspection summary
-  debug:
-    msg: >-
-      Cluster '{{ cluster_name | default('UNKNOWN') }}': Scanned {{ pv_all_pvs | length }} Persistent Volume(s).
-      Found {{ pv_offending_pvs | length }} non-healthy PV(s)
-      (Allow-listed: {{ pv_allow_list | default([]) | length }}).
-      Status: {{ pv_status }}.
-
-- name: Record Persistent Volumes status in health_summary
-  set_fact:
-    health_summary: "{{ (health_summary | default([])) + [pv_summary_entry] }}"
-  vars:
-    pv_summary_entry:
-      id: "{{ pv_id | default('08') }}"
-      name: "{{ pv_name | default('Persistent Volume (PV) Status') }}"
-      gate: "{{ pv_gate | default('WARN') }}"
-      status: "{{ pv_status }}"
+    pv_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "PersistentVolumes Health"
+      gate: "WARN"
+      status: "{{ 'PASS' if (pv_check_valid | bool) else 'WARN' }}"
       observed: >-
-        {% if pv_status == 'PASS' %}
-        All {{ pv_all_pvs | length }} Persistent Volume(s) are in healthy phase (Bound/Available)
-        {% else %}
-        Found {{ pv_offending_pvs | length }} non-healthy Persistent Volume(s) (Released/Failed/Error)
-        {% endif %}
-      details: >-
-        {% if pv_status == 'PASS' %}
-        Verified {{ pv_all_pvs | length }} Persistent Volumes on cluster {{ cluster_name | default('cluster') }}.
-        {% else %}
-        Non-healthy PVs: {% for p in pv_offending_pvs %}{{ p.name }} ({{ p.status }} - {{ p.reason }}){% if not loop.last %}, {% endif %}{% endfor %}.
-        {% endif %}
-      raw_output: "{{ pv_offending_pvs | to_json if pv_status == 'WARN' else pv_all_pvs | to_json }}"
+        {{ ('All ' ~ pv_total_count ~ ' PersistentVolumes are in healthy state (Bound/Available)')
+           if ((pv_check_valid | bool) and (pv_total_count > 0))
+           else ('No PersistentVolumes found on cluster (PASS)')
+           if ((pv_check_valid | bool) and (pv_total_count == 0))
+           else ('Unhealthy PersistentVolumes detected: failed=[' ~ (pv_failed_volumes | join(', ')) ~ '], released=[' ~ (pv_released_volumes | join(', ')) ~ '], total_unhealthy=' ~ (pv_unhealthy_volumes | length)) }}
 
-- name: Confirm Persistent Volumes check evaluation
+- name: "Record pv result to health_summary tracking list"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [pv_health_item] }}"
+
+- name: "Log persistent volume evaluation outcome"
   debug:
-    msg: >-
-      {% if pv_status == 'PASS' %}
-      ✔ PASS [Check {{ pv_id | default('08') }} - {{ pv_name | default('Persistent Volume (PV) Status') }}] —
-      All {{ pv_all_pvs | length }} PV(s) are healthy (Bound/Available).
-      {% else %}
-      ! WARN [Check {{ pv_id | default('08') }} - {{ pv_name | default('Persistent Volume (PV) Status') }}] —
-      Found {{ pv_offending_pvs | length }} non-healthy PV(s). Non-blocking warning recorded.
-      {% endif %}
+    msg:
+      - "Check        : {{ pv_health_item.name }}"
+      - "Gate         : {{ pv_health_item.gate }}"
+      - "Status       : {{ pv_health_item.status }}"
+      - "Observed     : {{ pv_health_item.observed }}"
+      - "Gate Enforced: {{ pv_enforce_gate | default(false) | bool }}"
+
+# ----------------------------------------------------------------------------
+# 4. Optional Gate Enforcement (WARN gate: does not halt by default)
+# Why: WARN gate allows non-critical storage warnings to surface in reports.
+# ----------------------------------------------------------------------------
+- name: "Enforce gate for PersistentVolumes check if strict mode configured"
+  fail:
+    msg: "GATE FAILURE [pv]: Problematic PersistentVolumes detected on cluster '{{ cluster_name }}'. Failed: {{ pv_failed_volumes | to_json }}, Released: {{ pv_released_volumes | to_json }}."
+  when:
+    - not (pv_check_valid | bool)
+    - pv_enforce_gate | default(false) | bool

@@ -1,0 +1,74 @@
+---
+# ============================================================================
+# Role Defaults: remediate
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses standard YAML scalar, list, and dictionary declarations.
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Default configuration parameters, feature toggles, allow-lists,
+#          and operational thresholds for the dedicated auto-remediation engine
+#          role. Centralizes automated resolution of known upgrade blockers
+#          (cgroup v1→v2 migration, dynamic admin-acks, paused MCPs, degraded
+#          operators) to realize one-touch upgrade automation.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/paths.yml
+# Gate type: N/A (Remediation engine)
+# ============================================================================
+
+# Master toggle for automatic remediation across all tiers
+auto_remediation_enabled: true
+
+# ----------------------------------------------------------------------------
+# Tier 1 Toggles (Auto-Fix: Safe, deterministic, official Red Hat remediation)
+# ----------------------------------------------------------------------------
+# Blocker 1: Auto-patch nodes.config/cluster to spec.cgroupMode: "v2"
+auto_fix_cgroup_v2: true
+
+# Blocker 2: Auto-apply admin-ack ConfigMap in openshift-config
+auto_apply_admin_acks: true
+
+# Blocker 3: Auto-unpause paused MachineConfigPools present in allow-list
+auto_unpause_mcp: true
+
+# Allow-list of MachineConfigPool names permitted for automated unpausing
+mcp_auto_unpause_list:
+  - "worker"
+  - "master"
+
+# ----------------------------------------------------------------------------
+# Tier 2 Toggles (Guided: Safe recovery attempts, default OFF, cluster opt-in)
+# ----------------------------------------------------------------------------
+# Blocker 4: Attempt restart of degraded ClusterOperator pods
+auto_restart_degraded_operators: false
+
+# Grace period in seconds to wait for operator reconciliation after pod restart
+operator_restart_grace_seconds: 180
+
+# Blocker 5: Force MachineConfigDaemon progress on stalled nodes via force file
+auto_force_stalled_node: false
+
+# Threshold in minutes a node can remain in updating state before being marked stalled
+node_stall_threshold_minutes: 30
+
+# ----------------------------------------------------------------------------
+# Specific Remediation Dispatch Triggers
+# ----------------------------------------------------------------------------
+# Manual or programmatic dispatch triggers to bypass automatic condition checks
+trigger_cgroup_remediation: false
+trigger_admin_ack_remediation: false
+trigger_unpause_mcp_remediation: false
+trigger_co_restart_remediation: false
+
+# Gate enforcement: if true, a FIX-FAILED outcome halts execution with fail:
+remediate_enforce_gate: false
+
+# ----------------------------------------------------------------------------
+# Transient Fault Tolerance & Retry Parameters
+# ----------------------------------------------------------------------------
+oc_command_retries: 3
+oc_command_retry_delay: 10
+
+# Audit logging defaults
+log_dir: ""
+run_timestamp: ""
+cluster_name: "cluster"

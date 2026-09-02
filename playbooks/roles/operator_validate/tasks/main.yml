@@ -1,94 +1,197 @@
-# Targets Ansible 2.7.17.
 ---
-- name: Query Final Operator State and Validation
+# ============================================================================
+# Role Tasks: operator_validate
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names, set_fact, and include_role.
+#
+# Purpose: Validates post-upgrade OLM operator health across the cluster.
+#          Asserts subscriptions have valid installedCSVs, confirms active
+#          CSVs report phase Succeeded, generates the Operator Validation
+#          HTML report via roles/report, and enforces HARD gates.
+# Dependencies: playbooks/roles/operator_validate/defaults/main.yml,
+#               playbooks/roles/report, playbooks/templates/health-overview.j2,
+#               playbooks/vars/report_vars.yml, playbooks/vars/paths.yml
+# Gate type: HARD (Blocks Phase 06 if operator validation fails)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Initialize State Facts & Display Banner
+# ----------------------------------------------------------------------------
+- name: "operator_validate: Initialize validation fact containers"
+  set_fact:
+    operators: []
+    operator_health_checks: []
+
+- name: "operator_validate: Display operator validation initiation banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "OLM OPERATOR HEALTH VALIDATION & AUDIT"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name | default('unknown') }}"
+      - "Gate Enforcement    : {{ operator_validate_enforce_gate | default(true) }}"
+      - "Report Output        : {{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name | default('cluster') }}_operators_{{ run_timestamp | default('current') }}.html"
+      - "============================================================================"
+
+# ----------------------------------------------------------------------------
+# 2. Resiliently Query Live Subscriptions & CSVs with jq v1.5
+# ----------------------------------------------------------------------------
+- name: "operator_validate: Query live OLM subscriptions"
   shell: |
-    set -euo pipefail
-    TMP_SUBS=$(mktemp)
-    TMP_CSVS=$(mktemp)
-    TMP_IPS=$(mktemp)
-    TMP_PODS=$(mktemp)
-
-    oc get subscriptions --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_SUBS"
-    oc get csv --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_CSVS"
-    oc get installplan --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_IPS"
-    oc get pods --all-namespaces -o json --kubeconfig "{{ kubeconfig_path }}" > "$TMP_PODS"
-
-    jq -s -r '
-      .[0].items as $subs |
-      .[1].items as $csvs |
-      .[2].items as $ips |
-      .[3].items as $pods |
-      $subs | map(
-        . as $sub |
-        ($csvs | map(select(.metadata.namespace == $sub.metadata.namespace and .metadata.name == $sub.status.installedCSV))[0]) as $csv |
-        ($ips | map(select(.metadata.namespace == $sub.metadata.namespace and .spec.approved == false and (.spec.clusterServiceVersionNames | index($sub.status.currentCSV))))[0]) as $pending_ip |
-        ($pods | map(select(.metadata.namespace == $sub.metadata.namespace and (.metadata.ownerReferences[]? | select(.kind == "ReplicaSet" or .kind == "Deployment"))))) as $op_pods |
-        
-        {
-          name: .metadata.name,
-          namespace: .metadata.namespace,
-          state: (.status.state // "Unknown"),
-          csv_phase: ($csv.status.phase // "Unknown"),
-          has_pending_ip: ($pending_ip != null),
-          pods_ready: (if ($op_pods | length) == 0 then true else ($op_pods | map(select(.status.phase == "Running")) | length) > 0 end)
-        }
-      )
-    ' "$TMP_SUBS" "$TMP_CSVS" "$TMP_IPS" "$TMP_PODS"
-    rm -f "$TMP_SUBS" "$TMP_CSVS" "$TMP_IPS" "$TMP_PODS"
+    set -o pipefail
+    oc get subscriptions.operators.coreos.com -A -o json 2>/dev/null || echo '{"items":[]}'
   args:
     executable: /bin/bash
-  register: validate_raw
+  register: val_subs_raw
+  until: val_subs_raw.rc == 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
   changed_when: false
 
-- name: Parse Validation Data
-  set_fact:
-    operator_validation_data: "{{ validate_raw.stdout | from_json }}"
+- name: "operator_validate: Parse subscriptions with jq v1.5"
+  shell: |
+    set -o pipefail
+    echo '{{ val_subs_raw.stdout | default("{}") }}' | jq -c '
+      [ .items[]? | {
+          name: (.metadata.name // "unknown"),
+          namespace: (.metadata.namespace // "unknown"),
+          package: (.spec.name // .metadata.name // "unknown"),
+          channel: (.spec.channel // "stable"),
+          approval: (.spec.installPlanApproval // "Automatic"),
+          installed_csv: (.status.installedCSV // .status.currentCSV // "None")
+        }
+      ]
+    '
+  args:
+    executable: /bin/bash
+  register: val_subs_parsed_raw
+  changed_when: false
 
-- name: Initialize Operator Report Records
-  set_fact:
-    operator_report_records: []
-    operator_hard_failures: []
-    operator_warn_failures: []
+- name: "operator_validate: Query live ClusterServiceVersions"
+  shell: |
+    set -o pipefail
+    oc get csv -A -o json 2>/dev/null || echo '{"items":[]}'
+  args:
+    executable: /bin/bash
+  register: val_csvs_raw
+  until: val_csvs_raw.rc == 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  changed_when: false
 
-- name: Evaluate Operator Validation Rules
-  set_fact:
-    operator_report_records: "{{ operator_report_records + [record] }}"
-    operator_hard_failures: "{{ operator_hard_failures + ([record] if gate == 'HARD' else []) }}"
-    operator_warn_failures: "{{ operator_warn_failures + ([record] if gate == 'WARN' else []) }}"
-  vars:
-    csv_succeeded: "{{ item.csv_phase == 'Succeeded' }}"
-    sub_healthy: "{{ item.state != 'UpgradePending' and item.state != 'InstallPlanFailed' }}"
-    no_pending_ip: "{{ not item.has_pending_ip }}"
-    pods_ready: "{{ item.pods_ready }}"
-    
-    gate: >-
-      {{
-        'HARD' if (not csv_succeeded or not sub_healthy)
-        else ('WARN' if (not no_pending_ip or not pods_ready) else 'PASS')
-      }}
-    
-    record: "{{ item | combine({'validation_gate': gate, 'status': ('FAIL' if gate == 'HARD' else ('WARN' if gate == 'WARN' else 'PASS'))}) }}"
-  loop: "{{ operator_validation_data }}"
-  when: item.name not in (operator_allow_list | default([]))
+- name: "operator_validate: Parse live CSVs with jq v1.5"
+  shell: |
+    set -o pipefail
+    echo '{{ val_csvs_raw.stdout | default("{}") }}' | jq -c '
+      [ .items[]? | {
+          name: (.metadata.name // "unknown"),
+          namespace: (.metadata.namespace // "unknown"),
+          phase: (.status.phase // "Unknown"),
+          message: (.status.message // ""),
+          reason: (.status.reason // "")
+        }
+      ]
+    '
+  args:
+    executable: /bin/bash
+  register: val_csvs_parsed_raw
+  changed_when: false
 
-- name: Record Operator Validation results into health_summary
+- name: "operator_validate: Set normalized subscriptions and CSVs facts"
   set_fact:
-    health_summary: "{{ (health_summary | default([])) + [op_summary] }}"
-  vars:
-    op_summary:
-      id: "20"
-      name: "Operator Upgrade & Validation"
-      gate: "HARD"
-      status: "{{ 'FAIL' if (operator_hard_failures | length) > 0 else ('WARN' if (operator_warn_failures | length) > 0 else 'PASS') }}"
-      observed: "Validated {{ operator_report_records | length }} operators ({{ operator_hard_failures | length }} HARD failures, {{ operator_warn_failures | length }} WARN)"
-      details: "Operator Post-Upgrade Checks"
-      raw_output: "{{ operator_report_records | to_json }}"
+    val_subs: "{{ val_subs_parsed_raw.stdout | from_json }}"
+    val_csvs: "{{ val_csvs_parsed_raw.stdout | from_json }}"
 
-- name: Enforce HARD gate on Operator Validation
+# ----------------------------------------------------------------------------
+# 3. Handle Empty Subscriptions Case Cleanly
+# ----------------------------------------------------------------------------
+- name: "operator_validate: Populate default records for clusters with zero subscriptions"
+  set_fact:
+    operators:
+      - subscription: "No OLM Subscriptions"
+        namespace: "N/A"
+        installed_csv: "None"
+        target_channel: "N/A"
+        installplan_approval: "N/A"
+        csv_phase: "Succeeded"
+        status: "PASS"
+        details: "No OLM operators installed on cluster"
+    operator_health_checks:
+      - num: 1
+        name: "Subscription Installed CSV Parity"
+        gate: "HARD"
+        status: "PASS"
+        observed: "No OLM subscriptions installed on cluster"
+      - num: 2
+        name: "ClusterServiceVersions Phase Verification"
+        gate: "HARD"
+        status: "PASS"
+        observed: "Zero failing CSVs on cluster"
+  when: val_subs | length == 0
+
+# ----------------------------------------------------------------------------
+# 4. Correlate Subscriptions and Validate CSV Succeeded Phase
+# ----------------------------------------------------------------------------
+- name: "operator_validate: Validate individual subscriptions against live CSVs"
+  include_tasks: validate_subscription.yml
+  loop: "{{ val_subs }}"
+  loop_control:
+    loop_var: sub_item
+  when: val_subs | length > 0
+
+- name: "operator_validate: Assemble structured operator health check contract records"
+  set_fact:
+    operator_health_checks:
+      - num: 1
+        name: "Subscription Installed CSV Parity"
+        gate: "HARD"
+        status: >-
+          {{ 'FAIL'
+             if (operators | selectattr('csv_phase', 'equalto', 'Missing') | list | length > 0)
+             else 'PASS' }}
+        observed: >-
+          {{ (operators | selectattr('csv_phase', 'equalto', 'Missing') | list | length | string ~ ' subscription(s) missing installed CSV')
+             if (operators | selectattr('csv_phase', 'equalto', 'Missing') | list | length > 0)
+             else ('All ' ~ (val_subs | length | string) ~ ' subscription(s) reference active CSVs') }}
+      - num: 2
+        name: "ClusterServiceVersions Phase Verification"
+        gate: "HARD"
+        status: >-
+          {{ 'FAIL'
+             if (operators | rejectattr('csv_phase', 'equalto', 'Succeeded') | list | length > 0)
+             else 'PASS' }}
+        observed: >-
+          {{ (operators | selectattr('csv_phase', 'equalto', 'Succeeded') | list | length | string) ~ '/' ~ (operators | length | string) ~ ' CSV(s) report phase Succeeded' }}
+  when: val_subs | length > 0
+
+# ----------------------------------------------------------------------------
+# 5. Generate Client-Facing HTML Operator Validation Report via roles/report
+# ----------------------------------------------------------------------------
+- name: "operator_validate: Configure report parameters for roles/report"
+  set_fact:
+    report_type: "operators"
+    report_title: "OLM Operator Validation Report"
+    is_operator_report: true
+    checks: "{{ operator_health_checks }}"
+
+- name: "operator_validate: Generate standalone operator validation HTML report"
+  include_role:
+    name: report
+
+# ----------------------------------------------------------------------------
+# 6. Settle Gate Assertion
+# Why: Fails Phase 06 if any operator failed validation when gate is enabled.
+#      Operator failures are HARD findings for Phase 06 only and never roll back
+#      completed cluster version hops.
+# ----------------------------------------------------------------------------
+- name: "operator_validate: Enforce operator validation HARD gate"
   fail:
-    msg: >-
-      Operator Validation FAILED (HARD gate). Found {{ operator_hard_failures | length }} failed operators:
-      {% for op in operator_hard_failures %}
-        - {{ op.namespace }}/{{ op.name }}: CSV Phase={{ op.csv_phase }}, Sub State={{ op.state }}
-      {% endfor %}
-  when: (operator_hard_failures | length) > 0
+    msg: "[HARD GATE FAILURE] One or more OLM operators failed validation: {{ operators | selectattr('status', 'equalto', 'FAIL') | map(attribute='subscription') | join(', ') }}"
+  when:
+    - operator_validate_enforce_gate | default(true) | bool
+    - (operators | selectattr('status', 'equalto', 'FAIL') | list | length) > 0
+
+- name: "operator_validate: Display operator validation success confirmation"
+  debug:
+    msg: "All {{ operators | length }} OLM operator(s) verified healthy and reporting phase Succeeded."

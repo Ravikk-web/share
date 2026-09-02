@@ -1,148 +1,255 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (set_fact, fail, include_role, command, debug, stat)
-#                 work on both versions.
-#                 | default('') guards are applied on all optional variables.
-#
-# Phase 02 — Pre-Upgrade Checks & 13-Check Hard Gate (02_Pre_upgrade_check.yaml)
-#
-# Responsibilities:
-#   1. Reuses authenticated session from Phase 01 (or logs in if run standalone).
-#   2. Executes prevalidation aggregator role running all 13 checks (7 HARD, 6 WARN).
-#   3. Renders client-facing HTML prevalidation report to output/ via report role.
-#   4. Enforces HARD gate: any HARD failure aborts execution and tears down session.
-#   5. WARN checks surface non-blocking findings in report and logs.
-#   6. Wrapped in block/rescue/always: rescue logs errors, dispatches alert email, and logs out.
-
 ---
-- name: Phase 02 — Pre-Upgrade Validation Hard Gate
+# ============================================================================
+# Phase 02 Playbook: Prevalidation & Auto-Remediation
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses standard play-level vars_files, include_role, and
+#                 block/rescue/always; compatible across Ansible 2.7 and 2.14.
+#
+# Purpose: Orchestrates the complete 14-check prevalidation contract defined
+#          in context/feature-spec/09-prevalidation-and-phase02.md.
+#          Reuses the authenticated session from Phase 01, executes the
+#          14-check scan via roles/prevalidation, invokes roles/remediate if
+#          auto-fixable HARD checks fail and toggles are active, re-evaluates
+#          residual gates, generates client-facing HTML prevalidation reports
+#          via roles/report, and ensures fail-safe session teardown on failure.
+# Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               roles/login, roles/logout, roles/prevalidation,
+#               roles/remediate, roles/report, roles/error_handle
+# Gate type: HARD (fails immediately if residual HARD checks persist)
+# ============================================================================
+
+- name: "Phase 02 — Prevalidation & Auto-Remediation"
   hosts: localhost
   connection: local
   gather_facts: true
-
   vars_files:
     - vars/upgrade.yml
-    - vars/paths.yml
     - vars/secrets.yml
+    - vars/paths.yml
     - vars/smtp.yml
     - vars/report_vars.yml
     - vars/api_regex.yml
 
+  # --------------------------------------------------------------------------
+  # Pre-Tasks: Session Verification & Re-use
+  # Why: Reuses authenticated session from Phase 01. If invoked standalone,
+  #      safely establishes cluster session via login role.
+  # --------------------------------------------------------------------------
   pre_tasks:
-    - name: Check existing kubeconfig session
+    - name: "Phase 02: Check if existing authenticated cluster session is present"
       stat:
-        path: "{{ kubeconfig_path }}"
-      register: pre_kubeconfig_stat
+        path: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: p02_kubeconfig_stat
 
-    - name: Test cluster session reachability
-      command: oc whoami --show-server --kubeconfig "{{ kubeconfig_path }}"
-      register: pre_whoami_test
-      changed_when: false
-      failed_when: false
-      when: pre_kubeconfig_stat.stat.exists | default(false)
-
-    - name: Resolve target cluster credentials if re-authentication needed
-      set_fact:
-        target_cluster_entry: "{{ (clusters | default([]) | selectattr('name', 'equalto', cluster_name) | list | first) | default({}) }}"
-      no_log: true
-      when: not (pre_kubeconfig_stat.stat.exists | default(false)) or (pre_whoami_test.rc | default(1) != 0)
-
-    - name: Set login parameters for cluster {{ cluster_name | default('UNKNOWN') }}
-      set_fact:
-        login_api_url: "{{ target_cluster_entry.api_url | default(login_api_url | default('')) }}"
-        login_username: "{{ target_cluster_entry.username | default(login_username | default('')) }}"
-        login_password: "{{ target_cluster_entry.password | default(login_password | default('')) }}"
-      no_log: true
-      when: not (pre_kubeconfig_stat.stat.exists | default(false)) or (pre_whoami_test.rc | default(1) != 0)
-
-    - name: Authenticate to cluster {{ cluster_name | default('UNKNOWN') }} (if not already logged in)
+    - name: "Phase 02: Establish authenticated cluster session via login role if needed"
       include_role:
         name: login
-      when: not (pre_kubeconfig_stat.stat.exists | default(false)) or (pre_whoami_test.rc | default(1) != 0)
+      when: not (p02_kubeconfig_stat.stat.exists | default(false))
 
+  # --------------------------------------------------------------------------
+  # Main Tasks: 14-Check Prevalidation, Auto-Remediation Pass & Report Generation
+  # --------------------------------------------------------------------------
   tasks:
-    - name: Phase 02 Execution Block
+    - name: "Phase 02: Execute Prevalidation Scan and Blocker Remediation"
       block:
-        - name: Set Phase 02 Step 1 Context — 13-Check Prevalidation
+        # 1. Establish run timestamp for consistent file naming across phases
+        - name: "Ensure run timestamp is established for logs and reports"
           set_fact:
-            failed_phase: "02_Pre_upgrade_check"
-            current_step_no: 1
-            current_task_name: "Pre-Upgrade 13-Check Prevalidation"
-            current_gate_type: "HARD"
-            phase02_failed: false
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+          when: run_timestamp is not defined or run_timestamp | length == 0
 
-        - name: Run 13-Check Prevalidation Aggregator
+        # 2. Display Phase 02 Initiation Banner
+        - name: "Display Phase 02 initiation banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 02: PREVALIDATION & AUTO-REMEDIATION INITIATED"
+              - "============================================================================"
+              - "Target Cluster       : {{ cluster_name }}"
+              - "Target Hop           : {{ upgrade_path[0] | default('unknown') }}"
+              - "Auto-Remediation     : {{ auto_remediation_enabled | default(true) | bool }}"
+              - "Kubeconfig           : {{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+              - "============================================================================"
+
+        # 3. Execute Initial 14-Check Prevalidation Scan via prevalidation role
+        - name: "Execute 14-Check Prevalidation Contract scan via prevalidation role"
           include_role:
             name: prevalidation
 
-        - name: Set Phase 02 Step 2 Context — Render Prevalidation HTML Report
+        # 4. Identify Initial Failed HARD Checks
+        - name: "Identify initial failed HARD prevalidation checks"
           set_fact:
-            current_step_no: 2
-            current_task_name: "Render Prevalidation HTML Report"
-            current_gate_type: "HARD"
+            preval_failed_hard_checks: >-
+              {{ health_summary | default([])
+                 | selectattr('gate', 'equalto', 'HARD')
+                 | selectattr('status', 'equalto', 'FAIL')
+                 | map(attribute='name') | list }}
 
-        - name: Render Prevalidation HTML Validation Report
+        # 5. Evaluate Auto-Remediation Requirements
+        - name: "Evaluate whether auto-remediation should be dispatched"
+          set_fact:
+            preval_remediation_needed: >-
+              {{ (auto_remediation_enabled | default(true) | bool) and
+                 ((('CGroup Mode Compatibility' in preval_failed_hard_checks) and (auto_fix_cgroup_v2 | default(true) | bool)) or
+                  (('Administrator Acknowledgement (Admin-Acks)' in preval_failed_hard_checks) and (auto_apply_admin_acks | default(true) | bool)) or
+                  (('MachineConfigPools Synchronization' in preval_failed_hard_checks) and (auto_unpause_mcp | default(true) | bool)) or
+                  (('ClusterOperators Health' in preval_failed_hard_checks) and (auto_restart_degraded_operators | default(false) | bool))) }}
+            trigger_cgroup_remediation: >-
+              {{ ('CGroup Mode Compatibility' in preval_failed_hard_checks) and (auto_fix_cgroup_v2 | default(true) | bool) }}
+            trigger_admin_ack_remediation: >-
+              {{ ('Administrator Acknowledgement (Admin-Acks)' in preval_failed_hard_checks) and (auto_apply_admin_acks | default(true) | bool) }}
+            trigger_unpause_mcp_remediation: >-
+              {{ ('MachineConfigPools Synchronization' in preval_failed_hard_checks) and (auto_unpause_mcp | default(true) | bool) }}
+            trigger_co_restart_remediation: >-
+              {{ ('ClusterOperators Health' in preval_failed_hard_checks) and (auto_restart_degraded_operators | default(false) | bool) }}
+
+        # 6. Execute Auto-Remediation Pass via remediate role if needed
+        - name: "Display Auto-Remediation pass initiation notice"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 02: AUTO-REMEDIATION PASS DISPATCHED"
+              - "============================================================================"
+              - "Trigger CGroup v2    : {{ trigger_cgroup_remediation | bool }}"
+              - "Trigger Admin-Acks   : {{ trigger_admin_ack_remediation | bool }}"
+              - "Trigger Unpause MCP  : {{ trigger_unpause_mcp_remediation | bool }}"
+              - "Trigger Restart CO   : {{ trigger_co_restart_remediation | bool }}"
+              - "============================================================================"
+          when: preval_remediation_needed | bool
+
+        - name: "Phase 02: Execute Auto-Remediation pass for fixable blockers via remediate role"
           include_role:
-            name: report
-          vars:
-            report_phase: "prevalidation"
-            phase_name: "Pre-Upgrade Validation (Phase 02)"
+            name: remediate
+          when: preval_remediation_needed | bool
 
-        - name: Detect any HARD gate failures in health_summary
+        # 7. Evaluate Residual HARD Gate
+        - name: "Identify residual failing HARD checks after remediation pass"
           set_fact:
-            preval_hard_failures: "{{ health_summary | default([]) | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'equalto', 'FAIL') | list }}"
+            preval_residual_hard_failures: >-
+              {{ health_summary | default([])
+                 | selectattr('gate', 'equalto', 'HARD')
+                 | selectattr('status', 'in', ['FAIL', 'FIX-FAILED'])
+                 | list }}
 
-        - name: Enforce HARD gate halt on prevalidation failures
+        - name: "HARD Gate: Enforce prevalidation health contract"
           fail:
             msg: >-
-              HARD GATE FAILURE in Phase 02: One or more critical prevalidation checks failed on cluster '{{ cluster_name }}'.
-              Found {{ preval_hard_failures | length }} failed HARD check(s).
-              Prevalidation report written to: {{ report_html_path | default('output/') }}.
-              Upgrade cannot proceed until all HARD checks pass.
-          when: (preval_hard_failures | length > 0) or (failed_validations | default([]) | length > 0)
+              [HARD GATE FAILURE] Phase 02 Prevalidation contract failed for cluster '{{ cluster_name }}'.
+              Residual failed HARD checks ({{ preval_residual_hard_failures | length }}):
+              {% for item in preval_residual_hard_failures %}
+              - Check {{ item.num }}: {{ item.name }} [{{ item.status }}] — {{ item.observed }}
+              {% endfor %}
+              Execution halted before upgrade initiation with zero cluster mutations.
+          when: (preval_residual_hard_failures | length) > 0
 
-        - name: Confirm Phase 02 Pre-Upgrade Validation Success
-          debug:
-            msg: >-
-              ✔ Phase 02 Pre-Upgrade Validation completed successfully on cluster '{{ cluster_name }}'.
-              All 7 HARD checks passed.
-              Report generated: {{ report_html_path | default('N/A') }}.
-              Overall verdict: {{ report_last_verdict | default('PASS') }}.
-
-      rescue:
-        - name: Record failure details for Phase 02
+        # 8. Generate Prevalidation HTML Report via report role
+        - name: "Configure report parameters for Prevalidation report"
           set_fact:
-            phase02_failed: true
-            failed_phase: "02_Pre_upgrade_check"
-            failure_reason: >-
-              {{
-                (((ansible_failed_result | default({})).stderr | default('')) | trim) if (((ansible_failed_result | default({})).stderr | default('')) | trim != '')
-                else (
-                  (((ansible_failed_result | default({})).stderr_lines | default([])) | join(' ') | trim) if ((((ansible_failed_result | default({})).stderr_lines | default([])) | length) > 0)
-                  else (
-                    (((ansible_failed_result | default({})).msg | default('')) | trim) if (((ansible_failed_result | default({})).msg | default('')) | trim != '' and ((ansible_failed_result | default({})).msg | default('')) != 'non-zero return code')
-                    else (
-                      (((ansible_failed_result | default({})).message | default('')) | trim) if (((ansible_failed_result | default({})).message | default('')) | trim != '')
-                      else 'Prevalidation checks failed.'
-                    )
-                  )
-                )
-              }}
-            failure_observed: "FAILED at Step {{ current_step_no | default(1) }}: {{ current_task_name | default('Pre-Upgrade Validation') }}"
+            report_type: "prevalidation"
+            report_title: "Pre-Upgrade Validation Report"
+            checks: "{{ health_summary }}"
 
-        - name: Trigger standardized error handling and alert
+        - name: "Generate client-facing Prevalidation HTML report via report role"
+          include_role:
+            name: report
+
+        # 9. Log Confirmation to Text Run Log (.txt)
+        - name: "Log Phase 02 prevalidation pass to text run log"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+            line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [PASS] [HARD] Phase 02: Prevalidation contract satisfied for cluster '{{ cluster_name }}' (Total checks: {{ health_summary | length }}, Passed: {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}, Warn: {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}, Autofixed: {{ health_summary | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length }}). Report generated: {{ report_file_path }}."
+            create: true
+
+        # 10. Log Confirmation to CSV Run Log (.csv)
+        - name: "Check if CSV run log exists"
+          stat:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+          register: phase02_csv_stat
+
+        - name: "Initialize CSV run log header if new"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+            line: "timestamp,cluster,task_name,gate_type,status,reason,observed"
+            create: true
+          when: not (phase02_csv_stat.stat.exists | default(false))
+
+        - name: "Log Phase 02 prevalidation pass to CSV run log"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+            line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name }}","Phase 02 Prevalidation & Auto-Remediation","HARD","PASS","Prevalidation contract satisfied (Autofixed: {{ health_summary | selectattr(''status'', ''equalto'', ''AUTO-FIXED'') | list | length }})","Report: {{ report_file_path }}"'
+            create: true
+
+        # 11. Display Structured Confirmation Banner
+        - name: "Display Phase 02 Prevalidation completion banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 02 COMPLETE: PREVALIDATION & AUTO-REMEDIATION SUCCESSFUL"
+              - "============================================================================"
+              - "Cluster Name       : {{ cluster_name }}"
+              - "Target First Hop   : {{ preval_resolved_target_version | default(upgrade_path[0] | default('unknown')) }}"
+              - "Total Checks       : {{ health_summary | length }}"
+              - "Passed Checks      : {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}"
+              - "Warnings           : {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}"
+              - "Auto-Fixed Checks  : {{ health_summary | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length }}"
+              - "Residual Failures  : 0"
+              - "Report File        : {{ report_file_path }}"
+              - "Session State      : Preserved for Phase 03 Upgrade Initiation"
+              - "============================================================================"
+
+      # ----------------------------------------------------------------------
+      # Rescue: Error Extraction, Alert Dispatch & Clean Session Logout
+      # ----------------------------------------------------------------------
+      rescue:
+        - name: "Extract sanitized error message from failure result in Phase 02"
+          set_fact:
+            resolved_error: >-
+              {{ ansible_failed_result.stderr | default('')
+                 if (ansible_failed_result.stderr | default('') | length > 0)
+                 else (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 if (ansible_failed_result.stderr_lines | default([]) | length > 0)
+                 else ansible_failed_result.msg | default('Unknown error — inspect logs') }}
+
+        - name: "Evaluate whether failure is an RBAC / authorization error in Phase 02"
+          set_fact:
+            is_rbac_error: >-
+              {{ (resolved_error | lower is search('forbidden'))
+                 or (resolved_error | lower is search('cannot patch'))
+                 or (resolved_error | lower is search('unauthorized'))
+                 or (resolved_error | lower is search('cannot get'))
+                 or (resolved_error | lower is search('cannot list'))
+                 or (resolved_error | lower is search('cannot create')) }}
+
+        - name: "Configure Phase 02 error context facts"
+          set_fact:
+            current_step_no: "Phase 02"
+            current_task_name: "Phase 02 Prevalidation & Auto-Remediation"
+            current_gate_type: "HARD"
+            failure_reason: "Prevalidation HARD gate or auto-remediation failure in Phase 02"
+            failure_observed: "{{ resolved_error }}"
+            phase_02_failed: true
+
+        - name: "Record Phase 02 failure and dispatch alert via error_handle role"
           include_role:
             name: error_handle
 
-        - name: Tear down cluster session on failure
+        - name: "Execute session logout on Phase 02 failure"
           include_role:
             name: logout
+          failed_when: false
 
-        - name: Halt execution due to Phase 02 failure
+        - name: "Halt execution on Phase 02 failure"
           fail:
-            msg: "Phase 02 (02_Pre_upgrade_check) failed for cluster '{{ cluster_name }}'. Session torn down."
+            msg: "Phase 02 Prevalidation & Auto-Remediation failed: {{ resolved_error }}"
 
+      # ----------------------------------------------------------------------
+      # Always: Fail-Safe Session Logout Guarantee
+      # ----------------------------------------------------------------------
       always:
-        - name: Ensure session logout on failure or dry run
+        - name: "Guarantee session logout if Phase 02 failed"
           include_role:
             name: logout
-          when: (phase02_failed | default(false)) or (dry_run | default(false) | bool)
+          when: phase_02_failed | default(false) | bool
+          failed_when: false

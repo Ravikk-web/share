@@ -1,48 +1,65 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable definitions.
-#
-# monitor role defaults — live upgrade monitoring during each hop.
-#
-# This role polls CV/MCP/nodes at a fixed cadence during each upgrade hop,
-# enforces a timeout guard, sends heartbeat and state-change emails, and
-# asserts the settle-gate before the next hop can proceed.
-#
-# Required variables (supplied by caller — hop.yml):
-#   - hop_target_version    — the version being upgraded to in this hop
-#   - hop_number            — current hop number (1-based)
-#   - hop_total             — total number of hops in upgrade_path
-#   - hop_label             — display label "x/y"
-#   - cluster_name          — target cluster identifier
-#   - kubeconfig_path       — path to the active kubeconfig
-#
-# Cadence variables (inherited from vars/upgrade.yml):
-#   - poll_interval_minutes — how often to poll (default: 2)
-#   - hop_timeout_minutes   — max time for a single hop MCP to complete (default: 90)
-#   - heartbeat_minutes     — interval between heartbeat emails (default: 20)
-
 ---
-# --- Cadence defaults (sourced from vars/upgrade.yml) -------------------------
+# ============================================================================
+# Role Defaults: monitor
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar numbers, booleans, and lists.
+#
+# Purpose: Default configuration parameters for the live upgrade monitor role.
+#          Drives 2-minute polling of ClusterVersion, MachineConfigPools, and
+#          nodes during an active upgrade hop, enforces 90-minute hop timeout,
+#          detects cluster state changes for immediate alert dispatch, sends
+#          20-minute heartbeat progress emails, detects stalled nodes with
+#          optional Tier 2 recovery, and verifies the settle-gate contract.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/smtp.yml
+# Gate type: HARD (strictly gates on hop timeout and cluster settle state)
+# ============================================================================
+
+# Polling cadence in minutes between cluster status checks (default: 2 minutes)
 poll_interval_minutes: 2
+
+# Maximum duration in minutes to wait for an upgrade hop to settle (default: 90 minutes)
 hop_timeout_minutes: 90
+
+# Interval in minutes for dispatching recurring progress heartbeat notifications (default: 20 minutes)
 heartbeat_minutes: 20
 
-# --- Hop context (supplied by caller) ----------------------------------------
+# Tier 2 Guided Auto-Remediation: Force MCD progress on a stalled node via force file
+# Default is false (requires explicit cluster-level opt-in)
+auto_force_stalled_node: false
+
+# Threshold in minutes a single node can remain in updating state before being flagged as stalled
+node_stall_threshold_minutes: 30
+
+# Whether to halt execution on timeout guard or settle-gate failure (HARD gate)
+monitor_enforce_gate: true
+
+# Simulation toggle for dry-run validation without waiting or cluster polling
+dry_run: false
+
+# Maximum retry attempts for oc CLI queries to absorb transient API restarts
+oc_command_retries: 3
+
+# Delay in seconds between oc CLI query retry attempts
+oc_command_retry_delay: 10
+
+# Allow-list of ClusterOperator names permitted to remain degraded or unavailable (default: empty)
+co_allow_list: []
+
+# Notification email subject prefix for progress heartbeats and state changes
+heartbeat_subject_prefix: "[ARO Upgrade]"
+
+# Recipient email list for progress heartbeat notifications
+mail_to: []
+
+# Target version for the current hop (typically passed from tasks/hop.yml)
 hop_target_version: ""
-hop_number: "1"
-hop_total: "1"
+
+# Human-readable hop identifier (e.g. "1/2")
 hop_label: "1/1"
 
-# --- Cluster context (inherited from vars) ------------------------------------
-# cluster_name: "" — inherited from vars/upgrade.yml
-# kubeconfig_path: "" — inherited from vars/paths.yml
+# 1-indexed hop sequence number
+hop_number: 1
 
-# --- Computed: max poll iterations (bounded loop guard) -----------------------
-# Calculated at runtime in tasks/main.yml as:
-#   hop_timeout_minutes / poll_interval_minutes
-# Default: 90 / 2 = 45 iterations
-# This is a fallback default; the actual value is computed dynamically.
-max_poll_iterations: 45
-
-# --- Email subject prefixes (inherited from vars/smtp.yml) --------------------
-# heartbeat_subject_prefix: "[ARO Upgrade] Heartbeat" — inherited
-# alert_subject_prefix: "[ARO Upgrade] ALERT" — inherited
+# Total number of hops in the current upgrade journey
+hop_total: 1

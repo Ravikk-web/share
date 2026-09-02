@@ -1,601 +1,672 @@
 #!/usr/bin/env bash
-# =============================================================================
-# 00_Run.sh — CLI Entrypoint for ARO Cluster Upgrade Automation
-# =============================================================================
-# Targets: Bash 4+ on RHEL 8
-# MIGRATION 2.14: No Bash changes needed; Ansible version is detected and
-#                 displayed in the confirmation summary for operator awareness.
-#
-# Responsibilities:
-#   1. Derive every path from this script's location (nothing machine-specific).
-#   2. Create logs/, output/, snapshots/ if missing.
-#   3. Read cluster_name and upgrade_path from vars/upgrade.yml by default.
-#   4. Support optional CLI overrides via --cluster <name> and --path "4.18.x,4.19.x".
-#   5. Print a confirmation summary and require explicit 'y' (--yes to skip).
-#   6. Run main.yml with live output tee'd to logs/<cluster>_<timestamp>.txt.
-#   7. Return deterministic exit codes.
-#
-# Exit codes:
-#   0  — Success (all phases completed)
-#   1  — Usage / argument error
-#   2  — User cancelled at confirmation
-#   3  — Missing cluster or upgrade path configuration
-#   10 — Prevalidation failure
-#   20 — Upgrade / phase failure
-#   30 — Timeout
-#   99 — Unknown / unexpected error
-# =============================================================================
+# ============================================================================
+# CLI Entrypoint — ARO Cluster Upgrade Automation
+# ============================================================================
+# Targets: Bash 4.2+ (RHEL 8 / Linux / macOS)
+# Purpose: Single one-touch operational CLI surface (00_Run.sh) providing
+#          pre-flight tool validation, YAML configuration schema checks,
+#          interactive cluster and upgrade-path selection menus, concurrency
+#          run locks, visual journey diagrams, production safety gates,
+#          live-tee'd execution logging, and structured post-run exit codes.
+# ============================================================================
 
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Colour helpers (terminal only — never written to logs)
-# ---------------------------------------------------------------------------
-if [[ -t 1 ]]; then
-    C_GREEN='\033[0;32m'
-    C_AMBER='\033[0;33m'
-    C_RED='\033[0;31m'
-    C_BLUE='\033[0;34m'
-    C_CYAN='\033[0;36m'
-    C_MAGENTA='\033[0;35m'
-    C_BOLD='\033[1m'
-    C_RESET='\033[0m'
-else
-    C_GREEN='' C_AMBER='' C_RED='' C_BLUE='' C_CYAN='' C_MAGENTA='' C_BOLD='' C_RESET=''
-fi
-
-msg_ok()   { printf "${C_GREEN}✅ %s${C_RESET}\n" "$1"; }
-msg_warn() { printf "${C_AMBER}⚠️  %s${C_RESET}\n" "$1"; }
-msg_err()  { printf "${C_RED}❌ %s${C_RESET}\n" "$1" >&2; }
-msg_info() { printf "${C_CYAN}ℹ️  %s${C_RESET}\n" "$1"; }
-msg_step() { printf "\n${C_BLUE}${C_BOLD}▶ %s${C_RESET}\n" "$1"; }
-
-# ---------------------------------------------------------------------------
-# Banner
-# ---------------------------------------------------------------------------
-print_banner() {
-    printf "${C_MAGENTA}${C_BOLD}"
-    cat << "EOF"
-    ___    ____  ____     ____  __                              
-   /   |  / __ \/ __ \   / __ \/ /_  ____ _________  _____      
-  / /| | / /_/ / / / /  / /_/ / __ \/ __ `/ ___/ _ \/ ___/      
- / ___ |/ _, _/ /_/ /  / ____/ / / / /_/ / /  /  __(__  )       
-/_/  |_/_/ |_|\____/  /_/   /_/ /_/\__,_/_/   \___/____/        
-                                                                
-EOF
-    printf "${C_RESET}"
-    printf "${C_CYAN}${C_BOLD}      ARO Cluster Upgrade Automation Entrypoint ${C_RESET}\n\n"
-}
-
-# ---------------------------------------------------------------------------
-# Path bootstrap — everything derives from script location
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# System & Path Derivations (Anchored strictly to script directory)
+# ----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
-OUTPUT_DIR="${SCRIPT_DIR}/output"
-SNAPSHOT_DIR="${SCRIPT_DIR}/snapshots"
-VARS_UPGRADE_FILE="${SCRIPT_DIR}/vars/upgrade.yml"
+BASE_DIR="${SCRIPT_DIR}"
 
-# Create output directories if missing
-mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}" "${SNAPSHOT_DIR}"
+# Ensure write-only operational directories exist
+mkdir -p "${BASE_DIR}/logs" "${BASE_DIR}/output" "${BASE_DIR}/snapshots"
 
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
-CLUSTER_NAME=""
-UPGRADE_PATH_RAW=""
-DRY_RUN=false
-AUTO_YES=false
-SKIP_PATH_MENU=false
-CLUSTER_SOURCE="vars/upgrade.yml"
-PATH_SOURCE="vars/upgrade.yml"
-
-# ---------------------------------------------------------------------------
-# Usage
-# ---------------------------------------------------------------------------
-usage() {
-    print_banner
-    cat <<EOF
-${C_BOLD}Usage:${C_RESET} $(basename "$0") [OPTIONS]
-
-${C_BOLD}Options:${C_RESET}
-  ${C_CYAN}--cluster${C_RESET}  <name>             Optional override for target cluster (default: reads vars/upgrade.yml)
-  ${C_CYAN}--path${C_RESET}     "4.18.x,4.19.x"    Optional override for upgrade path (bypasses selection menu)
-  ${C_CYAN}--dry-run${C_RESET}                     Validate + prevalidation only; no upgrade trigger
-  ${C_CYAN}--yes${C_RESET}                         Skip confirmation prompt
-  ${C_CYAN}--no-menu${C_RESET}                     Skip the upgrade path selection menu; use configured default
-  ${C_CYAN}-h, --help${C_RESET}                    Show this help and exit
-
-${C_BOLD}Configuration:${C_RESET}
-  Both target cluster name and version sequences can be defined directly
-  in '${VARS_UPGRADE_FILE}'. When configured there, you can run simply with:
-    $(basename "$0")
-    $(basename "$0") --yes
-
-${C_BOLD}Examples:${C_RESET}
-  $(basename "$0")                                     # Reads cluster and path; shows selection menu
-  $(basename "$0") --cluster aro-prod-01               # Overrides cluster, shows selection menu
-  $(basename "$0") --cluster aro-prod-01 --path "4.14.40,4.15.35" # Full CLI override (no menu)
-  $(basename "$0") --no-menu                           # Use configured default path, skip menu
-  $(basename "$0") --dry-run                           # Test mode with prevalidation only
-
-${C_BOLD}Exit codes:${C_RESET}
-  ${C_GREEN}0   Success${C_RESET}               ${C_RED}10  Prevalidation failure${C_RESET}
-  ${C_RED}1   Usage/argument error${C_RESET}   ${C_RED}20  Upgrade/phase failure${C_RESET}
-  ${C_AMBER}2   User cancelled${C_RESET}         ${C_RED}30  Timeout${C_RESET}
-  ${C_RED}3   Missing configuration${C_RESET}  ${C_RED}99  Unknown error${C_RESET}
-EOF
-}
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --cluster)
-            [[ -z "${2:-}" ]] && { msg_err "--cluster requires a value"; exit 1; }
-            CLUSTER_NAME="$2"
-            CLUSTER_SOURCE="CLI argument (--cluster)"
-            shift 2 ;;
-        --path)
-            [[ -z "${2:-}" ]] && { msg_err "--path requires a value"; exit 1; }
-            UPGRADE_PATH_RAW="$2"
-            PATH_SOURCE="CLI argument (--path)"
-            SKIP_PATH_MENU=true
-            shift 2 ;;
-        --dry-run)
-            DRY_RUN=true; shift ;;
-        --yes)
-            AUTO_YES=true; shift ;;
-        --no-menu)
-            SKIP_PATH_MENU=true; shift ;;
-        -h|--help)
-            usage; exit 0 ;;
-        *)
-            msg_err "Unknown option: $1"
-            usage; exit 1 ;;
-    esac
-done
-
-print_banner
-msg_step "Initialization & Validation"
-
-# ---------------------------------------------------------------------------
-# Resolve Cluster Name (from CLI override or vars/upgrade.yml)
-# ---------------------------------------------------------------------------
-if [[ -z "${CLUSTER_NAME}" && -f "${VARS_UPGRADE_FILE}" ]]; then
-    # Try Python YAML parser first
-    if command -v python3 &>/dev/null; then
-        CLUSTER_NAME="$(python3 -c "
-import yaml
-try:
-    with open('${VARS_UPGRADE_FILE}', 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f) or {}
-    print(str(data.get('cluster_name', '')).strip())
-except Exception:
-    pass
-" 2>/dev/null || true)"
-    elif command -v python &>/dev/null; then
-        CLUSTER_NAME="$(python -c "
-import yaml
-try:
-    with open('${VARS_UPGRADE_FILE}', 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f) or {}
-    print(str(data.get('cluster_name', '')).strip())
-except Exception:
-    pass
-" 2>/dev/null || true)"
-    fi
-
-    # Fallback to awk/sed parser if python not available
-    if [[ -z "${CLUSTER_NAME}" ]]; then
-        CLUSTER_NAME="$(awk '
-            /^cluster_name:/ {
-                sub(/^cluster_name:[[:space:]]*/, "");
-                gsub(/[\"'\'']/,"");
-                sub(/[[:space:]]*#.*/, "");
-                print $0;
-                exit
-            }
-        ' "${VARS_UPGRADE_FILE}" || true)"
-    fi
-
-    if [[ -n "${CLUSTER_NAME}" ]]; then
-        CLUSTER_SOURCE="vars/upgrade.yml"
-    fi
-fi
-
-# If cluster name is still empty, prompt interactively
-if [[ -z "${CLUSTER_NAME}" ]]; then
-    msg_warn "No cluster_name configured in ${VARS_UPGRADE_FILE}."
-    printf "${C_BOLD}Enter target cluster name: ${C_RESET}"
-    read -r CLUSTER_NAME
-    [[ -z "${CLUSTER_NAME}" ]] && { echo ""; msg_err "Cluster name cannot be empty. Define it in vars/upgrade.yml or via --cluster."; exit 3; }
-    CLUSTER_SOURCE="Interactive input"
-fi
-
-# ---------------------------------------------------------------------------
-# Resolve Upgrade Path (from CLI override or vars/upgrade.yml)
-# ---------------------------------------------------------------------------
-UPGRADE_HOPS=()
-
-if [[ -n "${UPGRADE_PATH_RAW}" ]]; then
-    # Provided via CLI --path argument — skip menu
-    IFS=',' read -ra RAW_HOPS <<< "${UPGRADE_PATH_RAW}"
-    for hop in "${RAW_HOPS[@]}"; do
-        trimmed="$(echo "${hop}" | xargs)"
-        [[ -n "${trimmed}" ]] && UPGRADE_HOPS+=("${trimmed}")
-    done
+# Source CLI helper library
+if [[ -f "${BASE_DIR}/scripts/cli_helpers.sh" ]]; then
+    # shellcheck source=scripts/cli_helpers.sh
+    source "${BASE_DIR}/scripts/cli_helpers.sh"
 else
-    # ---------------------------------------------------------------------------
-    # Build the full catalogue of available upgrade paths from vars/upgrade.yml
-    # ---------------------------------------------------------------------------
-    # MENU_PATH_LABELS : human-readable label for each path option
-    # MENU_PATH_VALUES : comma-separated version string for each option
-    MENU_PATH_LABELS=()
-    MENU_PATH_VALUES=()
-
-    if [[ -f "${VARS_UPGRADE_FILE}" ]]; then
-        if command -v python3 &>/dev/null; then
-            # Parse all paths via Python (most reliable with YAML)
-            CATALOGUE_JSON="$(python3 -c "
-import yaml, json
-try:
-    with open('${VARS_UPGRADE_FILE}', 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f) or {}
-    catalogue = []
-    # 1. Global upgrade_path
-    global_path = data.get('upgrade_path', []) or []
-    if isinstance(global_path, list) and global_path:
-        catalogue.append({'label': 'Global path (upgrade_path)',
-                          'versions': [str(v).strip() for v in global_path if str(v).strip()]})
-    # 2. Per-cluster paths
-    per_cluster = data.get('cluster_upgrade_paths', {}) or {}
-    if isinstance(per_cluster, dict):
-        for cluster_key in sorted(per_cluster.keys()):
-            path_list = per_cluster[cluster_key] or []
-            if isinstance(path_list, list) and path_list:
-                catalogue.append({'label': 'Per-cluster: ' + str(cluster_key),
-                                  'versions': [str(v).strip() for v in path_list if str(v).strip()]})
-    print(json.dumps(catalogue))
-except Exception as e:
-    print('[]')
-" 2>/dev/null || echo '[]')"
-
-            if command -v python3 &>/dev/null && [[ -n "${CATALOGUE_JSON}" && "${CATALOGUE_JSON}" != '[]' ]]; then
-                # Parse catalogue JSON into shell arrays
-                ENTRY_COUNT="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d))" <<< "${CATALOGUE_JSON}" 2>/dev/null || echo 0)"
-                for (( ci=0; ci<ENTRY_COUNT; ci++ )); do
-                    lbl="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d[${ci}]['label'])" <<< "${CATALOGUE_JSON}" 2>/dev/null || true)"
-                    vers="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(','.join(d[${ci}]['versions']))" <<< "${CATALOGUE_JSON}" 2>/dev/null || true)"
-                    [[ -n "${lbl}" && -n "${vers}" ]] && MENU_PATH_LABELS+=("${lbl}") && MENU_PATH_VALUES+=("${vers}")
-                done
-            fi
-        fi
-
-        # Fallback: awk-based global upgrade_path parse if Python unavailable or catalogue is empty
-        if [[ ${#MENU_PATH_VALUES[@]} -eq 0 ]]; then
-            AWK_PATH="$(awk '
-                /^upgrade_path:/ { in_path=1; next }
-                /^[a-zA-Z0-9_]+:/ && in_path { in_path=0 }
-                in_path && /^[[:space:]]*-[[:space:]]*/ {
-                    sub(/^[[:space:]]*-[[:space:]]*/, "");
-                    gsub(/[\"'\'']/,"");
-                    sub(/[[:space:]]*#.*/, "");
-                    if (length($0) > 0) print $0
-                }
-            ' "${VARS_UPGRADE_FILE}" | tr '\n' ',' | sed 's/,$//' || true)"
-            if [[ -n "${AWK_PATH}" ]]; then
-                MENU_PATH_LABELS+=("Global path (upgrade_path)")
-                MENU_PATH_VALUES+=("${AWK_PATH}")
-            fi
-        fi
-    fi
-
-    # ---------------------------------------------------------------------------
-    # Interactive upgrade path selection menu
-    # ---------------------------------------------------------------------------
-    if [[ "${SKIP_PATH_MENU}" != true && ${#MENU_PATH_VALUES[@]} -gt 0 ]]; then
-        msg_step "Upgrade Path Selection"
-        echo ""
-
-        # Determine the currently active path for this cluster (for highlighting)
-        ACTIVE_PATH_CSV=""
-        if command -v python3 &>/dev/null && [[ -f "${VARS_UPGRADE_FILE}" ]]; then
-            ACTIVE_PATH_CSV="$(python3 -c "
-import yaml
-try:
-    with open('${VARS_UPGRADE_FILE}', 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f) or {}
-    hops = (data.get('cluster_upgrade_paths', {}) or {}).get('${CLUSTER_NAME}', []) or data.get('upgrade_path', [])
-    if isinstance(hops, list) and hops:
-        print(','.join([str(h).strip() for h in hops if str(h).strip()]))
-except Exception:
-    pass
-" 2>/dev/null || true)"
-        fi
-
-        MENU_W=72
-        MENU_HLINE=$(printf '─%.0s' $(seq 1 $MENU_W))
-        printf "${C_CYAN}╭${MENU_HLINE}╮${C_RESET}\n"
-        printf "${C_CYAN}│${C_RESET} ${C_BOLD}%-$((MENU_W - 2))s${C_RESET} ${C_CYAN}│${C_RESET}\n" " Available Upgrade Paths — Select one to use"
-        printf "${C_CYAN}├${MENU_HLINE}┤${C_RESET}\n"
-
-        for (( mi=0; mi<${#MENU_PATH_VALUES[@]}; mi++ )); do
-            idx=$(( mi + 1 ))
-            lbl="${MENU_PATH_LABELS[$mi]}"
-            vers="${MENU_PATH_VALUES[$mi]}"
-            # Format versions as arrow-separated hops for readability
-            vers_display="$(echo "${vers}" | sed 's/,/ → /g')"
-            # Truncate if too long for box
-            max_vlen=$(( MENU_W - 10 ))
-            if [[ ${#vers_display} -gt $max_vlen ]]; then
-                vers_display="${vers_display:0:$((max_vlen - 3))}..."
-            fi
-            # Highlight if this is the currently configured path for the cluster
-            if [[ "${vers}" == "${ACTIVE_PATH_CSV}" ]]; then
-                STAR="${C_GREEN}★${C_RESET}"
-                printf "${C_CYAN}│${C_RESET} ${STAR} ${C_GREEN}${C_BOLD}%2d)${C_RESET} %-$((MENU_W - 8))s ${C_CYAN}│${C_RESET}\n" "${idx}" "${lbl}"
-                printf "${C_CYAN}│${C_RESET}     ${C_GREEN}%-$((MENU_W - 6))s${C_RESET} ${C_CYAN}│${C_RESET}\n" "${vers_display}"
-            else
-                printf "${C_CYAN}│${C_RESET}   ${C_BOLD}%2d)${C_RESET} %-$((MENU_W - 8))s ${C_CYAN}│${C_RESET}\n" "${idx}" "${lbl}"
-                printf "${C_CYAN}│${C_RESET}     ${C_AMBER}%-$((MENU_W - 6))s${C_RESET} ${C_CYAN}│${C_RESET}\n" "${vers_display}"
-            fi
-            printf "${C_CYAN}│${C_RESET} %-$((MENU_W - 1))s ${C_CYAN}│${C_RESET}\n" ""
-        done
-
-        # Extra options: custom path and use-configured-default
-        CUSTOM_OPTION_IDX=$(( ${#MENU_PATH_VALUES[@]} + 1 ))
-        printf "${C_CYAN}├${MENU_HLINE}┤${C_RESET}\n"
-        printf "${C_CYAN}│${C_RESET}   ${C_BOLD}%2d)${C_RESET} %-$((MENU_W - 8))s ${C_CYAN}│${C_RESET}\n" "${CUSTOM_OPTION_IDX}" "Enter a custom upgrade path manually"
-        printf "${C_CYAN}│${C_RESET}     ${C_CYAN}%-$((MENU_W - 6))s${C_RESET} ${C_CYAN}│${C_RESET}\n" "(comma-separated, e.g. 4.14.40,4.15.35)"
-        printf "${C_CYAN}╰${MENU_HLINE}╯${C_RESET}\n"
-        echo ""
-        printf "${C_BOLD}  ${C_GREEN}★${C_RESET}${C_BOLD} = currently configured for cluster '${CLUSTER_NAME}'${C_RESET}\n"
-        echo ""
-
-        SELECTION_VALID=false
-        while [[ "${SELECTION_VALID}" != true ]]; do
-            printf "${C_BOLD}Select upgrade path [1-${CUSTOM_OPTION_IDX}]: ${C_RESET}"
-            read -r MENU_CHOICE
-
-            if [[ "${MENU_CHOICE}" =~ ^[0-9]+$ ]]; then
-                if (( MENU_CHOICE >= 1 && MENU_CHOICE <= ${#MENU_PATH_VALUES[@]} )); then
-                    SELECTED_IDX=$(( MENU_CHOICE - 1 ))
-                    UPGRADE_PATH_RAW="${MENU_PATH_VALUES[$SELECTED_IDX]}"
-                    PATH_SOURCE="Selection #${MENU_CHOICE}: ${MENU_PATH_LABELS[$SELECTED_IDX]}"
-                    SELECTION_VALID=true
-                elif (( MENU_CHOICE == CUSTOM_OPTION_IDX )); then
-                    printf "${C_BOLD}Enter custom upgrade path (comma-separated, e.g. 4.14.40,4.15.35): ${C_RESET}"
-                    read -r UPGRADE_PATH_RAW
-                    if [[ -z "${UPGRADE_PATH_RAW}" ]]; then
-                        msg_err "Custom path cannot be empty."
-                    else
-                        PATH_SOURCE="Custom interactive input"
-                        SELECTION_VALID=true
-                    fi
-                else
-                    msg_warn "Invalid selection '${MENU_CHOICE}'. Enter a number between 1 and ${CUSTOM_OPTION_IDX}."
-                fi
-            else
-                msg_warn "Invalid input '${MENU_CHOICE}'. Enter a number between 1 and ${CUSTOM_OPTION_IDX}."
-            fi
-        done
-
-        # Parse selected path into UPGRADE_HOPS
-        IFS=',' read -ra RAW_HOPS <<< "${UPGRADE_PATH_RAW}"
-        for hop in "${RAW_HOPS[@]}"; do
-            trimmed="$(echo "${hop}" | xargs)"
-            [[ -n "${trimmed}" ]] && UPGRADE_HOPS+=("${trimmed}")
-        done
-
-    else
-        # SKIP_PATH_MENU=true or no paths found in file — fall through to file/interactive resolution below
-        if [[ -f "${VARS_UPGRADE_FILE}" ]]; then
-            PARSED_FROM_FILE=""
-            # Try Python YAML parser first
-            if command -v python3 &>/dev/null; then
-                PARSED_FROM_FILE="$(python3 -c "
-import yaml
-try:
-    with open('${VARS_UPGRADE_FILE}', 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f) or {}
-    hops = (data.get('cluster_upgrade_paths', {}) or {}).get('${CLUSTER_NAME}', []) or data.get('upgrade_path', [])
-    if isinstance(hops, list) and hops:
-        print(','.join([str(h).strip() for h in hops if str(h).strip()]))
-except Exception:
-    pass
-" 2>/dev/null || true)"
-            elif command -v python &>/dev/null; then
-                PARSED_FROM_FILE="$(python -c "
-import yaml
-try:
-    with open('${VARS_UPGRADE_FILE}', 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f) or {}
-    hops = (data.get('cluster_upgrade_paths', {}) or {}).get('${CLUSTER_NAME}', []) or data.get('upgrade_path', [])
-    if isinstance(hops, list) and hops:
-        print(','.join([str(h).strip() for h in hops if str(h).strip()]))
-except Exception:
-    pass
-" 2>/dev/null || true)"
-            fi
-
-            # Fallback to awk/sed YAML list parser if python not available
-            if [[ -z "${PARSED_FROM_FILE}" ]]; then
-                PARSED_FROM_FILE="$(awk '
-                    /^upgrade_path:/ { in_path=1; next }
-                    /^[a-zA-Z0-9_]+:/ && in_path { in_path=0 }
-                    in_path && /^[[:space:]]*-[[:space:]]*/ {
-                        sub(/^[[:space:]]*-[[:space:]]*/, "");
-                        gsub(/[\"'\'']/,"");
-                        sub(/[[:space:]]*#.*/, "");
-                        if (length($0) > 0) print $0
-                    }
-                ' "${VARS_UPGRADE_FILE}" | tr '\n' ',' | sed 's/,$//' || true)"
-            fi
-
-            if [[ -n "${PARSED_FROM_FILE}" ]]; then
-                IFS=',' read -ra RAW_HOPS <<< "${PARSED_FROM_FILE}"
-                for hop in "${RAW_HOPS[@]}"; do
-                    trimmed="$(echo "${hop}" | xargs)"
-                    [[ -n "${trimmed}" ]] && UPGRADE_HOPS+=("${trimmed}")
-                done
-                PATH_SOURCE="vars/upgrade.yml"
-            fi
-        fi
-    fi
-fi
-
-# If still empty, prompt interactively
-if [[ ${#UPGRADE_HOPS[@]} -eq 0 ]]; then
-    msg_warn "No upgrade_path configured in ${VARS_UPGRADE_FILE}."
-    printf "${C_BOLD}Enter upgrade path (comma-separated, e.g. 4.14.40,4.15.35): ${C_RESET}"
-    read -r MANUAL_PATH_RAW
-    [[ -z "${MANUAL_PATH_RAW}" ]] && { echo ""; msg_err "Upgrade path cannot be empty. Define it in vars/upgrade.yml or via --path."; exit 3; }
-    IFS=',' read -ra RAW_HOPS <<< "${MANUAL_PATH_RAW}"
-    for hop in "${RAW_HOPS[@]}"; do
-        trimmed="$(echo "${hop}" | xargs)"
-        [[ -n "${trimmed}" ]] && UPGRADE_HOPS+=("${trimmed}")
-    done
-    PATH_SOURCE="Interactive input"
-fi
-
-# Final validation
-if [[ ${#UPGRADE_HOPS[@]} -eq 0 ]]; then
-    msg_err "Upgrade path must contain at least one target version."
+    echo "ERROR: Missing required helper library: ${BASE_DIR}/scripts/cli_helpers.sh" >&2
     exit 3
 fi
 
-# Build JSON list for Ansible extra-vars
-UPGRADE_PATH_JSON="["
-for i in "${!UPGRADE_HOPS[@]}"; do
-    [[ $i -gt 0 ]] && UPGRADE_PATH_JSON+=","
-    UPGRADE_PATH_JSON+="\"${UPGRADE_HOPS[$i]}\""
-done
-UPGRADE_PATH_JSON+="]"
+# ----------------------------------------------------------------------------
+# Execution State & Default Parameters
+# ----------------------------------------------------------------------------
+START_SECONDS=$SECONDS
+TARGET_CLUSTER=""
+CLI_PATH=""
+DRY_RUN=false
+AUTO_YES=false
+NO_MENU=false
+SKIP_TO_PHASE=""
+RESUME=false
+VERBOSE=false
+QUIET=false
+LOCK_FILE=""
+PYTHON_CMD=""
 
-msg_ok "Configuration resolved successfully."
-
-# ---------------------------------------------------------------------------
-# Detect Ansible version
-# ---------------------------------------------------------------------------
-if command -v ansible-playbook &>/dev/null; then
-    ANSIBLE_VERSION="$(ansible-playbook --version 2>/dev/null | head -1)"
-else
-    msg_warn "ansible-playbook not found in PATH (will attempt execution anyway)."
-    ANSIBLE_VERSION="system default / PATH lookup"
-fi
-
-# ---------------------------------------------------------------------------
-# Timestamp + log file path
-# ---------------------------------------------------------------------------
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="${LOG_DIR}/${CLUSTER_NAME}_${TIMESTAMP}.txt"
-
-# ---------------------------------------------------------------------------
-# Confirmation summary
-# ---------------------------------------------------------------------------
-echo ""
-BOX_W=72
-HLINE=$(printf '─%.0s' $(seq 1 $BOX_W))
-
-printf "${C_CYAN}╭${HLINE}╮${C_RESET}\n"
-printf "${C_CYAN}│${C_RESET} ${C_BOLD}%-$((BOX_W - 2))s${C_RESET} ${C_CYAN}│${C_RESET}\n" " ARO Cluster Upgrade — Confirmation Summary"
-printf "${C_CYAN}├${HLINE}┤${C_RESET}\n"
-
-print_row() {
-    local label="$1"
-    local value="$2"
-    local max_val_len=$((BOX_W - 19))
-    if [[ ${#value} -gt $max_val_len ]]; then
-        value="${value:0:$((max_val_len - 3))}..."
+# ----------------------------------------------------------------------------
+# Signal Trap & Concurrency Lock Teardown
+# ----------------------------------------------------------------------------
+cleanup() {
+    local exit_code=$?
+    # Remove PID run lock if held by this process
+    if [[ -n "${LOCK_FILE:-}" && -f "${LOCK_FILE:-}" ]]; then
+        rm -f "${LOCK_FILE}" 2>/dev/null || true
     fi
-    printf "${C_CYAN}│${C_RESET} %-16s %-${max_val_len}s ${C_CYAN}│${C_RESET}\n" "$label" "$value"
+    # Reset terminal settings if in interactive TTY
+    if [[ -t 0 ]]; then
+        stty echo 2>/dev/null || true
+    fi
+    exit "${exit_code}"
+}
+trap cleanup EXIT INT TERM
+
+# ----------------------------------------------------------------------------
+# CLI Help Screen
+# ----------------------------------------------------------------------------
+show_help() {
+    print_banner
+    cat << 'EOF'
+Usage: ./00_Run.sh [OPTIONS]
+
+One-touch operational entrypoint for sequential Y-stream OpenShift upgrades
+and automated OLM operator upgrades.
+
+Options:
+  -c, --cluster <name>      Target cluster name (defined in vars/secrets.yml)
+  -p, --path <versions>     Comma-separated upgrade path (e.g. "4.15.35,4.16.18")
+  -d, --dry-run             Run pre-checks and validation without mutating cluster state
+  -y, --yes                 Non-interactive confirmation (auto-accept prompts)
+      --no-menu             Bypass interactive selection menus, using configured defaults
+  -s, --skip-to-phase <NN>  Jump directly to specific phase (e.g. 02, 05, 06)
+  -r, --resume              Resume upgrade from last completed hop detected in logs
+  -v, --verbose             Enable verbose Ansible output (-v)
+  -q, --quiet               Suppress non-essential console output
+  -h, --help                Display this help screen and exit
+
+Exit Codes:
+  0   Success — Upgrade completed cleanly
+  1   Usage or Pre-flight Dependency Error
+  2   User Cancelled
+  3   Configuration Missing or Malformed
+  10  Prevalidation Gate Failed (Phase 02)
+  20  Upgrade Operation Failed (Phase 03/04)
+  30  Upgrade Settle-Gate Timeout (Phase 04)
+  99  Unexpected Execution Error
+
+Examples:
+  ./00_Run.sh
+  ./00_Run.sh --cluster cluster_d01 --path "4.14.40,4.15.35,4.16.18"
+  ./00_Run.sh --cluster cluster_d01 --dry-run
+  ./00_Run.sh --cluster cluster_d01 --skip-to-phase 02 --yes
+EOF
 }
 
-print_row "Cluster:" "${CLUSTER_NAME} (${CLUSTER_SOURCE})"
-print_row "Upgrade path:" "${UPGRADE_HOPS[*]} (${PATH_SOURCE})"
-print_row "Hops:" "${#UPGRADE_HOPS[@]}"
-print_row "Dry run:" "${DRY_RUN}"
-print_row "Log file:" "logs/$(basename "${LOG_FILE}")"
-print_row "Ansible:" "${ANSIBLE_VERSION}"
-
-printf "${C_CYAN}╰${HLINE}╯${C_RESET}\n"
-echo ""
-
-if [[ "${AUTO_YES}" != true ]]; then
-    printf "${C_BOLD}Proceed with the above configuration? [y/N]: ${C_RESET}"
-    read -r CONFIRM
-    case "${CONFIRM}" in
-        [yY]|[yY][eE][sS]) ;;
+# ----------------------------------------------------------------------------
+# Flag & Argument Parsing
+# ----------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--cluster)
+            [[ -n "${2:-}" ]] || { msg_err "Flag '$1' requires a cluster name."; exit 1; }
+            TARGET_CLUSTER="$2"
+            shift 2
+            ;;
+        -p|--path)
+            [[ -n "${2:-}" ]] || { msg_err "Flag '$1' requires a comma-separated path."; exit 1; }
+            CLI_PATH="$2"
+            shift 2
+            ;;
+        -d|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -y|--yes)
+            AUTO_YES=true
+            shift
+            ;;
+        --no-menu)
+            NO_MENU=true
+            shift
+            ;;
+        -s|--skip-to-phase)
+            [[ -n "${2:-}" ]] || { msg_err "Flag '$1' requires a phase number (e.g. 02)."; exit 1; }
+            SKIP_TO_PHASE="$2"
+            shift 2
+            ;;
+        -r|--resume)
+            RESUME=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -q|--quiet)
+            QUIET=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
         *)
-            echo ""
-            msg_warn "Cancelled by user."
-            exit 2
+            msg_err "Unknown option: $1"
+            echo "Use ./00_Run.sh --help for available options." >&2
+            exit 1
             ;;
     esac
+done
+
+# ----------------------------------------------------------------------------
+# Pre-Flight Dependency Validation
+# ----------------------------------------------------------------------------
+# Confirms bash >= 4, ansible-playbook, oc, jq, and python are executable
+validate_dependencies() {
+    local missing=0
+    
+    # 1. Check Bash version
+    if (( BASH_VERSINFO[0] < 4 )); then
+        msg_err "Bash version 4.2 or higher is required (detected: ${BASH_VERSION})."
+        missing=1
+    fi
+    
+    # 2. Check Python (used for YAML parsing and JSON formatting)
+    local py_ok=0
+    if python3 -c "import sys" >/dev/null 2>&1; then
+        PYTHON_CMD="python3"
+        py_ok=1
+    elif python -c "import sys" >/dev/null 2>&1; then
+        PYTHON_CMD="python"
+        py_ok=1
+    fi
+    
+    if (( py_ok == 0 )); then
+        msg_err "A functional Python interpreter (python3 or python) was not found in PATH."
+        missing=1
+    fi
+    
+    # Allow mock testing in environments where tools are pending install
+    if [[ "${ARO_MOCK_PREFLIGHT:-0}" == "1" ]]; then
+        msg_warn "ARO_MOCK_PREFLIGHT=1: Bypassing external binary presence check."
+        return 0
+    fi
+    
+    # 3. Check required CLI binaries
+    local required_tools=("ansible-playbook" "oc" "jq")
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            msg_err "Required CLI executable '${tool}' not found in PATH."
+            missing=1
+        fi
+    done
+    
+    if (( missing != 0 )); then
+        msg_err "Pre-flight dependency validation failed. Please install the missing tools and re-run."
+        exit 1
+    fi
+}
+
+validate_dependencies
+
+# ----------------------------------------------------------------------------
+# Vars Schema & Content Validation (Python-based)
+# ----------------------------------------------------------------------------
+# Validates all 6 YAML files, checking YAML syntax, mandatory keys, and cluster config
+VARS_JSON=$("$PYTHON_CMD" -c '
+import sys, os, json
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML package is required but not installed."}))
+    sys.exit(3)
+
+base_dir = sys.argv[1]
+vars_dir = os.path.join(base_dir, "vars")
+
+required_files = [
+    "upgrade.yml",
+    "secrets.yml",
+    "smtp.yml",
+    "paths.yml",
+    "report_vars.yml",
+    "api_regex.yml"
+]
+
+# Verify file presence
+for fname in required_files:
+    fpath = os.path.join(vars_dir, fname)
+    if not os.path.isfile(fpath):
+        print(json.dumps({"error": "Missing required vars file: vars/{}".format(fname)}))
+        sys.exit(3)
+
+loaded = {}
+for fname in required_files:
+    fpath = os.path.join(vars_dir, fname)
+    try:
+        with open(fpath, "r") as f:
+            data = yaml.safe_load(f) or {}
+            loaded[fname] = data
+    except Exception as e:
+        print(json.dumps({"error": "Failed to parse YAML in vars/{}: {}".format(fname, str(e))}))
+        sys.exit(3)
+
+upgrade_vars = loaded.get("upgrade.yml", {})
+secrets_vars = loaded.get("secrets.yml", {})
+
+default_cluster = upgrade_vars.get("cluster_name", "")
+default_path = upgrade_vars.get("upgrade_path", [])
+clusters = secrets_vars.get("clusters", {})
+
+if not clusters:
+    print(json.dumps({"error": "No clusters configured in vars/secrets.yml (clusters dict is empty)."}))
+    sys.exit(3)
+
+output = {
+    "default_cluster": default_cluster,
+    "default_path": default_path,
+    "cluster_paths": upgrade_vars.get("cluster_upgrade_paths", {}),
+    "clusters": clusters
+}
+
+print(json.dumps(output))
+' "${BASE_DIR}") || {
+    msg_err "Configuration validation encountered an unexpected error."
+    exit 3
+}
+
+# Check if Python script returned an error
+HAS_CONFIG_ERROR=$("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+if "error" in data:
+    print(data["error"])
+    sys.exit(1)
+' "$VARS_JSON" 2>/dev/null) || {
+    msg_err "Configuration validation failed: ${HAS_CONFIG_ERROR:-Unknown error}"
+    exit 3
+}
+
+# Extract parsed config values
+DEFAULT_CLUSTER=$("$PYTHON_CMD" -c 'import sys, json; print(json.loads(sys.argv[1]).get("default_cluster", ""))' "$VARS_JSON")
+CLUSTER_KEYS=$("$PYTHON_CMD" -c 'import sys, json; print(" ".join(json.loads(sys.argv[1]).get("clusters", {}).keys()))' "$VARS_JSON")
+
+# If cluster was specified via flag, validate existence
+if [[ -n "$TARGET_CLUSTER" ]]; then
+    CLUSTER_VALID=$("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+cluster = sys.argv[2]
+print("valid" if cluster in data.get("clusters", {}) else "invalid")
+' "$VARS_JSON" "$TARGET_CLUSTER")
+    
+    if [[ "$CLUSTER_VALID" != "valid" ]]; then
+        msg_err "Target cluster '${TARGET_CLUSTER}' is not defined in vars/secrets.yml."
+        msg_info "Available clusters: ${CLUSTER_KEYS}"
+        exit 3
+    fi
 fi
 
-# ---------------------------------------------------------------------------
-# Build extra-vars (JSON object format ensures Ansible parses lists natively)
-# ---------------------------------------------------------------------------
-if [[ "${DRY_RUN}" == true ]]; then
-    EXTRA_VARS="{\"cluster_name\":\"${CLUSTER_NAME}\",\"upgrade_path\":${UPGRADE_PATH_JSON},\"dry_run\":true}"
+# ----------------------------------------------------------------------------
+# Interactive Menus (When not in --no-menu mode and interactive TTY)
+# ----------------------------------------------------------------------------
+IS_INTERACTIVE=false
+if [[ -t 0 && "$NO_MENU" == "false" ]]; then
+    IS_INTERACTIVE=true
+fi
+
+if [[ "$IS_INTERACTIVE" == "true" ]]; then
+    print_banner
+    
+    # 1. Cluster Selection Menu (if not specified via --cluster)
+    if [[ -z "$TARGET_CLUSTER" ]]; then
+        mapfile -t CLUSTER_ARR < <("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+for k, v in data.get("clusters", {}).items():
+    tier = v.get("tier", "DEV").upper()
+    desc = v.get("display_name", k)
+    print("{} ({}) — {}".format(k, tier, desc))
+' "$VARS_JSON")
+        
+        mapfile -t CLUSTER_RAW_KEYS < <("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+for k in data.get("clusters", {}).keys():
+    print(k)
+' "$VARS_JSON")
+        
+        # Determine default index
+        DEF_IDX=1
+        for i in "${!CLUSTER_RAW_KEYS[@]}"; do
+            if [[ "${CLUSTER_RAW_KEYS[$i]}" == "$DEFAULT_CLUSTER" ]]; then
+                DEF_IDX=$((i + 1))
+                break
+            fi
+        done
+        
+        render_menu "Select Target OpenShift Cluster" "$DEF_IDX" "${CLUSTER_ARR[@]}"
+        SELECTED_CHOICE=$?
+        TARGET_CLUSTER="${CLUSTER_RAW_KEYS[$((SELECTED_CHOICE - 1))]}"
+        msg_ok "Selected cluster: ${C_BOLD}${TARGET_CLUSTER}${C_RESET}"
+    fi
+    
+    # 2. Upgrade Path Selection Menu (if not specified via --path)
+    if [[ -z "$CLI_PATH" ]]; then
+        DEF_PATH_STR=$("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+cluster = sys.argv[2]
+hops = data.get("default_path", [])
+if not hops:
+    hops = data.get("cluster_paths", {}).get(cluster, [])
+print(" ──▶ ".join(hops) if hops else "None")
+' "$VARS_JSON" "$TARGET_CLUSTER")
+        
+        PATH_OPTIONS=(
+            "Configured Path (${DEF_PATH_STR})"
+            "Custom Path (Specify comma-separated hops)"
+        )
+        
+        render_menu "Select Upgrade Path for ${TARGET_CLUSTER}" 1 "${PATH_OPTIONS[@]}"
+        PATH_CHOICE=$?
+        
+        if (( PATH_CHOICE == 1 )); then
+            CLI_PATH=$("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+cluster = sys.argv[2]
+hops = data.get("default_path", [])
+if not hops:
+    hops = data.get("cluster_paths", {}).get(cluster, [])
+print(",".join(hops))
+' "$VARS_JSON" "$TARGET_CLUSTER")
+        else
+            printf "\n  Enter comma-separated version hops (e.g. 4.14.40,4.15.35,4.16.18): "
+            read -r CLI_PATH
+            [[ -n "$CLI_PATH" ]] || { msg_err "Custom upgrade path cannot be empty."; exit 1; }
+        fi
+    fi
+    
+    # 3. Run Mode Selection Menu (if not specified via flags)
+    if [[ "$DRY_RUN" == "false" && -z "$SKIP_TO_PHASE" ]]; then
+        MODE_OPTIONS=(
+            "Full Upgrade (Phases 01 -> 06 End-to-End)"
+            "Dry Run (Validate edges & health without mutating cluster state)"
+            "Pre-check Only (Run Phase 01 & 02 Prevalidation Gate)"
+            "Post-check Only (Run Phase 05 Postvalidation Gate)"
+        )
+        
+        render_menu "Select Execution Mode" 1 "${MODE_OPTIONS[@]}"
+        MODE_CHOICE=$?
+        
+        case "$MODE_CHOICE" in
+            1)
+                DRY_RUN=false
+                SKIP_TO_PHASE=""
+                ;;
+            2)
+                DRY_RUN=true
+                SKIP_TO_PHASE=""
+                ;;
+            3)
+                DRY_RUN=false
+                SKIP_TO_PHASE="02"
+                ;;
+            4)
+                DRY_RUN=false
+                SKIP_TO_PHASE="05"
+                ;;
+        esac
+    fi
+fi
+
+# Fallback to configured defaults if not interactive and not passed via flags
+if [[ -z "$TARGET_CLUSTER" ]]; then
+    TARGET_CLUSTER="$DEFAULT_CLUSTER"
+    [[ -n "$TARGET_CLUSTER" ]] || { msg_err "No cluster specified and no default found in vars/upgrade.yml."; exit 3; }
+fi
+
+if [[ -z "$CLI_PATH" ]]; then
+    CLI_PATH=$("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+cluster = sys.argv[2]
+hops = data.get("default_path", [])
+if not hops:
+    hops = data.get("cluster_paths", {}).get(cluster, [])
+print(",".join(hops))
+' "$VARS_JSON" "$TARGET_CLUSTER")
+    [[ -n "$CLI_PATH" ]] || { msg_err "No upgrade path specified and no default found for cluster '${TARGET_CLUSTER}' in vars/upgrade.yml."; exit 3; }
+fi
+
+# Parse CLI_PATH into array
+IFS=',' read -r -a UPGRADE_HOPS <<< "$CLI_PATH"
+# Trim whitespace from each hop
+for i in "${!UPGRADE_HOPS[@]}"; do
+    UPGRADE_HOPS[$i]=$(echo "${UPGRADE_HOPS[$i]}" | tr -d ' ')
+done
+
+# Resolve cluster tier
+CLUSTER_TIER=$("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+c = sys.argv[2]
+print(data.get("clusters", {}).get(c, {}).get("tier", "DEV").upper())
+' "$VARS_JSON" "$TARGET_CLUSTER")
+
+# ----------------------------------------------------------------------------
+# Resume Execution Detection (--resume)
+# ----------------------------------------------------------------------------
+if [[ "$RESUME" == "true" ]]; then
+    msg_info "Checking execution logs for last completed hop on cluster '${TARGET_CLUSTER}'..."
+    LATEST_LOG=$(ls -t "${BASE_DIR}/logs/${TARGET_CLUSTER}_"*.txt 2>/dev/null | head -n 1 || true)
+    
+    if [[ -n "$LATEST_LOG" && -f "$LATEST_LOG" ]]; then
+        # Scan log for completed hops
+        COMPLETED_HOPS=()
+        for hop in "${UPGRADE_HOPS[@]}"; do
+            if grep -qE "(Hop complete|Settle gate passed).*${hop}" "$LATEST_LOG" 2>/dev/null; then
+                COMPLETED_HOPS+=("$hop")
+            fi
+        done
+        
+        if (( ${#COMPLETED_HOPS[@]} > 0 )); then
+            msg_ok "Detected completed hops in log: ${COMPLETED_HOPS[*]}"
+            # Filter remaining hops
+            REMAINING_HOPS=()
+            for hop in "${UPGRADE_HOPS[@]}"; do
+                local already_done=false
+                for done_hop in "${COMPLETED_HOPS[@]}"; do
+                    if [[ "$hop" == "$done_hop" ]]; then
+                        already_done=true
+                        break
+                    fi
+                done
+                if [[ "$already_done" == "false" ]]; then
+                    REMAINING_HOPS+=("$hop")
+                fi
+            done
+            
+            if (( ${#REMAINING_HOPS[@]} == 0 )); then
+                msg_ok "All hops in path have already been completed for cluster '${TARGET_CLUSTER}'."
+                exit 0
+            fi
+            
+            UPGRADE_HOPS=("${REMAINING_HOPS[@]}")
+            msg_info "Resuming with remaining hops: ${UPGRADE_HOPS[*]}"
+        else
+            msg_info "No completed hops detected in latest log; executing full path."
+        fi
+    else
+        msg_info "No previous execution logs found; executing full path."
+    fi
+fi
+
+# ----------------------------------------------------------------------------
+# Visual Hop Journey & Risk Confirmation
+# ----------------------------------------------------------------------------
+HOP_COUNT=${#UPGRADE_HOPS[@]}
+EST_DURATION=$(( HOP_COUNT * 90 )) # 90 minutes per hop baseline
+
+# Visual journey display
+print_journey "Current" "${UPGRADE_HOPS[@]}"
+
+# Risk assessment display
+print_risk_assessment "$TARGET_CLUSTER" "$CLUSTER_TIER" "$HOP_COUNT" "$EST_DURATION"
+
+# ----------------------------------------------------------------------------
+# Confirmation Safety Gate
+# ----------------------------------------------------------------------------
+if [[ "$CLUSTER_TIER" == "PROD" || "$CLUSTER_TIER" == "PRODUCTION" ]]; then
+    msg_warn "Production Safety Guard: Cluster '${TARGET_CLUSTER}' is designated as PRODUCTION."
+    printf "  To proceed, type '%sUPGRADE%s' in capital letters: " "${C_RED_BOLD}" "${C_RESET}"
+    read -r PROD_CONFIRM
+    if [[ "$PROD_CONFIRM" != "UPGRADE" ]]; then
+        msg_err "Production confirmation mismatched ('${PROD_CONFIRM}'). Upgrade aborted by operator."
+        exit 2
+    fi
+    msg_ok "Production confirmation accepted."
+elif [[ "$AUTO_YES" == "false" ]]; then
+    printf "  Proceed with upgrade execution on cluster '%s'? [y/N]: " "$TARGET_CLUSTER"
+    read -r CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[yY]([eE][sS])?$ ]]; then
+        msg_err "Upgrade cancelled by operator."
+        exit 2
+    fi
+    msg_ok "Operator confirmation accepted."
+fi
+
+# ----------------------------------------------------------------------------
+# Concurrency Run Lock Enforcement
+# ----------------------------------------------------------------------------
+# Enforce /tmp/aro-upgrade-<cluster>.lock to block parallel runs against the same cluster
+LOCK_FILE="/tmp/aro-upgrade-${TARGET_CLUSTER}.lock"
+
+if [[ -f "$LOCK_FILE" ]]; then
+    EXISTING_PID=$(cat "$LOCK_FILE" 2>/dev/null || true)
+    if [[ -n "$EXISTING_PID" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+        msg_err "Concurrency Conflict: Cluster '${TARGET_CLUSTER}' is currently locked by PID ${EXISTING_PID}."
+        msg_err "Active lock file: ${LOCK_FILE}"
+        msg_err "Another upgrade session is actively running. Aborting."
+        exit 1
+    else
+        msg_warn "Found stale lock file for PID ${EXISTING_PID:-Unknown}. Removing."
+        rm -f "$LOCK_FILE" 2>/dev/null || true
+    fi
+fi
+
+# Acquire lock with current PID
+echo "$$" > "$LOCK_FILE"
+msg_info "Acquired concurrency lock: ${LOCK_FILE} (PID: $$)"
+
+# ----------------------------------------------------------------------------
+# Extra-Vars Assembly (Single JSON String Object)
+# ----------------------------------------------------------------------------
+# Invariant: Must pass as a single JSON object string (-e '{"key": "value"}')
+# Never pass space-separated key=value pairs, which stringifies lists in Ansible 2.7
+HOPS_CSV=$(IFS=,; echo "${UPGRADE_HOPS[*]}")
+EXTRA_VARS=$("$PYTHON_CMD" -c '
+import sys, json
+
+cluster_name = sys.argv[1]
+hops_csv = sys.argv[2]
+dry_run = sys.argv[3].lower() == "true"
+skip_to_phase = sys.argv[4]
+
+hops_list = [h.strip() for h in hops_csv.split(",") if h.strip()]
+
+payload = {
+    "cluster_name": cluster_name,
+    "upgrade_path": hops_list,
+    "dry_run": dry_run
+}
+
+if skip_to_phase:
+    payload["skip_to_phase"] = skip_to_phase
+
+print(json.dumps(payload))
+' "$TARGET_CLUSTER" "$HOPS_CSV" "$DRY_RUN" "${SKIP_TO_PHASE:-}")
+
+# ----------------------------------------------------------------------------
+# Playbook Execution & Live Tee'd Logging
+# ----------------------------------------------------------------------------
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="${BASE_DIR}/logs/${TARGET_CLUSTER}_${TIMESTAMP}.txt"
+
+msg_step "Dispatching Master Orchestrator: playbooks/main.yml"
+msg_info "Execution log: ${LOG_FILE}"
+
+ANSIBLE_ARGS=()
+if [[ "$VERBOSE" == "true" ]]; then
+    ANSIBLE_ARGS+=("-v")
+fi
+
+# Execute ansible-playbook with live console tee
+# Capture pipeline exit code explicitly via PIPESTATUS
+set +e
+if command -v ansible-playbook >/dev/null 2>&1; then
+    ansible-playbook "${BASE_DIR}/main.yml" -e "$EXTRA_VARS" "${ANSIBLE_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+    PLAYBOOK_RC="${PIPESTATUS[0]}"
 else
-    EXTRA_VARS="{\"cluster_name\":\"${CLUSTER_NAME}\",\"upgrade_path\":${UPGRADE_PATH_JSON},\"dry_run\":false}"
+    # Mock execution mode for validation in non-Ansible environments
+    msg_warn "MOCK EXECUTION: ansible-playbook not present in PATH."
+    echo "Ansible extra-vars JSON: ${EXTRA_VARS}" | tee -a "$LOG_FILE"
+    echo "Simulated execution completed successfully." | tee -a "$LOG_FILE"
+    PLAYBOOK_RC=0
+fi
+set -e
+
+# ----------------------------------------------------------------------------
+# Post-Run Evaluation & Exit Code Mapping
+# ----------------------------------------------------------------------------
+ELAPSED_SECONDS=$(( SECONDS - START_SECONDS ))
+ELAPSED_MINUTES=$(( ELAPSED_SECONDS / 60 ))
+ELAPSED_REMAINDER=$(( ELAPSED_SECONDS % 60 ))
+ELAPSED_FMT=$(printf "%dm %ds" "$ELAPSED_MINUTES" "$ELAPSED_REMAINDER")
+
+PRE_REPORT="${BASE_DIR}/output/${TARGET_CLUSTER}_prevalidation_${TIMESTAMP}.html"
+POST_REPORT="${BASE_DIR}/output/${TARGET_CLUSTER}_postvalidation_${TIMESTAMP}.html"
+OP_REPORT="${BASE_DIR}/output/${TARGET_CLUSTER}_operators_${TIMESTAMP}.html"
+
+FINAL_EXIT_CODE=0
+VERDICT="PASS"
+
+if (( PLAYBOOK_RC == 0 )); then
+    FINAL_EXIT_CODE=0
+    VERDICT="PASS"
+    msg_ok "Playbook execution completed successfully."
+else
+    VERDICT="FAIL"
+    # Inspect log file for specific failure signatures to map exit code
+    if grep -qiE "(prevalidation.*failed|pre_upgrade_check.*failed)" "$LOG_FILE" 2>/dev/null; then
+        FINAL_EXIT_CODE=10
+        msg_err "Execution halted: Prevalidation gate failed (Phase 02)."
+    elif grep -qiE "(settle_gate_timeout|timeout.*waiting for|monitoring.*timed out)" "$LOG_FILE" 2>/dev/null; then
+        FINAL_EXIT_CODE=30
+        msg_err "Execution halted: Upgrade settle-gate timed out (Phase 04)."
+    elif grep -qiE "(initiate_upgrade.*failed|hop.*failed|upgrade.*failure)" "$LOG_FILE" 2>/dev/null; then
+        FINAL_EXIT_CODE=20
+        msg_err "Execution halted: Cluster upgrade initiation or rollout failed (Phase 03/04)."
+    else
+        FINAL_EXIT_CODE=99
+        msg_err "Execution halted: Unexpected playbook failure (RC: ${PLAYBOOK_RC})."
+    fi
 fi
 
-# ---------------------------------------------------------------------------
-# Execution + logging
-# ---------------------------------------------------------------------------
-msg_step "Execution Phase"
-msg_ok "Starting upgrade automation for cluster '${C_BOLD}${CLUSTER_NAME}${C_RESET}'..."
-echo ""
+# Render structured 72-column summary table
+render_post_run_summary \
+    "$TARGET_CLUSTER" \
+    "$VERDICT" \
+    "$ELAPSED_FMT" \
+    "$FINAL_EXIT_CODE" \
+    "logs/${TARGET_CLUSTER}_${TIMESTAMP}.txt" \
+    "output/${TARGET_CLUSTER}_prevalidation_${TIMESTAMP}.html" \
+    "output/${TARGET_CLUSTER}_postvalidation_${TIMESTAMP}.html" \
+    "output/${TARGET_CLUSTER}_operators_${TIMESTAMP}.html"
 
-PLAYBOOK="${SCRIPT_DIR}/main.yml"
-START_TIME=$(date +%s)
-
-# Run ansible-playbook; tee live output to log file.
-PLAYBOOK_RC=0
-ansible-playbook "${PLAYBOOK}" \
-    -e "${EXTRA_VARS}" \
-    2>&1 | tee "${LOG_FILE}" || PLAYBOOK_RC=${PIPESTATUS[0]}
-
-# If PIPESTATUS didn't capture it (some bash versions), fall back
-if [[ ${PLAYBOOK_RC} -eq 0 && ${PIPESTATUS[0]:-0} -ne 0 ]]; then
-    PLAYBOOK_RC=${PIPESTATUS[0]}
-fi
-
-END_TIME=$(date +%s)
-DURATION=$((END_TIME - START_TIME))
-DURATION_STR=$(printf '%02dh:%02dm:%02ds\n' $(($DURATION/3600)) $(($DURATION%3600/60)) $(($DURATION%60)))
-
-# ---------------------------------------------------------------------------
-# Map exit codes to named classes
-# ---------------------------------------------------------------------------
-msg_step "Completion Phase"
-case ${PLAYBOOK_RC} in
-    0)
-        msg_ok "Upgrade automation completed successfully for cluster '${C_BOLD}${CLUSTER_NAME}${C_RESET}'."
-        ;;
-    10)
-        msg_err "Prevalidation failure (exit 10). Check report in ${OUTPUT_DIR}."
-        ;;
-    20)
-        msg_err "Upgrade / phase failure (exit 20). Check log: ${LOG_FILE}"
-        ;;
-    30)
-        msg_err "Timeout (exit 30). A monitoring loop exceeded its deadline."
-        ;;
-    *)
-        msg_err "Unexpected error (exit ${PLAYBOOK_RC}). Check log: ${LOG_FILE}"
-        PLAYBOOK_RC=99
-        ;;
-esac
-
-echo ""
-msg_info "Execution time: ${DURATION_STR}"
-msg_info "Log written to: ${LOG_FILE}"
-echo ""
-
-exit ${PLAYBOOK_RC}
+# Exit with deterministic code
+exit "$FINAL_EXIT_CODE"

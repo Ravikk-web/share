@@ -1,75 +1,131 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: Short module names (command, fail, set_fact, debug) work
-#                 on both versions. Replace with FQCN only if adopting the
-#                 ansible.builtin.* convention project-wide.
-#                 | default('') is already applied on all optional variables.
-#
-# Login role — establishes a single authenticated session with the target
-# cluster and writes the kubeconfig under playbook_dir.
-#
-# Contract:
-#   - Login happens ONCE; all later phases reuse this session.
-#   - The kubeconfig is written to kubeconfig_path (defaults to playbook_dir/.kubeconfig).
-#   - Password handling uses no_log: true — credentials never appear in logs.
-#   - Context is validated against desired_cluster_api_regex after login.
-#   - On failure, a clear message names the cluster and the error.
-#
-# Required variables (supplied by vars_files or extra-vars):
-#   - login_api_url   (or api_url)   — cluster API endpoint
-#   - login_username  (or username)  — service account name
-#   - login_password  (or password)  — credential (vault reference)
-#   - kubeconfig_path                — where to write the kubeconfig
-#   - desired_cluster_api_regex      — regex to validate the API URL
-#   - cluster_name                   — used in failure messages
-
 ---
-- name: Authenticate to cluster {{ cluster_name | default('UNKNOWN') }}
-  command: >-
-    oc login {{ login_api_url }}
-    -u {{ login_username }}
-    -p {{ login_password }}
-    --kubeconfig {{ kubeconfig_path }}
-    --insecure-skip-tls-verify=true
-  no_log: true
-  register: login_result
-  changed_when: login_result.rc == 0
-  failed_when: false
+# ============================================================================
+# Tasks: login
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses command, assert, set_fact, and fail modules; compatible
+#                 across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Authenticates against the target OpenShift cluster using credentials
+#          referenced from vars/secrets.yml, creates a dedicated session
+#          kubeconfig file under playbook_dir, verifies server identity, and
+#          exports the KUBECONFIG fact for all downstream roles.
+# Dependencies: vars/secrets.yml, vars/paths.yml, vars/api_regex.yml
+# Gate type: HARD (fails immediately and triggers rescue if login or identity fails)
+# ============================================================================
 
-- name: Fail if login was unsuccessful
-  fail:
-    msg: >-
-      Login to cluster '{{ cluster_name | default('UNKNOWN') }}' failed
-      (API: {{ login_api_url | default('NOT SET') }}).
-      Exit code: {{ login_result.rc | default('N/A') }}.
-      Check credentials, API URL, and network connectivity.
-  when: login_result.rc | default(1) != 0
-
-- name: Verify authenticated context — oc whoami --show-server
-  command: oc whoami --show-server --kubeconfig {{ kubeconfig_path }}
-  register: whoami_result
-  changed_when: false
-  failed_when: whoami_result.rc != 0
-
-- name: Store authenticated server URL
+# ----------------------------------------------------------------------------
+# 1. Resolve Credentials and Endpoint Facts
+# ----------------------------------------------------------------------------
+# Why: Allows execution whether cluster parameters were supplied as individual
+#      variables or as part of the structured 'clusters' map in vars/secrets.yml.
+- name: "Resolve cluster endpoint and credentials if not explicitly set"
   set_fact:
-    authenticated_server_url: "{{ whoami_result.stdout | trim }}"
+    cluster_api_url: >-
+      {{ cluster_api_url
+         if (cluster_api_url is defined and cluster_api_url | length > 0)
+         else (clusters[cluster_name].api_url | default(''))
+         if (clusters is defined and cluster_name is defined and cluster_name in clusters)
+         else '' }}
+    cluster_username: >-
+      {{ cluster_username
+         if (cluster_username is defined and cluster_username | length > 0)
+         else (clusters[cluster_name].username | default(''))
+         if (clusters is defined and cluster_name is defined and cluster_name in clusters)
+         else '' }}
+    cluster_password: >-
+      {{ cluster_password
+         if (cluster_password is defined and cluster_password | length > 0)
+         else (clusters[cluster_name].password | default(''))
+         if (clusters is defined and cluster_name is defined and cluster_name in clusters)
+         else '' }}
+  no_log: true
 
-- name: Display authenticated server URL
-  debug:
-    msg: "Authenticated to: {{ authenticated_server_url }}"
+# ----------------------------------------------------------------------------
+# 2. Validate Prerequisites
+# ----------------------------------------------------------------------------
+# Why: Explicitly verifies all necessary facts are present before attempting
+#      CLI execution to avoid cryptic errors.
+- name: "Validate cluster name and credentials exist"
+  assert:
+    that:
+      - cluster_name is defined
+      - cluster_name | length > 0
+      - cluster_api_url is defined
+      - cluster_api_url | length > 0
+      - cluster_username is defined
+      - cluster_username | length > 0
+      - cluster_password is defined
+      - cluster_password | length > 0
+    fail_msg: >-
+      Authentication prerequisites failed. Ensure 'cluster_name', 'cluster_api_url',
+      'cluster_username', and 'cluster_password' are defined and non-empty.
+    success_msg: "Cluster credentials validated for: {{ cluster_name }}"
+  no_log: true
 
-- name: Validate server URL against desired_cluster_api_regex
+# ----------------------------------------------------------------------------
+# 3. Execute OpenShift CLI Login
+# ----------------------------------------------------------------------------
+# Why: Dedicated kubeconfig prevents clobbering ~/.kube/config.
+# Why: no_log: true guarantees zero password leaks in logs or console.
+# Why: retries/delay absorbs transient network blips and API server restarts.
+- name: "Execute OpenShift CLI login"
+  command: >-
+    oc login {{ cluster_api_url }}
+    -u {{ cluster_username }}
+    -p {{ cluster_password }}
+    --kubeconfig={{ kubeconfig_path }}
+    --insecure-skip-tls-verify={{ insecure_skip_tls_verify | bool | lower }}
+  register: oc_login_result
+  failed_when: false
+  no_log: true
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: oc_login_result.rc == 0
+
+# ----------------------------------------------------------------------------
+# 4. Check Login Outcome
+# ----------------------------------------------------------------------------
+# Why: Fail explicitly if authentication was unsuccessful, naming the cluster
+#      endpoint while ensuring passwords remain unexposed.
+- name: "Validate login success"
   fail:
     msg: >-
-      Context validation failed for cluster '{{ cluster_name | default('UNKNOWN') }}'.
-      Expected API URL to match regex '{{ desired_cluster_api_regex | default('NOT SET') }}'
-      but got '{{ authenticated_server_url }}'.
-      This may indicate login connected to the wrong cluster.
-  when: authenticated_server_url is not match(desired_cluster_api_regex | default(''))
+      Authentication failed for cluster '{{ cluster_name }}' at endpoint {{ cluster_api_url }}
+      (exit code {{ oc_login_result.rc }}). Verify cluster reachability, network routing,
+      and service account credentials.
+  when: oc_login_result.rc != 0
 
-- name: Confirm session established for {{ cluster_name | default('UNKNOWN') }}
-  debug:
-    msg: >-
-      ✔ Session established — cluster '{{ cluster_name | default('UNKNOWN') }}'
-      at {{ authenticated_server_url }}.
-      Kubeconfig: {{ kubeconfig_path }}.
+# ----------------------------------------------------------------------------
+# 5. Verify Server Identity
+# ----------------------------------------------------------------------------
+# Why: Guarantees that the session established actually connects to the expected
+#      cluster API URL, preventing DNS spoofing or session hijack.
+- name: "Verify active cluster server identity"
+  command: "oc whoami --show-server --kubeconfig={{ kubeconfig_path }}"
+  register: whoami_server_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: whoami_server_raw.rc == 0
+
+- name: "Assert active cluster server matches expected API endpoint pattern"
+  assert:
+    that:
+      - (whoami_server_raw.stdout | trim) is match(desired_cluster_api_regex)
+    fail_msg: >-
+      Connected server '{{ whoami_server_raw.stdout | trim }}' does not match the
+      required cluster API URL pattern '{{ desired_cluster_api_regex }}'. Possible DNS
+      spoofing or misdirected session.
+    success_msg: "Cluster server identity verified: {{ whoami_server_raw.stdout | trim }}"
+
+# ----------------------------------------------------------------------------
+# 6. Export KUBECONFIG Facts
+# ----------------------------------------------------------------------------
+# Why: Sets environment facts consumed by all subsequent phase playbooks and roles.
+- name: "Export KUBECONFIG facts for subsequent tasks and roles"
+  set_fact:
+    cluster_kubeconfig: "{{ kubeconfig_path }}"
+    ansible_env_kubeconfig: "{{ kubeconfig_path }}"
+    kubeconfig: "{{ kubeconfig_path }}"
+    active_cluster_server: "{{ whoami_server_raw.stdout | trim }}"

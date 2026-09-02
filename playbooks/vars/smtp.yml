@@ -1,22 +1,45 @@
-# Targets Ansible 2.7.17.
-# MIGRATION 2.14: No changes required — pure variable definitions.
+# ============================================================================
+# SMTP Notification & Email Configuration
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Native mail module configuration parameters.
 #
-# SMTP configuration for heartbeat, change-alert, and report emails.
-# All email-sending tasks use sendmail (active) with a commented
-# community.general.mail block for 2.14 migration.
+# Purpose: Defines direct SMTP host, port, authentication parameters, sender,
+#          recipient lists, and subject line tags for notification emails.
+# Dependencies: None
+# Gate type: N/A
+# ============================================================================
 
----
-# --- SMTP server settings ---------------------------------------------------
+# SMTP server hostname or IP address reachable from the jump server
 smtp_host: "smtp.example.com"
+
+# SMTP service port (25 for unauthenticated internal relays, 587 for STARTTLS)
 smtp_port: 25
 
-# --- Sender and recipients ---------------------------------------------------
-mail_from: "aro-upgrade@example.com"
+# Sender email address appearing in the 'From' header
+mail_from: "aro-upgrades@example.com"
+
+# Default distribution list for progress, heartbeat, and completion notices
 mail_to:
   - "platform-team@example.com"
-  - "cloud-ops@example.com"
 
-# --- Subject prefixes --------------------------------------------------------
-# These are prepended to the dynamic subject line (cluster, hop, status).
-heartbeat_subject_prefix: "[ARO Upgrade] Heartbeat"
-alert_subject_prefix: "[ARO Upgrade] ALERT"
+# Distribution list for critical failure alerts and gate aborts
+alert_mail_to:
+  - "platform-team@example.com"
+  - "oncall-platform@example.com"
+
+# Subject line prefix for monitoring heartbeats and progress notifications
+heartbeat_subject_prefix: "[ARO Upgrade]"
+
+# Subject line prefix for critical failure alerts and gate aborts
+alert_subject_prefix: "[ARO Upgrade ALERT]"
+
+# Subject line prefix for final completion digests
+completion_subject_prefix: "[ARO Upgrade COMPLETE]"
+
+# Optional SMTP authentication credentials (empty by default for internal relay)
+smtp_username: "{{ vault_smtp_username | default('') }}"
+smtp_password: "{{ vault_smtp_password | default('') }}"
+
+# SMTP security mode ('never', 'starttls', or 'ssl')
+smtp_secure: "never"
