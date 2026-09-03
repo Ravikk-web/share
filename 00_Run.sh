@@ -40,6 +40,8 @@ DRY_RUN=false
 AUTO_YES=false
 NO_MENU=false
 SKIP_TO_PHASE=""
+STOP_AFTER_PHASE=""
+AUTO_REMEDIATION_MODE=""
 RESUME=false
 VERBOSE=false
 QUIET=false
@@ -79,9 +81,12 @@ Options:
   -c, --cluster <name>      Target cluster name (defined in vars/secrets.yml)
   -p, --path <versions>     Comma-separated upgrade path (e.g. "4.15.35,4.16.18")
   -d, --dry-run             Run pre-checks and validation without mutating cluster state
+      --pre-check           Run pre-upgrade validation gate (Phases 01 & 02) and exit cleanly
+      --post-check          Run post-upgrade validation gate (Phase 05) and exit cleanly
   -y, --yes                 Non-interactive confirmation (auto-accept prompts)
       --no-menu             Bypass interactive selection menus, using configured defaults
   -s, --skip-to-phase <NN>  Jump directly to specific phase (e.g. 02, 05, 06)
+      --stop-after-phase <NN> Halt execution after specific phase (e.g. 02, 05)
   -r, --resume              Resume upgrade from last completed hop detected in logs
       --skip-cgroup         Skip CGroup v2 compatibility check and remediation (for non-admin accounts)
   -v, --verbose             Enable verbose Ansible output (-v)
@@ -102,7 +107,8 @@ Examples:
   ./00_Run.sh
   ./00_Run.sh --cluster cluster_d01 --path "4.14.40,4.15.35,4.16.18"
   ./00_Run.sh --cluster cluster_d01 --dry-run
-  ./00_Run.sh --cluster cluster_d01 --skip-to-phase 02 --yes
+  ./00_Run.sh --cluster cluster_d01 --pre-check --yes
+  ./00_Run.sh --cluster cluster_d01 --skip-to-phase 05 --yes
 EOF
 }
 
@@ -123,6 +129,19 @@ while [[ $# -gt 0 ]]; do
             ;;
         -d|--dry-run)
             DRY_RUN=true
+            STOP_AFTER_PHASE="02"
+            AUTO_REMEDIATION_MODE="false"
+            shift
+            ;;
+        --pre-check|--pre-check-only)
+            DRY_RUN=true
+            STOP_AFTER_PHASE="02"
+            AUTO_REMEDIATION_MODE="true"
+            shift
+            ;;
+        --post-check|--post-check-only)
+            SKIP_TO_PHASE="05"
+            STOP_AFTER_PHASE="05"
             shift
             ;;
         -y|--yes)
@@ -136,6 +155,11 @@ while [[ $# -gt 0 ]]; do
         -s|--skip-to-phase)
             [[ -n "${2:-}" ]] || { msg_err "Flag '$1' requires a phase number (e.g. 02)."; exit 1; }
             SKIP_TO_PHASE="$2"
+            shift 2
+            ;;
+        --stop-after|--stop-after-phase)
+            [[ -n "${2:-}" ]] || { msg_err "Flag '$1' requires a phase number (e.g. 02)."; exit 1; }
+            STOP_AFTER_PHASE="$2"
             shift 2
             ;;
         -r|--resume)
@@ -398,7 +422,7 @@ print(",".join(hops))
     fi
     
     # 3. Run Mode Selection Menu (if not specified via flags)
-    if [[ "$DRY_RUN" == "false" && -z "$SKIP_TO_PHASE" ]]; then
+    if [[ "$DRY_RUN" == "false" && -z "$SKIP_TO_PHASE" && -z "$STOP_AFTER_PHASE" ]]; then
         MODE_OPTIONS=(
             "Full Upgrade (Phases 01 -> 06 End-to-End)"
             "Dry Run (Validate edges & health without mutating cluster state)"
@@ -413,18 +437,24 @@ print(",".join(hops))
             1)
                 DRY_RUN=false
                 SKIP_TO_PHASE=""
+                STOP_AFTER_PHASE=""
                 ;;
             2)
                 DRY_RUN=true
                 SKIP_TO_PHASE=""
+                STOP_AFTER_PHASE="02"
+                AUTO_REMEDIATION_MODE="false"
                 ;;
             3)
-                DRY_RUN=false
-                SKIP_TO_PHASE="02"
+                DRY_RUN=true
+                SKIP_TO_PHASE=""
+                STOP_AFTER_PHASE="02"
+                AUTO_REMEDIATION_MODE="true"
                 ;;
             4)
                 DRY_RUN=false
                 SKIP_TO_PHASE="05"
+                STOP_AFTER_PHASE="05"
                 ;;
         esac
     fi
@@ -527,20 +557,42 @@ print_risk_assessment "$TARGET_CLUSTER" "$CLUSTER_TIER" "$HOP_COUNT" "$EST_DURAT
 # ----------------------------------------------------------------------------
 # Confirmation Safety Gate
 # ----------------------------------------------------------------------------
+IS_MUTATING_UPGRADE=true
+if [[ "$DRY_RUN" == "true" || "${STOP_AFTER_PHASE:-}" == "02" ]]; then
+    IS_MUTATING_UPGRADE=false
+fi
+
 if [[ "$CLUSTER_TIER" == "PROD" || "$CLUSTER_TIER" == "PRODUCTION" ]]; then
-    msg_warn "Production Safety Guard: Cluster '${TARGET_CLUSTER}' is designated as PRODUCTION."
-    printf "  To proceed, type '%sUPGRADE%s' in capital letters: " "${C_RED_BOLD}" "${C_RESET}"
-    read -r PROD_CONFIRM
-    if [[ "$PROD_CONFIRM" != "UPGRADE" ]]; then
-        msg_err "Production confirmation mismatched ('${PROD_CONFIRM}'). Upgrade aborted by operator."
-        exit 2
+    if [[ "$IS_MUTATING_UPGRADE" == "true" ]]; then
+        msg_warn "Production Safety Guard: Cluster '${TARGET_CLUSTER}' is designated as PRODUCTION."
+        printf "  To proceed, type '%sUPGRADE%s' in capital letters: " "${C_RED_BOLD}" "${C_RESET}"
+        read -r PROD_CONFIRM
+        if [[ "$PROD_CONFIRM" != "UPGRADE" ]]; then
+            msg_err "Production confirmation mismatched ('${PROD_CONFIRM}'). Upgrade aborted by operator."
+            exit 2
+        fi
+        msg_ok "Production confirmation accepted."
+    else
+        msg_info "Production Cluster '${TARGET_CLUSTER}': Non-mutating validation mode active."
+        if [[ "$AUTO_YES" == "false" ]]; then
+            printf "  Proceed with validation execution on cluster '%s'? [y/N]: " "$TARGET_CLUSTER"
+            read -r CONFIRM
+            if [[ ! "$CONFIRM" =~ ^[yY]([eE][sS])?$ ]]; then
+                msg_err "Execution cancelled by operator."
+                exit 2
+            fi
+            msg_ok "Operator confirmation accepted."
+        fi
     fi
-    msg_ok "Production confirmation accepted."
 elif [[ "$AUTO_YES" == "false" ]]; then
-    printf "  Proceed with upgrade execution on cluster '%s'? [y/N]: " "$TARGET_CLUSTER"
+    if [[ "$IS_MUTATING_UPGRADE" == "true" ]]; then
+        printf "  Proceed with upgrade execution on cluster '%s'? [y/N]: " "$TARGET_CLUSTER"
+    else
+        printf "  Proceed with validation execution on cluster '%s'? [y/N]: " "$TARGET_CLUSTER"
+    fi
     read -r CONFIRM
     if [[ ! "$CONFIRM" =~ ^[yY]([eE][sS])?$ ]]; then
-        msg_err "Upgrade cancelled by operator."
+        msg_err "Execution cancelled by operator."
         exit 2
     fi
     msg_ok "Operator confirmation accepted."
@@ -583,6 +635,8 @@ hops_csv = sys.argv[2]
 dry_run = sys.argv[3].lower() == "true"
 skip_to_phase = sys.argv[4]
 skip_cgroup_check = sys.argv[5].lower() == "true"
+stop_after_phase = sys.argv[6] if len(sys.argv) > 6 else ""
+auto_remediation = sys.argv[7] if len(sys.argv) > 7 else ""
 
 hops_list = [h.strip() for h in hops_csv.split(",") if h.strip()]
 
@@ -595,11 +649,17 @@ payload = {
 if skip_to_phase:
     payload["skip_to_phase"] = skip_to_phase
 
+if stop_after_phase:
+    payload["stop_after_phase"] = stop_after_phase
+
+if auto_remediation.lower() in ("true", "false"):
+    payload["auto_remediation_enabled"] = (auto_remediation.lower() == "true")
+
 if skip_cgroup_check:
     payload["skip_cgroup_check"] = True
 
 print(json.dumps(payload))
-' "$TARGET_CLUSTER" "$HOPS_CSV" "$DRY_RUN" "${SKIP_TO_PHASE:-}" "$SKIP_CGROUP_CHECK")
+' "$TARGET_CLUSTER" "$HOPS_CSV" "$DRY_RUN" "${SKIP_TO_PHASE:-}" "$SKIP_CGROUP_CHECK" "${STOP_AFTER_PHASE:-}" "${AUTO_REMEDIATION_MODE:-}")
 
 # ----------------------------------------------------------------------------
 # Playbook Execution & Live Tee'd Logging
