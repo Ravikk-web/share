@@ -1,0 +1,34 @@
+---
+# ============================================================================
+# Role Defaults: login
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Standard variable declarations.
+#
+# Purpose: Default configuration variables for the login role. Defines the
+#          session-scoped kubeconfig path, server endpoint validation regex,
+#          TLS verification behavior, and transient command retry parameters.
+# Dependencies: None (consumed by roles/login/tasks/main.yml)
+# Gate type: N/A
+# ============================================================================
+
+# Dedicated session kubeconfig path scoped to the active cluster target
+# Isolated under playbook_dir to avoid mutating user default ~/.kube/config
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig-{{ cluster_name | default('default') }}"
+
+# Regular expression pattern to validate the active cluster API URL
+# Enforces https scheme, valid domain hostname or IP, and port 6443
+desired_cluster_api_regex: "^https://api\\.[a-zA-Z0-9.-]+:6443/?$"
+
+# Default OpenShift CLI binary name or path
+oc_binary: "oc"
+
+# Whether to bypass TLS certificate verification (default true for ARO internal API endpoints)
+insecure_skip_tls_verify: true
+
+# Maximum retry attempts for oc commands against API server
+oc_command_retries: 3
+
+# Seconds to pause between transient oc command retries
+oc_command_retry_delay: 10
+

@@ -1,0 +1,30 @@
+---
+# ============================================================================
+# Role Defaults: api_check
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Simple scalar values.
+#
+# Purpose: Defines default input parameters for the api_check role, which verifies
+#          that the active cluster API URL matches the intended cluster pattern
+#          to prevent mutating operations against an unintended cluster.
+# Dependencies: playbooks/vars/api_regex.yml
+# Gate type: HARD
+# ============================================================================
+
+# Target cluster identifier (string, required)
+# Sourced from vars/upgrade.yml, CLI flag (-c/--cluster), or extra-vars
+cluster_name: ""
+
+# Regular expression pattern for validating active cluster API endpoint URL
+# Matches both standard ARO endpoints (api.aro-d01...) and custom enterprise domains (api.arod01...)
+desired_cluster_api_regex: '^https://api\.[a-zA-Z0-9.-]+:6443/?$'
+
+# Master toggle for enforcing HARD gate failure on validation error
+# Set to false by prevalidation aggregator during diagnostic sweeps before remediation
+api_check_enforce_gate: true
+
+# Transient retry parameters for oc CLI execution
+# Absorbs temporary network hiccups and API server restarts
+oc_command_retries: 3
+oc_command_retry_delay: 10
