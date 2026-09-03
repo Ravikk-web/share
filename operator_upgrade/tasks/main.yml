@@ -1,0 +1,119 @@
+---
+# ============================================================================
+# Role Tasks: operator_upgrade
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names, set_fact, and include_tasks.
+#
+# Purpose: Sequentially discovers and approves pending manual OLM InstallPlans,
+#          monitors ClusterServiceVersion (CSV) rollouts within a bounded loop,
+#          and executes Tier 2 one-shot recovery on stalled CSVs.
+# Dependencies: playbooks/roles/operator_upgrade/defaults/main.yml,
+#               playbooks/vars/upgrade.yml, playbooks/vars/paths.yml
+# Gate type: HARD (Blocks Phase 06 if CSVs fail to settle)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Initialize State Facts & Display Banner
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Initialize execution state facts"
+  set_fact:
+    approved_installplans: []
+    recovered_csvs: []
+    all_csvs_succeeded: false
+
+- name: "operator_upgrade: Display operator upgrade execution banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "OLM OPERATOR UPGRADE & INSTALLPLAN APPROVAL"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name | default('unknown') }}"
+      - "CSV Timeout          : {{ operator_upgrade_timeout_seconds }}s (Poll: {{ operator_upgrade_poll_interval_seconds }}s)"
+      - "Auto-Recovery        : {{ operator_auto_recover_csv | default(true) }}"
+      - "Dry Run Mode         : {{ dry_run | default(false) }}"
+      - "============================================================================"
+
+# ----------------------------------------------------------------------------
+# 2. Discover Unapproved Manual InstallPlans
+# Why: Finds any InstallPlan with spec.approved == false across all namespaces.
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Query and parse unapproved InstallPlans with jq v1.5"
+  shell: |
+    set -o pipefail
+    oc get installplan -A -o json 2>/dev/null | jq -c '
+      [ .items[]? | select(.spec.approved == false) | {
+          name: (.metadata.name // "unknown"),
+          namespace: (.metadata.namespace // "unknown"),
+          csv_names: [ .spec.clusterServiceVersionNames[]? ],
+          phase: (.status.phase // "RequiresApproval")
+        }
+      ]
+    ' || echo '[]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: ip_parsed_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: ip_parsed_raw.rc == 0
+
+- name: "operator_upgrade: Set unapproved InstallPlans fact"
+  set_fact:
+    unapproved_installplans: >-
+      {{ ((ip_parsed_raw.stdout | default('[]') | trim).split('\n') | first | from_json)
+         if (ip_parsed_raw.stdout | default('') | trim | length > 0)
+         else [] }}
+
+# ----------------------------------------------------------------------------
+# 3. Sequentially Approve Manual InstallPlans
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Display unapproved InstallPlans count"
+  debug:
+    msg: "Discovered {{ unapproved_installplans | length }} unapproved manual InstallPlan(s)."
+  when: unapproved_installplans | length > 0
+
+- name: "operator_upgrade: Sequentially approve manual InstallPlans"
+  include_tasks: approve_installplan.yml
+  loop: "{{ unapproved_installplans }}"
+  loop_control:
+    loop_var: ip_item
+  when: unapproved_installplans | length > 0
+
+- name: "operator_upgrade: Confirm when no manual approvals required"
+  debug:
+    msg: "No unapproved manual InstallPlans discovered. All operators are on Automatic approval or already approved."
+  when: unapproved_installplans | length == 0
+
+# ----------------------------------------------------------------------------
+# 4. Monitor CSV Rollout in Bounded Polling Loop
+# Why: Executes bounded polling loop for CSVs to reach Succeeded phase.
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Calculate maximum CSV poll iterations"
+  set_fact:
+    max_csv_poll_iterations: >-
+      {{ ((operator_upgrade_timeout_seconds | int + operator_upgrade_poll_interval_seconds | int - 1) // operator_upgrade_poll_interval_seconds | int)
+         if (operator_upgrade_poll_interval_seconds | int > 0)
+         else 40 }}
+
+- name: "operator_upgrade: Execute bounded CSV monitoring loop"
+  include_tasks: poll_csv_iteration.yml
+  loop: "{{ range(1, (max_csv_poll_iterations | int) + 1) | list }}"
+  loop_control:
+    loop_var: csv_poll_iteration
+
+# ----------------------------------------------------------------------------
+# 5. Settle Assertion
+# Why: Enforces HARD gate ensuring all CSVs have settled at Succeeded phase.
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Assert all CSVs have reached Succeeded phase"
+  fail:
+    msg: "[HARD GATE FAILURE] One or more ClusterServiceVersions failed to reach Succeeded within {{ operator_upgrade_timeout_seconds }}s."
+  when: not (all_csvs_succeeded | default(false) | bool)
+
+- name: "operator_upgrade: Log operator upgrade completion confirmation"
+  debug:
+    msg: "Operator upgrade lifecycle and CSV settlement completed successfully."

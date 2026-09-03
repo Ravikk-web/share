@@ -1,0 +1,72 @@
+---
+# ============================================================================
+# Task File: approve_installplan.yml (roles/operator_upgrade)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names and set_fact; fully compatible.
+#
+# Purpose: Sequentially approves an individual unapproved manual InstallPlan
+#          via deterministic JSON merge patch and emits audit logs.
+# Dependencies: playbooks/roles/operator_upgrade/defaults/main.yml
+# Gate type: HARD / Auto-Remediation
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Display Approval Initiation
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Display approval notice for {{ ip_item.name }}"
+  debug:
+    msg: "Approving manual InstallPlan '{{ ip_item.name }}' in namespace '{{ ip_item.namespace }}' for CSV(s): {{ ip_item.csv_names | join(', ') }}"
+
+# ----------------------------------------------------------------------------
+# 2. Patch InstallPlan with spec.approved=true
+# Why: Approves pending OLM InstallPlan with retry protection.
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Approve manual InstallPlan {{ ip_item.name }}"
+  shell: |
+    set -o pipefail
+    oc patch installplan "{{ ip_item.name }}" -n "{{ ip_item.namespace }}" --type=merge -p '{"spec":{"approved":true}}'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: ip_patch_result
+  until: ip_patch_result.rc == 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  changed_when: true
+  when: not (dry_run | default(false) | bool)
+
+- name: "operator_upgrade: Simulate InstallPlan approval in dry-run mode"
+  debug:
+    msg: "[DRY-RUN SIMULATION] Would patch installplan '{{ ip_item.name }}' in namespace '{{ ip_item.namespace }}' with approved: true"
+  when: dry_run | default(false) | bool
+
+# ----------------------------------------------------------------------------
+# 3. Append to Approved InstallPlans List & Emit Audit Log
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Record approved InstallPlan fact"
+  set_fact:
+    approved_installplans: >-
+      {{ approved_installplans | default([]) + [{
+           'name': ip_item.name,
+           'namespace': ip_item.namespace,
+           'csv_names': ip_item.csv_names,
+           'approved_at': (ansible_date_time.iso8601 if (ansible_date_time is defined and ansible_date_time.iso8601 is defined) else 'current')
+         }] }}
+
+- name: "operator_upgrade: Append approval to human-readable text run log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.txt"
+    line: "[{{ lookup('pipe', 'date +%Y-%m-%d\\ %H:%M:%S') }}] [AUTO-FIX] Approved manual OLM InstallPlan: {{ ip_item.name }} in namespace {{ ip_item.namespace }} for CSV(s): {{ ip_item.csv_names | join(', ') }}"
+    create: true
+  failed_when: false
+  when: not (dry_run | default(false) | bool)
+
+- name: "operator_upgrade: Append approval to machine-parseable CSV audit log"
+  lineinfile:
+    path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.csv"
+    line: "\"{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}\",\"{{ cluster_name | default('cluster') }}\",\"Approve InstallPlan {{ ip_item.name }}\",\"HARD\",\"AUTO-FIXED\",\"Approved manual InstallPlan for OLM operator upgrade\",\"namespace={{ ip_item.namespace }}, csvs={{ ip_item.csv_names | join(';') }}\""
+    create: true
+  failed_when: false
+  when: not (dry_run | default(false) | bool)
