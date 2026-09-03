@@ -38,7 +38,7 @@
   set_fact:
     detected_cgroup_mode: "{{ (cgroup_detect_raw.stdout | default('', true) | trim) if ((cgroup_detect_raw.stdout | default('', true) | trim | length) > 0) else 'v1' }}"
     cgroup_target_requires_v2: "{{ preval_target_requires_cgroup_v2 | default(false) | bool }}"
-    cgroup_needs_patch: "{{ (preval_target_requires_cgroup_v2 | default(false) | bool) and (((cgroup_detect_raw.stdout | default('', true) | trim) if ((cgroup_detect_raw.stdout | default('', true) | trim | length) > 0) else 'v1') != 'v2') }}"
+    cgroup_needs_patch: "{{ (not (skip_cgroup_check | default(false) | bool)) and (preval_target_requires_cgroup_v2 | default(false) | bool) and (((cgroup_detect_raw.stdout | default('', true) | trim) if ((cgroup_detect_raw.stdout | default('', true) | trim | length) > 0) else 'v1') != 'v2') }}"
 
 - name: "Log current CGroup mode status"
   debug:
@@ -48,16 +48,19 @@
       - "Target Requires  : {{ cgroup_target_requires_v2 | bool }} (Target version: {{ preval_resolved_target_version | default('unknown') }})"
       - "Patch Needed     : {{ cgroup_needs_patch | bool }}"
       - "Toggle State     : {{ auto_fix_cgroup_v2 | default(true) | bool }}"
+      - "Skip Configured  : {{ skip_cgroup_check | default(false) | bool }}"
 
 # ----------------------------------------------------------------------------
-# 2. Skip if Already CGroup v2 or Target Does Not Require v2
+# 2. Skip if Already CGroup v2, Target Does Not Require v2, or Check Skipped
 # ----------------------------------------------------------------------------
 - name: "Confirm cluster cgroupMode compatibility"
   debug:
     msg: >-
-      {{ '[PASS] Cluster is already configured with cgroupMode: v2. No remediation required.'
-         if (detected_cgroup_mode == 'v2')
-         else ('[PASS] Upgrade target version (' ~ (preval_resolved_target_version | default('N/A')) ~ ') does not require cgroupMode v2 (cgroupMode: ' ~ detected_cgroup_mode ~ ' supported). No remediation required.') }}
+      {{ '[SKIP] CGroup v2 check skipped via configuration (skip_cgroup_check: true).'
+         if (skip_cgroup_check | default(false) | bool)
+         else ('[PASS] Cluster is already configured with cgroupMode: v2. No remediation required.'
+               if (detected_cgroup_mode == 'v2')
+               else ('[PASS] Upgrade target version (' ~ (preval_resolved_target_version | default('N/A')) ~ ') does not require cgroupMode v2 (cgroupMode: ' ~ detected_cgroup_mode ~ ' supported). No remediation required.')) }}
   when: not (cgroup_needs_patch | bool)
 
 # ----------------------------------------------------------------------------
@@ -106,6 +109,10 @@
 - name: "Evaluate cgroupMode re-verification outcome"
   set_fact:
     cgroup_patch_verified: "{{ (verified_cgroup.stdout | default('', true) | trim) == 'v2' }}"
+    cgroup_is_rbac_error: >-
+      {{ (('forbidden' in (cgroup_patch_result.stderr | default('') | lower)) or
+          ('cannot patch' in (cgroup_patch_result.stderr | default('') | lower)) or
+          ('unauthorized' in (cgroup_patch_result.stderr | default('') | lower))) | bool }}
     cgroup_patch_failure_reason: >-
       {{ (cgroup_patch_result.stderr | default('', true) | trim)
          if (cgroup_patch_result.stderr | default('', true) | trim | length > 0)
@@ -153,24 +160,30 @@
       {%- for item in health_summary | default([]) -%}
         {%- if 'CGroup' in (item.name | default('')) -%}
           {%- set _ = matching.append(1) -%}
+          {%- set effective_gate = 'WARN' if ((not (cgroup_enforce_gate | default(false) | bool)) or (cgroup_is_rbac_error | default(false) | bool)) else item.gate -%}
+          {%- set effective_status = 'AUTO-FIXED' if (cgroup_patch_verified | default(false) | bool) else ('WARN' if (effective_gate == 'WARN') else 'FIX-FAILED') -%}
+          {%- set effective_observed = ('cgroupMode patched to v2 and verified' if (cgroup_patch_verified | default(false) | bool) else (('cgroupMode patch skipped (user account lacks patch permission on nodes.config/cluster; managed cluster SRE will handle node rollout): ' ~ (cgroup_patch_failure_reason | default('unknown') | trim)) if (cgroup_is_rbac_error | default(false) | bool) else ('cgroupMode patch failed: ' ~ (cgroup_patch_failure_reason | default('unknown') | trim)))) -%}
           {%- set _ = updated.append({
             'num': item.num,
             'name': item.name,
-            'gate': item.gate,
-            'status': ('AUTO-FIXED' if (cgroup_patch_verified | default(false) | bool) else 'FIX-FAILED'),
-            'observed': ('cgroupMode patched to v2 and verified' if (cgroup_patch_verified | default(false) | bool) else ('cgroupMode patch failed: ' ~ (cgroup_patch_failure_reason | default('unknown') | trim)))
+            'gate': effective_gate,
+            'status': effective_status,
+            'observed': effective_observed
           }) -%}
         {%- else -%}
           {%- set _ = updated.append(item) -%}
         {%- endif -%}
       {%- endfor -%}
       {%- if matching | length == 0 -%}
+        {%- set effective_gate = 'WARN' if ((not (cgroup_enforce_gate | default(false) | bool)) or (cgroup_is_rbac_error | default(false) | bool)) else 'WARN' -%}
+        {%- set effective_status = 'AUTO-FIXED' if (cgroup_patch_verified | default(false) | bool) else ('WARN' if (effective_gate == 'WARN') else 'FIX-FAILED') -%}
+        {%- set effective_observed = ('cgroupMode patched to v2 and verified' if (cgroup_patch_verified | default(false) | bool) else (('cgroupMode patch skipped (user account lacks patch permission on nodes.config/cluster; managed cluster SRE will handle node rollout): ' ~ (cgroup_patch_failure_reason | default('unknown') | trim)) if (cgroup_is_rbac_error | default(false) | bool) else ('cgroupMode patch failed: ' ~ (cgroup_patch_failure_reason | default('unknown') | trim)))) -%}
         {%- set _ = updated.append({
           'num': ((health_summary | default([]) | length) + 1),
           'name': 'CGroup Mode Compatibility',
-          'gate': 'HARD',
-          'status': ('AUTO-FIXED' if (cgroup_patch_verified | default(false) | bool) else 'FIX-FAILED'),
-          'observed': ('cgroupMode patched to v2 and verified' if (cgroup_patch_verified | default(false) | bool) else ('cgroupMode patch failed: ' ~ (cgroup_patch_failure_reason | default('unknown') | trim)))
+          'gate': effective_gate,
+          'status': effective_status,
+          'observed': effective_observed
         }) -%}
       {%- endif -%}
       {{ updated }}
@@ -251,4 +264,6 @@
     - auto_remediation_enabled | default(true) | bool
     - auto_fix_cgroup_v2 | default(true) | bool
     - not (cgroup_patch_verified | bool)
+    - not (cgroup_is_rbac_error | default(false) | bool)
+    - cgroup_enforce_gate | default(false) | bool
     - remediate_enforce_gate | default(false) | bool

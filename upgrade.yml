@@ -58,6 +58,15 @@ fail_on_zero_disruption_pdb: false
 pv_enforce_gate: false
 pvc_enforce_gate: false
 
+# CGroup Mode Compatibility Policy (Check 14):
+# Set to true to completely bypass CGroup mode checks and auto-remediation.
+# Recommended for non-cluster-admin users or managed ARO environments.
+skip_cgroup_check: false
+
+# Enforce HARD gate for cgroupMode compatibility (default: false — non-blocking WARN advisory).
+# When false, cgroupMode mismatches or RBAC patch restrictions surface as WARN without blocking upgrade.
+cgroup_enforce_gate: false
+
 
 # ----------------------------------------------------------------------------
 # Monitoring Cadences & Timeout Protection (Phase 04)

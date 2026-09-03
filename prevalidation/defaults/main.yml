@@ -39,3 +39,8 @@ oc_command_retry_delay: 10
 
 # Namespace pattern list for critical platform pod health check (Check 13)
 critical_namespace_prefix: "openshift-"
+
+# CGroup Mode Compatibility Policy (Check 14)
+# Sourced from vars/upgrade.yml
+skip_cgroup_check: false
+cgroup_enforce_gate: false
