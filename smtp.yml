@@ -32,11 +32,18 @@ alert_mail_to:
 preval_mail_to:
   - "platform-team@example.com"
 
+# Distribution list for post-upgrade validation & success reports (defaults to mail_to if unset or empty)
+postval_mail_to:
+  - "platform-team@example.com"
+
 # Subject line prefix for monitoring heartbeats and progress notifications
 heartbeat_subject_prefix: "[ARO Upgrade]"
 
 # Subject line prefix for prevalidation reports
 prevalidation_subject_prefix: "[ARO Upgrade PREVALIDATION]"
+
+# Subject line prefix for postvalidation reports
+postvalidation_subject_prefix: "[ARO Upgrade POSTVALIDATION]"
 
 # Subject line prefix for critical failure alerts and gate aborts
 alert_subject_prefix: "[ARO Upgrade ALERT]"
@@ -46,6 +53,10 @@ completion_subject_prefix: "[ARO Upgrade COMPLETE]"
 
 # Master toggle to send prevalidation HTML report via email (default: true)
 send_prevalidation_email: true
+
+# Master toggle to send postvalidation / upgrade success HTML report via email (default: true)
+send_postvalidation_email: true
+send_upgrade_success_email: true
 
 # Optional SMTP authentication credentials (empty by default for internal relay)
 smtp_username: "{{ vault_smtp_username | default('') }}"

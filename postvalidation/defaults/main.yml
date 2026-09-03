@@ -1,0 +1,35 @@
+---
+# ============================================================================
+# Role Defaults: postvalidation (10-Check Postvalidation & Baseline Diff)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Standard YAML dictionary mapping; fully compatible across
+#                 Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Default configuration parameters for the 10-check postvalidation
+#          contract, baseline snapshot location, and gate enforcement rules.
+# Dependencies: vars/upgrade.yml, vars/paths.yml
+# Gate type: HARD (Checks 01–06) / WARN (Checks 07–10)
+# ============================================================================
+
+# Path to the Phase 01 baseline snapshot JSON file
+# Ingested by Check 10 to compute baseline diffing
+baseline_snapshot_file: "{{ baseline_snapshot_file_path | default('') }}"
+
+# Target final version (defaults to last element in upgrade_path or empty string)
+# Check 01 asserts that the cluster has settled at this version
+final_target_version: "{{ (upgrade_path[-1] if (upgrade_path is defined and (upgrade_path | length > 0)) else '') }}"
+
+# Flag controlling whether HARD gates trigger fail:
+# Set to false to perform a non-blocking diagnostic sweep
+postval_enforce_gate: true
+
+# Operator allow list to exclude from degraded/unavailable checks
+co_allow_list: []
+
+# Allowed unschedulable nodes threshold
+allowed_unschedulable_nodes: 0
+
+# Transient query retry parameters for oc CLI calls
+oc_command_retries: 3
+oc_command_retry_delay: 10

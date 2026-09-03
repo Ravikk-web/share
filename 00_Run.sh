@@ -102,6 +102,7 @@ Exit Codes:
   3   Configuration Missing or Malformed
   10  Prevalidation Gate Failed (Phase 02)
   20  Upgrade Operation Failed (Phase 03/04)
+  25  Postvalidation Gate Failed (Phase 05)
   30  Upgrade Settle-Gate Timeout (Phase 04)
   99  Unexpected Execution Error
 
@@ -403,16 +404,18 @@ if not hops:
 print(" ──▶ ".join(hops) if hops else "None")
 ' "$VARS_JSON" "$TARGET_CLUSTER")
         
-        PATH_OPTIONS=(
-            "Configured Path (${DEF_PATH_STR})"
-            "Custom Path (Specify comma-separated hops)"
-        )
-        
-        render_menu "Select Upgrade Path for ${TARGET_CLUSTER}" 1 "${PATH_OPTIONS[@]}"
-        PATH_CHOICE="$MENU_CHOICE"
-        
-        if (( PATH_CHOICE == 1 )); then
-            CLI_PATH=$("$PYTHON_CMD" -c '
+        if [[ "$SKIP_TO_PHASE" == "05" && "$STOP_AFTER_PHASE" == "05" ]]; then
+            PATH_OPTIONS=(
+                "Current Live Cluster Version (Validate settled health at current version)"
+                "Configured Path (${DEF_PATH_STR})"
+                "Custom Path (Specify comma-separated hops)"
+            )
+            render_menu "Select Validation Target for ${TARGET_CLUSTER}" 1 "${PATH_OPTIONS[@]}"
+            PATH_CHOICE="$MENU_CHOICE"
+            if (( PATH_CHOICE == 1 )); then
+                CLI_PATH="current"
+            elif (( PATH_CHOICE == 2 )); then
+                CLI_PATH=$("$PYTHON_CMD" -c '
 import sys, json
 data = json.loads(sys.argv[1])
 cluster = sys.argv[2]
@@ -421,10 +424,34 @@ if not hops:
     hops = data.get("cluster_paths", {}).get(cluster, [])
 print(",".join(hops))
 ' "$VARS_JSON" "$TARGET_CLUSTER")
+            else
+                printf "\n  Enter comma-separated version hops (e.g. 4.14.40,4.15.35,4.16.18): "
+                read -r CLI_PATH
+                [[ -n "$CLI_PATH" ]] || { msg_err "Custom upgrade path cannot be empty."; exit 1; }
+            fi
         else
-            printf "\n  Enter comma-separated version hops (e.g. 4.14.40,4.15.35,4.16.18): "
-            read -r CLI_PATH
-            [[ -n "$CLI_PATH" ]] || { msg_err "Custom upgrade path cannot be empty."; exit 1; }
+            PATH_OPTIONS=(
+                "Configured Path (${DEF_PATH_STR})"
+                "Custom Path (Specify comma-separated hops)"
+            )
+            render_menu "Select Upgrade Path for ${TARGET_CLUSTER}" 1 "${PATH_OPTIONS[@]}"
+            PATH_CHOICE="$MENU_CHOICE"
+            
+            if (( PATH_CHOICE == 1 )); then
+                CLI_PATH=$("$PYTHON_CMD" -c '
+import sys, json
+data = json.loads(sys.argv[1])
+cluster = sys.argv[2]
+hops = data.get("default_path", [])
+if not hops:
+    hops = data.get("cluster_paths", {}).get(cluster, [])
+print(",".join(hops))
+' "$VARS_JSON" "$TARGET_CLUSTER")
+            else
+                printf "\n  Enter comma-separated version hops (e.g. 4.14.40,4.15.35,4.16.18): "
+                read -r CLI_PATH
+                [[ -n "$CLI_PATH" ]] || { msg_err "Custom upgrade path cannot be empty."; exit 1; }
+            fi
         fi
     fi
     
@@ -474,7 +501,10 @@ if [[ -z "$TARGET_CLUSTER" ]]; then
 fi
 
 if [[ -z "$CLI_PATH" ]]; then
-    CLI_PATH=$("$PYTHON_CMD" -c '
+    if [[ "$SKIP_TO_PHASE" == "05" && "$STOP_AFTER_PHASE" == "05" ]]; then
+        CLI_PATH="current"
+    else
+        CLI_PATH=$("$PYTHON_CMD" -c '
 import sys, json
 data = json.loads(sys.argv[1])
 cluster = sys.argv[2]
@@ -483,7 +513,8 @@ if not hops:
     hops = data.get("cluster_paths", {}).get(cluster, [])
 print(",".join(hops))
 ' "$VARS_JSON" "$TARGET_CLUSTER")
-    [[ -n "$CLI_PATH" ]] || { msg_err "No upgrade path specified and no default found for cluster '${TARGET_CLUSTER}' in vars/upgrade.yml."; exit 3; }
+        [[ -n "$CLI_PATH" ]] || { msg_err "No upgrade path specified and no default found for cluster '${TARGET_CLUSTER}' in vars/upgrade.yml."; exit 3; }
+    fi
 fi
 
 # Parse CLI_PATH into array
@@ -668,6 +699,7 @@ if mail_to_cli:
     if recipients:
         payload["mail_to"] = recipients
         payload["preval_mail_to"] = recipients
+        payload["postval_mail_to"] = recipients
 
 if skip_cgroup_check:
     payload["skip_cgroup_check"] = True
@@ -732,6 +764,9 @@ else
     elif grep -qiE "(settle_gate_timeout|timeout.*waiting for|monitoring.*timed out)" "$LOG_FILE" 2>/dev/null; then
         FINAL_EXIT_CODE=30
         msg_err "Execution halted: Upgrade settle-gate timed out (Phase 04)."
+    elif grep -qiE "(postvalidation.*failed|post_upgrade_checks.*failed|Phase 05.*failed)" "$LOG_FILE" 2>/dev/null; then
+        FINAL_EXIT_CODE=25
+        msg_err "Execution halted: Postvalidation gate failed (Phase 05)."
     elif grep -qiE "(initiate_upgrade.*failed|hop.*failed|upgrade.*failure)" "$LOG_FILE" 2>/dev/null; then
         FINAL_EXIT_CODE=20
         msg_err "Execution halted: Cluster upgrade initiation or rollout failed (Phase 03/04)."

@@ -1,0 +1,238 @@
+---
+# ============================================================================
+# Phase 06 Playbook: Operator Upgrade & Workflow Closeout
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses standard play-level vars_files, include_role, and
+#                 block/rescue/always; fully compatible across 2.7 and 2.14.
+#
+# Purpose: Final automation phase of the ARO cluster upgrade lifecycle.
+#          Scans installed OLM operator subscriptions for OCP version
+#          compatibility, approves manual InstallPlans sequentially, verifies
+#          that all CSVs reach Succeeded phase, generates the standalone
+#          Operator Validation HTML report via roles/report, dispatches the
+#          final Upgrade-Complete digest email with all 4 audit attachments,
+#          and performs definitive terminal session logout and token revocation.
+# Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               roles/login, roles/logout, roles/operator_compat,
+#               roles/operator_upgrade, roles/operator_validate,
+#               roles/sendmail, roles/error_handle
+# Gate type: HARD (Operator findings are hard-stops for Phase 06 closeout,
+#                  without rolling back finalized cluster version hops)
+# ============================================================================
+
+- name: "Phase 06 — Operator Upgrade & Workflow Closeout"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+
+  # --------------------------------------------------------------------------
+  # Pre-Tasks: Session Verification & Fallback Authentication
+  # Why: Reuses authenticated session from previous phases (Phase 01–05).
+  #      If invoked standalone or resumed, safely establishes cluster session.
+  # --------------------------------------------------------------------------
+  pre_tasks:
+    - name: "Phase 06: Check if existing authenticated cluster session is present"
+      stat:
+        path: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: p06_kubeconfig_stat
+
+    - name: "Phase 06: Establish authenticated cluster session via login role if needed"
+      include_role:
+        name: login
+      when: not (p06_kubeconfig_stat.stat.exists | default(false))
+
+  # --------------------------------------------------------------------------
+  # Main Tasks: Operator Lifecycle, Digest Dispatch & Terminal Teardown
+  # --------------------------------------------------------------------------
+  tasks:
+    - name: "Phase 06: Execute Operator Upgrade and Workflow Closeout Block"
+      block:
+        # 1. Establish run timestamp for consistent file naming across phases
+        - name: "Ensure run timestamp is established for logs and reports"
+          set_fact:
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+          when: run_timestamp is not defined or run_timestamp | length == 0
+
+        # 2. Display Phase 06 Initiation Banner
+        - name: "Display Phase 06 initiation banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 06: OPERATOR UPGRADE & WORKFLOW CLOSEOUT INITIATED"
+              - "============================================================================"
+              - "Target Cluster       : {{ cluster_name | default('unknown') }}"
+              - "Target OCP Version   : {{ (upgrade_path[-1] if (upgrade_path is defined and upgrade_path | length > 0) else 'unknown') }}"
+              - "Dry Run Mode         : {{ dry_run | default(false) }}"
+              - "Kubeconfig           : {{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+              - "Lifecycle Policy     : FINAL PHASE — TERMINAL LOGOUT UPON COMPLETION"
+              - "============================================================================"
+
+        # 3. Step 1: Scan Operator Compatibility (roles/operator_compat)
+        - name: "1. Scan operator version compatibility via operator_compat role"
+          include_role:
+            name: operator_compat
+
+        # 4. Step 2: Execute Operator Upgrades & Approve InstallPlans (roles/operator_upgrade)
+        - name: "2. Execute operator upgrades and approve InstallPlans via operator_upgrade role"
+          include_role:
+            name: operator_upgrade
+
+        # 5. Step 3: Validate Operator Health & Generate Report (roles/operator_validate)
+        - name: "3. Validate operator health and generate report via operator_validate role"
+          include_role:
+            name: operator_validate
+
+        # 6. Step 4: Resolve Audit Attachments for Final Upgrade-Complete Digest
+        # Resolves 4 files: Prevalidation, Postvalidation, Operator report, Run log.
+        - name: "Resolve audit attachment paths for final completion digest"
+          set_fact:
+            p06_preval_report: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_prevalidation_{{ run_timestamp }}.html"
+            p06_postval_report: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_postvalidation_{{ run_timestamp }}.html"
+            p06_operator_report: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_operators_{{ run_timestamp }}.html"
+            p06_run_log: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+
+        - name: "Audit attachment presence check on disk"
+          stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ p06_preval_report }}"
+            - "{{ p06_postval_report }}"
+            - "{{ p06_operator_report }}"
+            - "{{ p06_run_log }}"
+          register: p06_attachment_stats
+
+        - name: "Filter existing attachments for email dispatch"
+          set_fact:
+            p06_final_attachments: >-
+              {{ p06_attachment_stats.results
+                 | selectattr('stat.exists', 'defined')
+                 | selectattr('stat.exists', 'equalto', true)
+                 | map(attribute='item')
+                 | list }}
+
+        # 7. Configure and Dispatch Final Upgrade-Complete Digest Email
+        - name: "Configure final Upgrade-Complete digest email parameters"
+          set_fact:
+            mail_subject: "{{ completion_subject_prefix | default('[ARO Upgrade COMPLETE]') }} — ALL PHASES COMPLETE ✔ — {{ cluster_name }}"
+            mail_template: "progress-mail.j2"
+            is_upgrade_complete: true
+            all_phases_complete: true
+            is_hop_complete: true
+            target_version: "{{ (upgrade_path[-1] if (upgrade_path is defined and upgrade_path | length > 0) else 'Final Target') }}"
+            current_hop: "{{ upgrade_path | default([1]) | length }}"
+            total_hops: "{{ upgrade_path | default([1]) | length }}"
+            percent_complete: 100
+            elapsed_time: "{{ total_elapsed_duration | default('Completed') }}"
+            attached_reports: >-
+              {{ p06_final_attachments | default([]) | map('basename') | list }}
+            mail_attachments: "{{ p06_final_attachments | default([]) }}"
+
+        - name: "4. Dispatch final Upgrade-Complete digest email via sendmail role"
+          block:
+            - name: "Dispatch final completion digest email"
+              include_role:
+                name: sendmail
+          rescue:
+            - name: "Log warning if final completion email dispatch encountered SMTP error"
+              debug:
+                msg: "[WARN] Upgrade completed successfully, but final email notification dispatch encountered SMTP error: {{ ansible_failed_result.msg | default('SMTP error') }}"
+          when:
+            - not (dry_run | default(false) | bool)
+            - (mail_to | default([]) | length) > 0
+
+        # 8. Step 5: Perform Definitive Session Logout & Token Revocation
+        - name: "5. Perform definitive terminal session logout via logout role"
+          include_role:
+            name: logout
+
+        # 9. Dual Audit Logging of Phase 06 Completion
+        - name: "Log Phase 06 completion to human-readable text run log"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+            line: "[{{ lookup('pipe', 'date +%Y-%m-%d\\ %H:%M:%S') }}] [PHASE-06-SUCCESS] Operator upgrades validated and terminal logout completed for cluster {{ cluster_name }}."
+            create: true
+          failed_when: false
+
+        - name: "Log Phase 06 completion to machine-parseable CSV audit log"
+          lineinfile:
+            path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+            line: "\"{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}\",\"{{ cluster_name }}\",\"Phase 06 Operator Upgrade\",\"HARD\",\"PASS\",\"Operator upgrade and closeout completed\",\"target={{ (upgrade_path[-1] if (upgrade_path is defined and upgrade_path | length > 0) else '') }}\""
+            create: true
+          failed_when: false
+
+      # ----------------------------------------------------------------------
+      # Rescue Block: Error Extraction, Alerting & Terminal Logout
+      # ----------------------------------------------------------------------
+      rescue:
+        # 1. Standardized hierarchical error extraction
+        - name: "Phase 06 Rescue: Extract error details from failed task"
+          set_fact:
+            resolved_error: >-
+              {{ ansible_failed_result.stderr | default('')
+                 if (ansible_failed_result.stderr | default('') | length > 0)
+                 else (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 if (ansible_failed_result.stderr_lines | default([]) | length > 0)
+                 else (ansible_failed_result.msg | default('Unknown error — inspect logs')) }}
+
+        # 2. RBAC authorization error detection
+        - name: "Phase 06 Rescue: Detect RBAC or permission error"
+          set_fact:
+            is_rbac_error: >-
+              {{ (resolved_error | lower is search('forbidden'))
+                 or (resolved_error | lower is search('cannot patch'))
+                 or (resolved_error | lower is search('unauthorized'))
+                 or (resolved_error | lower is search('cannot get'))
+                 or (resolved_error | lower is search('cannot list'))
+                 or (resolved_error | lower is search('cannot create')) }}
+
+        # 3. Pre-set facts before calling error_handle
+        - name: "Phase 06 Rescue: Configure error handling parameters"
+          set_fact:
+            current_step_no: "Phase 06"
+            current_task_name: "Phase 06 Operator Upgrade"
+            current_gate_type: "HARD"
+            failure_reason: "Operator upgrade lifecycle or CSV validation failed in Phase 06"
+            failure_observed: "{{ resolved_error }}"
+            phase_06_failed: true
+
+        - name: "Phase 06 Rescue: Extract error and alert platform team via error_handle role"
+          include_role:
+            name: error_handle
+
+        # 4. Perform terminal logout on failure
+        - name: "Phase 06 Rescue: Perform terminal session logout on failure"
+          include_role:
+            name: logout
+
+        - name: "Phase 06 Rescue: Halt playbook execution with failure reason"
+          fail:
+            msg: "[HARD GATE FAILURE] Phase 06 Operator Upgrade failed: {{ resolved_error }}"
+
+      # ----------------------------------------------------------------------
+      # Always Block: Teardown Safety Verification
+      # ----------------------------------------------------------------------
+      always:
+        - name: "Phase 06 Always: Fail-safe cluster session logout"
+          include_role:
+            name: logout
+
+        - name: "Phase 06: Verify terminal cluster session teardown"
+          stat:
+            path: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+          register: p06_teardown_check
+          failed_when: false
+
+        - name: "Phase 06: Force session cleanup if kubeconfig remains on disk"
+          file:
+            path: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+            state: absent
+          when: p06_teardown_check.stat.exists | default(false)
