@@ -42,6 +42,7 @@ NO_MENU=false
 SKIP_TO_PHASE=""
 STOP_AFTER_PHASE=""
 AUTO_REMEDIATION_MODE=""
+MAIL_TO_CLI=""
 RESUME=false
 VERBOSE=false
 QUIET=false
@@ -87,6 +88,7 @@ Options:
       --no-menu             Bypass interactive selection menus, using configured defaults
   -s, --skip-to-phase <NN>  Jump directly to specific phase (e.g. 02, 05, 06)
       --stop-after-phase <NN> Halt execution after specific phase (e.g. 02, 05)
+  -m, --mail-to <email>     Override recipient email address (comma-separated for multiple)
   -r, --resume              Resume upgrade from last completed hop detected in logs
       --skip-cgroup         Skip CGroup v2 compatibility check and remediation (for non-admin accounts)
   -v, --verbose             Enable verbose Ansible output (-v)
@@ -160,6 +162,11 @@ while [[ $# -gt 0 ]]; do
         --stop-after|--stop-after-phase)
             [[ -n "${2:-}" ]] || { msg_err "Flag '$1' requires a phase number (e.g. 02)."; exit 1; }
             STOP_AFTER_PHASE="$2"
+            shift 2
+            ;;
+        -m|--mail-to)
+            [[ -n "${2:-}" ]] || { msg_err "Flag '$1' requires an email address."; exit 1; }
+            MAIL_TO_CLI="$2"
             shift 2
             ;;
         -r|--resume)
@@ -637,6 +644,7 @@ skip_to_phase = sys.argv[4]
 skip_cgroup_check = sys.argv[5].lower() == "true"
 stop_after_phase = sys.argv[6] if len(sys.argv) > 6 else ""
 auto_remediation = sys.argv[7] if len(sys.argv) > 7 else ""
+mail_to_cli = sys.argv[8] if len(sys.argv) > 8 else ""
 
 hops_list = [h.strip() for h in hops_csv.split(",") if h.strip()]
 
@@ -655,11 +663,17 @@ if stop_after_phase:
 if auto_remediation.lower() in ("true", "false"):
     payload["auto_remediation_enabled"] = (auto_remediation.lower() == "true")
 
+if mail_to_cli:
+    recipients = [m.strip() for m in mail_to_cli.split(",") if m.strip()]
+    if recipients:
+        payload["mail_to"] = recipients
+        payload["preval_mail_to"] = recipients
+
 if skip_cgroup_check:
     payload["skip_cgroup_check"] = True
 
 print(json.dumps(payload))
-' "$TARGET_CLUSTER" "$HOPS_CSV" "$DRY_RUN" "${SKIP_TO_PHASE:-}" "$SKIP_CGROUP_CHECK" "${STOP_AFTER_PHASE:-}" "${AUTO_REMEDIATION_MODE:-}")
+' "$TARGET_CLUSTER" "$HOPS_CSV" "$DRY_RUN" "${SKIP_TO_PHASE:-}" "$SKIP_CGROUP_CHECK" "${STOP_AFTER_PHASE:-}" "${AUTO_REMEDIATION_MODE:-}" "${MAIL_TO_CLI:-}")
 
 # ----------------------------------------------------------------------------
 # Playbook Execution & Live Tee'd Logging
