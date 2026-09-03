@@ -16,28 +16,37 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     exit 1
 fi
 
+# Normalize locale to UTF-8 if unset or basic C, enabling proper character width measurement
+if [[ -z "${LC_ALL:-}" && -z "${LANG:-}" ]]; then
+    export LC_ALL="C.UTF-8" 2>/dev/null || export LANG="C.UTF-8" 2>/dev/null || true
+elif [[ "${LANG:-}" == "C" || "${LC_ALL:-}" == "C" ]]; then
+    if locale -a 2>/dev/null | grep -qi "C\.UTF-8\|en_US\.UTF-8"; then
+        export LC_ALL="C.UTF-8" 2>/dev/null || true
+    fi
+fi
+
 # ----------------------------------------------------------------------------
 # ANSI Color & Style Constants (Terminal TTY Detection)
 # ----------------------------------------------------------------------------
 if [[ -t 1 ]]; then
-    C_RESET="\033[0m"
-    C_BOLD="\033[1m"
-    C_DIM="\033[2m"
-    C_RED="\033[0;31m"
-    C_RED_BOLD="\033[1;31m"
-    C_GREEN="\033[0;32m"
-    C_GREEN_BOLD="\033[1;32m"
-    C_AMBER="\033[0;33m"
-    C_AMBER_BOLD="\033[1;33m"
-    C_YELLOW="\033[0;33m"
-    C_YELLOW_BOLD="\033[1;33m"
-    C_BLUE="\033[0;34m"
-    C_BLUE_BOLD="\033[1;34m"
-    C_MAGENTA="\033[0;35m"
-    C_MAGENTA_BOLD="\033[1;35m"
-    C_CYAN="\033[0;36m"
-    C_CYAN_BOLD="\033[1;36m"
-    C_WHITE_BOLD="\033[1;37m"
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[0;31m'
+    C_RED_BOLD=$'\033[1;31m'
+    C_GREEN=$'\033[0;32m'
+    C_GREEN_BOLD=$'\033[1;32m'
+    C_AMBER=$'\033[0;33m'
+    C_AMBER_BOLD=$'\033[1;33m'
+    C_YELLOW=$'\033[0;33m'
+    C_YELLOW_BOLD=$'\033[1;33m'
+    C_BLUE=$'\033[0;34m'
+    C_BLUE_BOLD=$'\033[1;34m'
+    C_MAGENTA=$'\033[0;35m'
+    C_MAGENTA_BOLD=$'\033[1;35m'
+    C_CYAN=$'\033[0;36m'
+    C_CYAN_BOLD=$'\033[1;36m'
+    C_WHITE_BOLD=$'\033[1;37m'
 else
     C_RESET=""
     C_BOLD=""
@@ -78,23 +87,53 @@ COLOR_CYAN_BOLD="${C_CYAN_BOLD}"
 COLOR_WHITE_BOLD="${C_WHITE_BOLD}"
 
 # ----------------------------------------------------------------------------
-# Box-Drawing Primitives (UTF-8 Standard 72-Column Width)
+# Box-Drawing Primitives (UTF-8 Standard 72-Column Width & ASCII Fallback)
 # ----------------------------------------------------------------------------
-BOX_TL="╭"
-BOX_TR="╮"
-BOX_BL="╰"
-BOX_BR="╯"
-BOX_H="─"
-BOX_V="│"
-BOX_ML="├"
-BOX_MR="┤"
+# Detect terminal UTF-8 capability:
+_has_utf8=false
+if [[ "${LANG:-}" =~ [Uu][Tt][Ff]-?8 ]] || [[ "${LC_ALL:-}" =~ [Uu][Tt][Ff]-?8 ]] || [[ "${LC_CTYPE:-}" =~ [Uu][Tt][Ff]-?8 ]]; then
+    _has_utf8=true
+elif [[ -n "${WT_SESSION:-}" || -n "${TERM_PROGRAM:-}" || "${TERM:-}" =~ (xterm-256color|xterm|rxvt|screen|tmux) ]]; then
+    _has_utf8=true
+fi
+
+if [[ "${ARO_CLI_ASCII:-false}" == "true" ]] || [[ "$_has_utf8" == "false" && "${LANG:-}" == "C" ]]; then
+    BOX_TL="+"
+    BOX_TR="+"
+    BOX_BL="+"
+    BOX_BR="+"
+    BOX_H="-"
+    BOX_V="|"
+    BOX_ML="+"
+    BOX_MR="+"
+    CHAR_DEFAULT="*"
+    CHAR_ARROW="-->"
+else
+    BOX_TL="╭"
+    BOX_TR="╮"
+    BOX_BL="╰"
+    BOX_BR="╯"
+    BOX_H="─"
+    BOX_V="│"
+    BOX_ML="├"
+    BOX_MR="┤"
+    CHAR_DEFAULT="★"
+    CHAR_ARROW="──▶"
+fi
 BOX_WIDTH=72
 
 # Strip ANSI color escape sequences to calculate visible character count
+# Pure Bash pattern replacement: strips genuine ANSI bytes and literal escape strings without spawning subshells
 strip_ansi() {
     local text="$1"
-    printf "%s" "$text" | sed -E $'s/\033\\[[0-9;]*[a-zA-Z]//g' 2>/dev/null || \
-    printf "%s" "$text" | sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' 2>/dev/null || \
+    local esc_pattern=$'\033\\[[0-9;?]*[a-zA-Z]'
+    while [[ "$text" =~ $esc_pattern ]]; do
+        text="${text//${BASH_REMATCH[0]}/}"
+    done
+    local lit_pattern='(\\033|\\e)\[[0-9;?]*[a-zA-Z]'
+    while [[ "$text" =~ $lit_pattern ]]; do
+        text="${text//${BASH_REMATCH[0]}/}"
+    done
     printf "%s" "$text"
 }
 
@@ -110,14 +149,17 @@ visible_length() {
 draw_horizontal_line() {
     local width="${1:-$BOX_WIDTH}"
     local line=""
+    local i
     for ((i=0; i<width; i++)); do line+="${BOX_H}"; done
     printf "%s\n" "$line"
 }
 
 # Draw top border with optional embedded title: ╭──── [ Title ] ────╮
+# Accommodates 6 embellishment characters: " [ " (3) and " ] " (3)
 draw_box_header() {
     local title="${1:-}"
     local inner_width=$((BOX_WIDTH - 2)) # 70
+    local i
     
     if [[ -z "$title" ]]; then
         local bar=""
@@ -128,7 +170,7 @@ draw_box_header() {
     
     local title_len
     title_len=$(visible_length "$title")
-    local total_title_len=$((title_len + 4)) # " [ " + title + " ] "
+    local total_title_len=$((title_len + 6)) # " [ " + title + " ] " is 6 characters
     
     if (( total_title_len >= inner_width )); then
         # Title too long for embellishment, print compact header
@@ -152,6 +194,7 @@ draw_box_header() {
 draw_box_divider() {
     local inner_width=$((BOX_WIDTH - 2)) # 70
     local bar=""
+    local i
     for ((i=0; i<inner_width; i++)); do bar+="${BOX_H}"; done
     printf "${C_CYAN}%s%s%s${C_RESET}\n" "${BOX_ML}" "${bar}" "${BOX_MR}"
 }
@@ -160,6 +203,7 @@ draw_box_divider() {
 draw_box_footer() {
     local inner_width=$((BOX_WIDTH - 2)) # 70
     local bar=""
+    local i
     for ((i=0; i<inner_width; i++)); do bar+="${BOX_H}"; done
     printf "${C_CYAN}%s%s%s${C_RESET}\n" "${BOX_BL}" "${bar}" "${BOX_BR}"
 }
@@ -178,7 +222,7 @@ draw_box_row() {
     else
         local pad_len=$(( inner_width - vis_len ))
         local padding=""
-        for ((i=0; i<pad_len; i++)); do padding+=" "; done
+        printf -v padding "%*s" "$pad_len" ""
         printf "${C_CYAN}%s${C_RESET} %s%s ${C_CYAN}%s${C_RESET}\n" "${BOX_V}" "$content" "$padding" "${BOX_V}"
     fi
 }
@@ -223,11 +267,12 @@ log_autofix() { msg_autofix "$*"; }
 print_banner() {
     printf "${C_MAGENTA_BOLD}"
     cat << 'EOF'
-    _   ___  ___    _   _                        _      
-   /_\ | _ \/ _ \  | | | |_ __  __ _ _ _ __ _ __| | ___ 
-  / _ \|   / (_) | | |_| | '_ \/ _` | '_/ _` / _` /| -_)
- /_/ \_\_|_\\___/   \___/| .__/\__, |_| \__,_\__,/ \___|
-                         |_|   |___/                   
+  ___  ____   ___    _   _                                _      
+ / _ \|  _ \ / _ \  | | | |_ __   __ _ _ __ __ _  __| | ___ 
+| | | | |_) | | | | | | | | '_ \ / _` | '__/ _` |/ _` |/ _ \
+| |_| |  _ <| |_| | | |_| | |_) | (_| | | | (_| | (_| |  __/
+ \___/|_| \_\\___/   \___/| .__/ \__, |_|  \__,_|\__,_|\___|
+                          |_|    |___/                      
 EOF
     printf "${C_RESET}"
     printf "${C_CYAN_BOLD}  %s${C_RESET}\n" "ARO CLUSTER UPGRADE AUTOMATION — Version 2.0"
@@ -247,10 +292,11 @@ print_journey() {
     local current_version="${1:-Unknown}"
     shift || true
     local hops=("$@")
+    local hop
     
     local route_str="${current_version}"
     for hop in "${hops[@]}"; do
-        route_str+=" ──▶ ${hop}"
+        route_str+=" ${CHAR_ARROW:-──▶} ${hop}"
     done
     
     draw_box_header "Planned Upgrade Journey"
@@ -310,13 +356,14 @@ render_menu() {
     shift 2
     local options=("$@")
     local num_options=${#options[@]}
+    local i
     
     draw_box_header "$title"
     for ((i=1; i<=num_options; i++)); do
         local opt_text="${options[$((i-1))]}"
         local row_str
         if (( i == default_idx )); then
-            row_str="  [${C_BOLD}${i}${C_RESET}] ${opt_text} ${C_GREEN_BOLD}★ (Default)${C_RESET}"
+            row_str="  [${C_BOLD}${i}${C_RESET}] ${opt_text} ${C_GREEN_BOLD}${CHAR_DEFAULT:-★} (Default)${C_RESET}"
         else
             row_str="  [${i}] ${opt_text}"
         fi
@@ -336,8 +383,8 @@ render_menu() {
         
         # Validate selection is a valid numeric index within range
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= num_options )); then
-            MENU_SELECTED_INDEX="$choice"
-            MENU_SELECTED_VALUE="${options[$((choice-1))]}"
+            export MENU_SELECTED_INDEX="$choice"
+            export MENU_SELECTED_VALUE="${options[$((choice-1))]}"
             return "$choice"
         else
             printf "  ${C_RED_BOLD}Invalid selection '%s'. Please choose a number between 1 and %d.${C_RESET}\n" "$choice" "$num_options"
