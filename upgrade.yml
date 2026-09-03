@@ -48,8 +48,16 @@ max_cpu_percent: 90
 # Maximum node memory utilization percentage allowed before flagging a warning
 max_memory_percent: 90
 
-# Enforce strict PodDisruptionBudget check (fail if any PDB allows 0 disruptions)
-fail_on_zero_disruption_pdb: true
+# PodDisruptionBudget Health Check Policy (Check 12):
+# Default: WARN advisory (audits zero-disruption PDBs for visibility without blocking).
+# Strict: Set to true if zero-disruption PDBs should halt upgrades.
+fail_on_zero_disruption_pdb: false
+
+# Storage Volumes (PV/PVC) Health Check Policy:
+# Enforced strictly as non-blocking WARN advisories (never a HARD gate).
+pv_enforce_gate: false
+pvc_enforce_gate: false
+
 
 # ----------------------------------------------------------------------------
 # Monitoring Cadences & Timeout Protection (Phase 04)

@@ -1,0 +1,400 @@
+---
+# ============================================================================
+# Role Tasks: prevalidation (14-Check Prevalidation Aggregator)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses include_role for modular health check invocation and
+#                 standard short module names (shell, set_fact, debug).
+#                 Never uses bare include:. Compatible across 2.7 and 2.14.
+#
+# Purpose: Orchestrates the complete 14-check prevalidation contract defined
+#          in context/feature-spec/09-prevalidation-and-phase02.md.
+#          Executes all 14 checks (8 HARD gates, 6 WARN advisories) without
+#          premature abort, populating a structured health_summary list for
+#          downstream auto-remediation, residual gate evaluation, and report rendering.
+# Dependencies: playbooks/vars/upgrade.yml, playbooks/vars/paths.yml,
+#               roles/co, roles/node, roles/mcp, roles/api_check,
+#               roles/api_readiness, roles/etcd, roles/utilization,
+#               roles/pv, roles/pvc, roles/pdb
+# Gate type: HARD / WARN (Aggregated health contract scan)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 0. Initialize Prevalidation Context & Gate Suppression
+# Why: Reset health_summary to guarantee a clean 14-check list.
+# Why: Suppress individual role fail: gates so all 14 checks execute and
+#      populate health_summary before auto-remediation and final gate evaluation.
+# ----------------------------------------------------------------------------
+- name: "Initialize prevalidation health summary tracking list"
+  set_fact:
+    health_summary: []
+    co_enforce_gate: false
+    node_enforce_gate: false
+    mcp_enforce_gate: false
+    api_check_enforce_gate: false
+    api_readiness_enforce_gate: false
+    etcd_enforce_gate: false
+    utilization_enforce_gate: false
+    pdb_enforce_gate: false
+    pv_enforce_gate: false
+    pvc_enforce_gate: false
+    preval_resolved_target_version: >-
+      {{ preval_target_version
+         if (preval_target_version is defined and preval_target_version | length > 0)
+         else (upgrade_path[0] if (upgrade_path is defined and upgrade_path | length > 0) else '4.14.0') }}
+
+- name: "Display 14-Check Prevalidation Contract initiation banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "PREVALIDATION CONTRACT: EXECUTING 14-CHECK SYSTEM SCAN"
+      - "============================================================================"
+      - "Target Cluster   : {{ cluster_name }}"
+      - "Target Hop       : {{ preval_resolved_target_version }}"
+      - "Scan Mode        : Comprehensive (All 14 checks execute prior to gate)"
+      - "============================================================================"
+
+# ----------------------------------------------------------------------------
+# Check 01: ClusterOperators Health (co role)
+# Gate: HARD | Rule: All operators Available=True, Degraded=False
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 01/14: Execute ClusterOperators health evaluation"
+  include_role:
+    name: co
+
+# ----------------------------------------------------------------------------
+# Check 02: Node Readiness & Pressures (node role)
+# Gate: HARD | Rule: All nodes Ready=True; no Memory/Disk/PID pressures
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 02/14: Execute Node readiness and condition evaluation"
+  include_role:
+    name: node
+
+# ----------------------------------------------------------------------------
+# Check 03: MachineConfigPool Sync & Pause (mcp role)
+# Gate: HARD | Rule: Updated=True, Degraded=False, spec.paused=false (Auto-Fixable)
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 03/14: Execute MachineConfigPool synchronization evaluation"
+  include_role:
+    name: mcp
+
+# ----------------------------------------------------------------------------
+# Check 04: API Server Context (api_check role)
+# Gate: HARD | Rule: Active URL matches desired_cluster_api_regex
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 04/14: Execute API server context evaluation"
+  include_role:
+    name: api_check
+
+# ----------------------------------------------------------------------------
+# Check 05: API Server Readiness (api_readiness role)
+# Gate: HARD | Rule: /readyz endpoint returns ok
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 05/14: Execute API server readiness (/readyz) evaluation"
+  include_role:
+    name: api_readiness
+
+# ----------------------------------------------------------------------------
+# Check 06: etcd Quorum & Health (etcd role)
+# Gate: HARD | Rule: All etcd members healthy and quorum established
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 06/14: Execute etcd control-plane quorum evaluation"
+  include_role:
+    name: etcd
+
+# ----------------------------------------------------------------------------
+# Check 07: Administrator Acknowledgements (Admin-Acks)
+# Gate: HARD | Rule: No pending AdminAckRequired blocking upgrade (Auto-Fixable)
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 07/14: Query live ClusterVersion for pending admin acknowledgement conditions"
+  shell: |
+    set -o pipefail
+    oc get clusterversion version -o json | jq -r '
+      [.status.conditions[]? | select((.type == "Upgradeable") and (((.status // "") == "False") or ((.reason // "") == "AdminAckRequired"))) | .message // ""] | join(" ")
+    '
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: preval_admin_ack_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: preval_admin_ack_raw.rc == 0
+
+- name: "Prevalidation Check 07/14: Extract dynamic admin-ack keys from condition message"
+  shell: |
+    set -o pipefail
+    echo "{{ preval_admin_ack_raw.stdout | default('') }}" | grep -oE 'ack-[0-9]+\.[0-9]+-api-removals-in-[0-9]+\.[0-9]+' | sort -u || true
+  args:
+    executable: /bin/bash
+  register: preval_extracted_ack_keys
+  changed_when: false
+
+- name: "Prevalidation Check 07/14: Query existing openshift-config/admin-acks ConfigMap"
+  shell: |
+    set -o pipefail
+    oc get configmap admin-acks -n openshift-config -o json 2>/dev/null || echo "{}"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: preval_existing_ack_cm_raw
+  changed_when: false
+  failed_when: false
+
+- name: "Prevalidation Check 07/14: Evaluate admin acknowledgement satisfaction"
+  set_fact:
+    preval_detected_ack_keys: "{{ preval_extracted_ack_keys.stdout_lines | default([]) }}"
+    preval_existing_ack_data: "{{ (preval_existing_ack_cm_raw.stdout | default('{}') | from_json)['data'] | default({}) }}"
+
+- name: "Prevalidation Check 07/14: Determine missing administrator acknowledgement keys"
+  set_fact:
+    preval_missing_ack_keys: >-
+      {%- set missing = [] -%}
+      {%- for key in preval_detected_ack_keys -%}
+        {%- if (preval_existing_ack_data[key] is not defined) or (preval_existing_ack_data[key] | string | trim | lower != 'true') -%}
+          {%- set _ = missing.append(key) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ missing }}
+
+- name: "Prevalidation Check 07/14: Construct Check 07 structured health record"
+  set_fact:
+    admin_ack_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "Administrator Acknowledgement (Admin-Acks)"
+      gate: "HARD"
+      status: "{{ 'PASS' if ((preval_missing_ack_keys | default([]) | length) == 0) else 'FAIL' }}"
+      observed: >-
+        {{ 'All required administrator acknowledgements satisfied'
+           if ((preval_missing_ack_keys | default([]) | length) == 0)
+           else ('Pending admin acknowledgements required: ' ~ (preval_missing_ack_keys | join(', ')) ~ ' (Auto-fixable)') }}
+
+- name: "Prevalidation Check 07/14: Record admin acknowledgement result to health_summary"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [admin_ack_health_item] }}"
+
+- name: "Prevalidation Check 07/14: Log Check 07 outcome"
+  debug:
+    msg:
+      - "Check        : {{ admin_ack_health_item.name }}"
+      - "Status       : {{ admin_ack_health_item.status }}"
+      - "Observed     : {{ admin_ack_health_item.observed }}"
+
+# ----------------------------------------------------------------------------
+# Check 08: Node Request Capacity Headroom (utilization role)
+# Gate: HARD | Rule: CPU & Memory requests < max_cpu_percent (90%)
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 08/14: Execute Node capacity headroom evaluation"
+  include_role:
+    name: utilization
+
+# ----------------------------------------------------------------------------
+# Check 09: Pending Node CSRs (Advisory)
+# Gate: WARN | Rule: No unresolved certificates waiting for approval
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 09/14: Query live CertificateSigningRequests via jq v1.5"
+  shell: |
+    set -o pipefail
+    oc get csr -o json | jq -c '
+      [ (.items // [])[] | select((((.status.conditions // []) | length) == 0)) | .metadata.name ]
+    '
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: preval_pending_csrs_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: preval_pending_csrs_raw.rc == 0
+
+- name: "Prevalidation Check 09/14: Parse pending CSR list"
+  set_fact:
+    preval_pending_csr_list: "{{ preval_pending_csrs_raw.stdout | default('[]') | from_json }}"
+
+- name: "Prevalidation Check 09/14: Construct Check 09 structured health record"
+  set_fact:
+    csr_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "Pending Node Certificate Signing Requests (CSRs)"
+      gate: "WARN"
+      status: "{{ 'PASS' if ((preval_pending_csr_list | length) == 0) else 'WARN' }}"
+      observed: >-
+        {{ 'No pending certificate signing requests (0 pending)'
+           if ((preval_pending_csr_list | length) == 0)
+           else ('Pending CSRs waiting for approval (' ~ (preval_pending_csr_list | length) ~ '): ' ~ (preval_pending_csr_list | join(', '))) }}
+
+- name: "Prevalidation Check 09/14: Record CSR result to health_summary"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [csr_health_item] }}"
+
+- name: "Prevalidation Check 09/14: Log Check 09 outcome"
+  debug:
+    msg:
+      - "Check        : {{ csr_health_item.name }}"
+      - "Status       : {{ csr_health_item.status }}"
+      - "Observed     : {{ csr_health_item.observed }}"
+
+# ----------------------------------------------------------------------------
+# Check 10: PersistentVolume Health (pv role)
+# Gate: WARN | Rule: All PVs in Bound or Available phase
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 10/14: Execute PersistentVolumes status evaluation"
+  include_role:
+    name: pv
+
+# ----------------------------------------------------------------------------
+# Check 11: PersistentVolumeClaim Health (pvc role)
+# Gate: WARN | Rule: All PVCs in Bound phase
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 11/14: Execute PersistentVolumeClaims status evaluation"
+  include_role:
+    name: pvc
+
+# ----------------------------------------------------------------------------
+# Check 12: PodDisruptionBudgets Headroom (pdb role)
+# Gate: WARN / Configurable | Rule: Audit zero-disruption budgets (disruptionsAllowed == 0)
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 12/14: Execute PodDisruptionBudgets deadlock evaluation"
+  include_role:
+    name: pdb
+
+# ----------------------------------------------------------------------------
+# Check 13: Critical Namespace Pod Health (Advisory)
+# Gate: WARN | Rule: Core pods in openshift-* running without CrashLoop/Error
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 13/14: Query critical platform pods in core namespaces via jq v1.5"
+  shell: |
+    set -o pipefail
+    oc get pods -A -o json | jq -c '
+      [ (.items // [])[]
+        | select((.metadata.namespace // "") | startswith("openshift-"))
+        | select(
+            ((.status.containerStatuses // []) | any(
+              ((.state.waiting.reason // "") == "CrashLoopBackOff") or
+              ((.state.waiting.reason // "") == "ImagePullBackOff") or
+              ((.state.waiting.reason // "") == "ErrImagePull") or
+              ((.state.waiting.reason // "") == "CreateContainerConfigError") or
+              ((.state.waiting.reason // "") == "Error")
+            )) or
+            ((.status.phase // "") == "Failed")
+          )
+        | "\(.metadata.namespace)/\(.metadata.name)"
+      ]
+    '
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: preval_unhealthy_pods_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: preval_unhealthy_pods_raw.rc == 0
+
+- name: "Prevalidation Check 13/14: Parse unhealthy critical pods list"
+  set_fact:
+    preval_unhealthy_pod_list: "{{ preval_unhealthy_pods_raw.stdout | default('[]') | from_json }}"
+
+- name: "Prevalidation Check 13/14: Construct Check 13 structured health record"
+  set_fact:
+    critical_pods_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "Critical Namespace Pod Health"
+      gate: "WARN"
+      status: "{{ 'PASS' if ((preval_unhealthy_pod_list | length) == 0) else 'WARN' }}"
+      observed: >-
+        {{ 'All critical namespace pods running healthy (0 CrashLoopBackOff/Error)'
+           if ((preval_unhealthy_pod_list | length) == 0)
+           else ('Unhealthy pods detected in core namespaces (' ~ (preval_unhealthy_pod_list | length) ~ '): ' ~ (preval_unhealthy_pod_list | join(', '))) }}
+
+- name: "Prevalidation Check 13/14: Record critical pods result to health_summary"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [critical_pods_health_item] }}"
+
+- name: "Prevalidation Check 13/14: Log Check 13 outcome"
+  debug:
+    msg:
+      - "Check        : {{ critical_pods_health_item.name }}"
+      - "Status       : {{ critical_pods_health_item.status }}"
+      - "Observed     : {{ critical_pods_health_item.observed }}"
+
+# ----------------------------------------------------------------------------
+# Check 14: CGroup Mode Compatibility
+# Gate: HARD | Rule: Cluster cgroupMode == "v2" if target >= 4.19 (Auto-Fixable)
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 14/14: Query live nodes.config/cluster for cgroupMode"
+  shell: |
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "v1") | tostring'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: preval_cgroup_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: preval_cgroup_raw.rc == 0
+
+- name: "Prevalidation Check 14/14: Evaluate target version minor number"
+  set_fact:
+    preval_target_major: "{{ (preval_resolved_target_version | regex_replace('^([0-9]+)\\.([0-9]+).*$', '\\1')) | int }}"
+    preval_target_minor: "{{ (preval_resolved_target_version | regex_replace('^([0-9]+)\\.([0-9]+).*$', '\\2')) | int }}"
+    preval_detected_cgroup_mode: "{{ (preval_cgroup_raw.stdout | default('', true) | trim) if ((preval_cgroup_raw.stdout | default('', true) | trim | length) > 0) else 'v1' }}"
+
+- name: "Prevalidation Check 14/14: Determine cgroup v2 compatibility requirement"
+  set_fact:
+    preval_target_requires_cgroup_v2: "{{ ((preval_target_major | int >= 4) and (preval_target_minor | int >= 19)) | bool }}"
+
+- name: "Prevalidation Check 14/14: Evaluate cgroupMode validity"
+  set_fact:
+    preval_cgroup_valid: "{{ (not (preval_target_requires_cgroup_v2 | bool)) or (preval_detected_cgroup_mode == 'v2') }}"
+
+- name: "Prevalidation Check 14/14: Construct Check 14 structured health record"
+  set_fact:
+    cgroup_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "CGroup Mode Compatibility"
+      gate: "HARD"
+      status: "{{ 'PASS' if (preval_cgroup_valid | bool) else 'FAIL' }}"
+      observed: >-
+        {{ ('Cluster cgroupMode is ' ~ preval_detected_cgroup_mode ~ ' (Target version: ' ~ preval_resolved_target_version ~ ')')
+           if (preval_cgroup_valid | bool)
+           else ('Cluster cgroupMode is ' ~ preval_detected_cgroup_mode ~ '. Upgrades targeting >= 4.19 require cgroupMode v2 (Auto-fixable)') }}
+
+- name: "Prevalidation Check 14/14: Record cgroup result to health_summary"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [cgroup_health_item] }}"
+
+- name: "Prevalidation Check 14/14: Log Check 14 outcome"
+  debug:
+    msg:
+      - "Check        : {{ cgroup_health_item.name }}"
+      - "Status       : {{ cgroup_health_item.status }}"
+      - "Observed     : {{ cgroup_health_item.observed }}"
+
+# ----------------------------------------------------------------------------
+# 15. Prevalidation Contract Scan Summary
+# Why: Emits a high-visibility 14-line terminal diagnostic summary.
+# ----------------------------------------------------------------------------
+- name: "Display Prevalidation 14-Check Contract completion summary"
+  debug:
+    msg:
+      - "============================================================================"
+      - "PREVALIDATION SCAN COMPLETE: 14 CHECKS EVALUATED"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name }}"
+      - "Target Version       : {{ preval_resolved_target_version }}"
+      - "Total Checks Scanned : {{ health_summary | length }}"
+      - "Passed               : {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}"
+      - "Warnings             : {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}"
+      - "Failed               : {{ (health_summary | selectattr('status', 'equalto', 'FAIL') | list | length) + (health_summary | selectattr('status', 'equalto', 'FIX-FAILED') | list | length) }}"
+      - "Auto-Remediable Failures Found: {{ (health_summary | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'equalto', 'FAIL') | selectattr('name', 'in', ['CGroup Mode Compatibility', 'Administrator Acknowledgement (Admin-Acks)', 'MachineConfigPools Synchronization', 'ClusterOperators Health']) | list | length) }}"
+      - "============================================================================"

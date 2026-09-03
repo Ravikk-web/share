@@ -1,0 +1,126 @@
+---
+# ============================================================================
+# Role Tasks: etcd (etcd Database Health)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, fail, debug).
+#                 Compatible across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Verifies etcd member quorum and raft leader stability before cluster
+#          mutation by validating control-plane etcd pod status and the etcd
+#          ClusterOperator condition state.
+# Dependencies: playbooks/vars/paths.yml, playbooks/vars/upgrade.yml
+# Gate type: HARD
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Query etcd Control-Plane Pods via oc CLI & jq v1.5
+# Why: Validates that all static control-plane etcd pods are Running and Ready.
+# Why: Shell with set -o pipefail and executable: /bin/bash captures errors.
+# ----------------------------------------------------------------------------
+- name: "Query etcd control-plane pods status via jq"
+  shell: |
+    set -o pipefail
+    oc get pods -n {{ etcd_namespace | default('openshift-etcd') }} -l app=etcd -o json | jq -c '
+      {
+        total_pods: ((.items // []) | length),
+        pod_names: [(.items // [])[] | .metadata.name],
+        running_pods: [(.items // [])[] | select(.status.phase == "Running") | .metadata.name],
+        unready_pods: [(.items // [])[] | select(
+          (.status.phase != "Running") or
+          ((((.status.conditions // []) | map(select(.type == "Ready")) | .[0].status) // "False" | tostring) != "True")
+        ) | .metadata.name]
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: etcd_pods_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: etcd_pods_raw.rc == 0
+
+# ----------------------------------------------------------------------------
+# 2. Query ClusterOperator etcd Status via oc CLI & jq v1.5
+# Why: ClusterOperator etcd continuously evaluates member health, quorum, and raft alarms.
+# ----------------------------------------------------------------------------
+- name: "Query ClusterOperator etcd condition status via jq"
+  shell: |
+    set -o pipefail
+    oc get clusteroperator etcd -o json | jq -c '
+      {
+        available: (((.status.conditions // []) | map(select(.type == "Available")) | .[0].status) // "False" | tostring),
+        degraded: (((.status.conditions // []) | map(select(.type == "Degraded")) | .[0].status) // "True" | tostring),
+        progressing: (((.status.conditions // []) | map(select(.type == "Progressing")) | .[0].status) // "Unknown" | tostring),
+        message: (((.status.conditions // []) | map(select(.type == "Degraded")) | .[0].message) // "")
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: etcd_co_raw
+  changed_when: false
+  failed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: etcd_co_raw.rc == 0
+
+# ----------------------------------------------------------------------------
+# 3. Extract Facts & Evaluate etcd Quorum Health
+# Why: Ensures pod count meets HA quorum threshold and ClusterOperator is healthy.
+# ----------------------------------------------------------------------------
+- name: "Extract etcd pod and operator condition facts"
+  set_fact:
+    etcd_total_pods: "{{ (etcd_pods_raw.stdout | default('{}') | from_json)['total_pods'] | default(0) | int }}"
+    etcd_unready_pods: "{{ (etcd_pods_raw.stdout | default('{}') | from_json)['unready_pods'] | default([]) }}"
+    etcd_co_available: "{{ (etcd_co_raw.stdout | default('{}') | from_json)['available'] | default('False') | string | trim | lower == 'true' }}"
+    etcd_co_degraded: "{{ (etcd_co_raw.stdout | default('{}') | from_json)['degraded'] | default('True') | string | trim | lower == 'true' }}"
+
+- name: "Evaluate etcd quorum and member stability"
+  set_fact:
+    etcd_check_valid: >-
+      {{ ((etcd_total_pods | int) >= (etcd_expected_min_members | default(3) | int)) and
+         ((etcd_unready_pods | length) == 0) and
+         (etcd_co_available | bool) and
+         (not (etcd_co_degraded | bool)) }}
+
+# ----------------------------------------------------------------------------
+# 4. Construct Structured Health Record & Append to Summary
+# Why: Appends structured dictionary into health_summary for reporting.
+# ----------------------------------------------------------------------------
+- name: "Construct structured etcd health record"
+  set_fact:
+    etcd_health_item:
+      num: "{{ (health_summary | default([]) | length) + 1 }}"
+      name: "etcd Quorum and Member Health"
+      gate: "HARD"
+      status: "{{ 'PASS' if (etcd_check_valid | bool) else 'FAIL' }}"
+      observed: >-
+        {{ ('etcd quorum healthy: ' ~ etcd_total_pods ~ ' control-plane pods Running/Ready, ClusterOperator etcd Available=True, Degraded=False')
+           if (etcd_check_valid | bool)
+           else ('etcd unhealthy: pods=' ~ etcd_total_pods ~ ' (unready: [' ~ (etcd_unready_pods | join(', ')) ~ ']), CO etcd Available=' ~ ('True' if (etcd_co_available | bool) else 'False') ~ ', Degraded=' ~ ('True' if (etcd_co_degraded | bool) else 'False')) }}
+
+- name: "Record etcd result to health_summary tracking list"
+  set_fact:
+    health_summary: "{{ (health_summary | default([])) + [etcd_health_item] }}"
+
+- name: "Log etcd evaluation outcome"
+  debug:
+    msg:
+      - "Check        : {{ etcd_health_item.name }}"
+      - "Status       : {{ etcd_health_item.status }}"
+      - "Observed     : {{ etcd_health_item.observed }}"
+      - "Gate Enforced: {{ etcd_enforce_gate | default(true) | bool }}"
+
+# ----------------------------------------------------------------------------
+# 5. Enforce HARD Gate
+# Why: Halts execution immediately if etcd loses quorum or member pods fail.
+# ----------------------------------------------------------------------------
+- name: "Enforce HARD gate for etcd health check"
+  fail:
+    msg: "HARD GATE FAILURE [etcd]: etcd health check failed on cluster '{{ cluster_name }}'. Pods: {{ etcd_total_pods }} (expected >= {{ etcd_expected_min_members }}), Unready pods: {{ etcd_unready_pods | to_json }}, CO etcd Available: {{ etcd_co_available }}, Degraded: {{ etcd_co_degraded }}."
+  when:
+    - not (etcd_check_valid | bool)
+    - etcd_enforce_gate | default(true) | bool
