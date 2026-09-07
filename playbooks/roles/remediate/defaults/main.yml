@@ -1,0 +1,106 @@
+---
+# ============================================================================
+# Role Defaults: remediate
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default configuration parameters, feature toggles, allow-lists,
+#          and operational thresholds for the dedicated auto-remediation engine
+#          role. Centralizes automated resolution of known upgrade blockers
+#          (cgroup v1→v2 migration, dynamic admin-acks, paused MCPs, degraded
+#          operators) to realize one-touch upgrade automation.
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/paths.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by remediate tasks
+# ============================================================================
+
+# Master toggle for automatic remediation across all tiers (boolean, default: true)
+# Sourced from vars/upgrade.yml; defaults to true for one-touch execution
+auto_remediation_enabled: true
+
+# ----------------------------------------------------------------------------
+# Tier 1 Toggles (Auto-Fix: Safe, deterministic, official Red Hat remediation)
+# ----------------------------------------------------------------------------
+# Blocker 1: Auto-patch nodes.config/cluster to spec.cgroupMode: "v2" (boolean, default: true)
+# Sourced from vars/upgrade.yml
+auto_fix_cgroup_v2: true
+
+# Blocker 2: Auto-apply admin-ack ConfigMap in openshift-config (boolean, default: true)
+# Sourced from vars/upgrade.yml
+auto_apply_admin_acks: true
+
+# Blocker 3: Auto-unpause paused MachineConfigPools present in allow-list (boolean, default: true)
+# Sourced from vars/upgrade.yml
+auto_unpause_mcp: true
+
+# Allow-list of MachineConfigPool names permitted for automated unpausing (list of strings)
+# Sourced from vars/upgrade.yml or role defaults
+mcp_auto_unpause_list:
+  - "worker"
+  - "master"
+
+# ----------------------------------------------------------------------------
+# Tier 2 Toggles (Guided: Safe recovery attempts, default OFF, cluster opt-in)
+# ----------------------------------------------------------------------------
+# Blocker 4: Attempt restart of degraded ClusterOperator controller pods (boolean, default: false)
+# Sourced from vars/upgrade.yml (guided recovery; default: false)
+auto_restart_degraded_operators: false
+
+# Grace period in seconds to wait for operator reconciliation after pod restart (integer, default: 180)
+# Sourced from vars/upgrade.yml or role defaults
+operator_restart_grace_seconds: 180
+
+# Blocker 5: Force MachineConfigDaemon progress on stalled nodes via force file (boolean, default: false)
+# Sourced from vars/upgrade.yml (guided recovery; default: false)
+auto_force_stalled_node: false
+
+# Threshold in minutes a node can remain in updating state before being marked stalled (integer, default: 30)
+# Sourced from vars/upgrade.yml
+node_stall_threshold_minutes: 30
+
+# ----------------------------------------------------------------------------
+# Specific Remediation Dispatch Triggers
+# ----------------------------------------------------------------------------
+# Manual or programmatic dispatch trigger for cgroup v2 remediation (boolean, default: false)
+# Sourced from internal trigger facts or prevalidation scan
+trigger_cgroup_remediation: false
+
+# Manual or programmatic dispatch trigger for admin-ack remediation (boolean, default: false)
+# Sourced from internal trigger facts or prevalidation scan
+trigger_admin_ack_remediation: false
+
+# Manual or programmatic dispatch trigger for MCP unpause remediation (boolean, default: false)
+# Sourced from internal trigger facts or prevalidation scan
+trigger_unpause_mcp_remediation: false
+
+# Manual or programmatic dispatch trigger for operator restart remediation (boolean, default: false)
+# Sourced from internal trigger facts or prevalidation scan
+trigger_co_restart_remediation: false
+
+# Gate enforcement: if true, a FIX-FAILED outcome halts execution with fail: (boolean, default: false)
+# Sourced from role defaults
+remediate_enforce_gate: false
+
+# ----------------------------------------------------------------------------
+# Transient Fault Tolerance & Retry Parameters
+# ----------------------------------------------------------------------------
+# Maximum command retry attempts for transient API communication blips (integer, default: 3)
+# Sourced from vars/upgrade.yml or role defaults
+oc_command_retries: 3
+
+# Delay in seconds between command retry attempts (integer, default: 10)
+# Sourced from vars/upgrade.yml or role defaults
+oc_command_retry_delay: 10
+
+# Directory where remediation audit entries are appended to run logs (string, default: "")
+# Sourced from vars/paths.yml or dynamically derived from playbook_dir
+log_dir: ""
+
+# Execution timestamp for consistent audit logging (string, default: "")
+# Sourced from master orchestrator or dynamically generated
+run_timestamp: ""
+
+# Target ARO cluster name (string, default: "cluster")
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: "cluster"

@@ -1,0 +1,27 @@
+---
+# ============================================================================
+# Role Defaults: api_readiness
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defines default input parameters for the api_readiness role, which
+#          confirms that the OpenShift API server readiness endpoint (/readyz)
+#          is responding with 'ok' and return code 0.
+# Role / Playbook Dependencies: vars/paths.yml, vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by api_readiness tasks
+# ============================================================================
+
+# Target ARO cluster name (string, mandatory)
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: ""
+
+# Target readiness endpoint to query via oc get --raw (string, default: "/readyz")
+# Sourced from role defaults
+# In OpenShift 4, /readyz aggregates readiness across all API server subsystems
+api_readiness_endpoint: "/readyz"
+
+# Master toggle for enforcing HARD gate failure on validation error (boolean, default: true)
+# Sourced from role defaults or overridden by prevalidation scan during diagnostic sweeps
+api_readiness_enforce_gate: true

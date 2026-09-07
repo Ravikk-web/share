@@ -1,0 +1,46 @@
+---
+# ============================================================================
+# Role Defaults: operator_validate
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default configuration parameters for the operator_validate role, which
+#          confirms that all installed operator subscriptions reference valid CSVs
+#          in Succeeded phase and generates the Operator Validation HTML audit report.
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/paths.yml, vars/report_vars.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by operator_validate tasks
+# ============================================================================
+
+# Target ARO cluster name (string, mandatory)
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: ""
+
+# Master toggle for enforcing HARD gate failure on unrecovered operator failures (boolean, default: true)
+# Sourced from role defaults or Phase 06 orchestrator
+operator_validate_enforce_gate: true
+
+# Maximum command retry attempts for transient API communication blips (integer, default: 3)
+# Sourced from vars/upgrade.yml or role defaults
+oc_command_retries: 3
+
+# Delay in seconds between command retry attempts (integer, default: 10)
+# Sourced from vars/upgrade.yml or role defaults
+oc_command_retry_delay: 10
+
+# Jinja2 presentation template to render for Operator Validation report (string, default: "health-overview.j2")
+# Sourced from role defaults
+operator_report_template: "health-overview.j2"
+
+# Inbound list of discovered operator subscriptions (list of dicts, default: [])
+# Sourced from operator discovery tasks in operator_compat
+operators: []
+
+# Structured health check records populated during operator evaluation (list of dicts, default: [])
+# Internal fact accumulator consumed by report rendering
+operator_health_checks: []
+
+# Formatted operator summary records populated during evaluation (list of dicts, default: [])
+# Internal fact accumulator consumed by report rendering
+validated_operator_records: []

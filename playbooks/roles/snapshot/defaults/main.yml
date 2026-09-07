@@ -1,0 +1,34 @@
+---
+# ============================================================================
+# Role Defaults: snapshot
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default configuration parameters for the snapshot role, which captures
+#          an immutable baseline JSON snapshot of clusterversion, operators,
+#          nodes, and routes before any cluster mutation or upgrade action.
+# Role / Playbook Dependencies: vars/paths.yml, vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by snapshot tasks
+# ============================================================================
+
+# Directory where cluster baseline snapshots are stored (string, default: path)
+# Sourced from vars/paths.yml or dynamically derived from playbook_dir
+snapshot_dir: "{{ playbook_dir }}/snapshots"
+
+# Target ARO cluster name (string, mandatory)
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: ""
+
+# Explicit snapshot output file path override (string, default: "")
+# Sourced from calling playbook or dynamically derived from cluster and timestamp
+snapshot_file: ""
+
+# Maximum command retry attempts for transient API communication blips (integer, default: 3)
+# Sourced from vars/upgrade.yml or role defaults
+oc_command_retries: 3
+
+# Delay in seconds between command retry attempts (integer, default: 10)
+# Sourced from vars/upgrade.yml or role defaults
+oc_command_retry_delay: 10
