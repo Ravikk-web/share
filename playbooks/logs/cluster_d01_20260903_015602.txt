@@ -1,2 +1,0 @@
-Ansible extra-vars JSON: {"cluster_name": "cluster_d01", "upgrade_path": ["4.14.40", "4.15.35", "4.16.18"], "dry_run": true}
-Simulated execution completed successfully.

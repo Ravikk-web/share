@@ -106,24 +106,27 @@
 # 4. Execute OpenShift CLI Login
 # ----------------------------------------------------------------------------
 # Why: Dedicated kubeconfig prevents clobbering ~/.kube/config.
-# Why: shell with /bin/bash ensures precise flag quoting for credentials and URLs.
+# Why: command with argv avoids shell expansion, quoting issues, or argument
+#      splitting on special characters or whitespace in passwords.
+# Why: Placing cluster_api_url as the immediate positional argument after 'login'
+#      strictly adheres to OpenShift CLI / Cobra syntax requirements.
 # Why: --insecure-skip-tls-verify avoids rejection of internal/cluster CA certificates.
 # Why: no_log: true guarantees zero password leaks in logs or console.
 # Why: retries/delay absorbs transient network blips and API server restarts.
 - name: "{{ cluster_name }} | Execute OpenShift CLI login"
-  shell: |
-    {{ oc_binary }} login \
-      --username="{{ cluster_username }}" \
-      --password="{{ cluster_password }}" \
-      "{{ cluster_api_url }}" \
-      --kubeconfig="{{ kubeconfig_path }}" \
-      --insecure-skip-tls-verify={{ insecure_skip_tls_verify | bool | lower }} 2>&1
-  args:
-    executable: /bin/bash
+  command:
+    argv:
+      - "{{ oc_binary }}"
+      - "login"
+      - "{{ cluster_api_url }}"
+      - "--username={{ cluster_username }}"
+      - "--password={{ cluster_password }}"
+      - "--kubeconfig={{ kubeconfig_path | default(cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default')))) }}"
+      - "--insecure-skip-tls-verify={{ insecure_skip_tls_verify | bool | lower }}"
   register: oc_login_result
   failed_when: false
   no_log: true
-  changed_when: "'Login successful' in oc_login_result.stdout"
+  changed_when: "'Login successful' in (oc_login_result.stdout | default(''))"
   retries: "{{ oc_command_retries | default(3) }}"
   delay: "{{ oc_command_retry_delay | default(10) }}"
   until: oc_login_result.rc == 0
@@ -156,13 +159,15 @@
 # 6. Check Login Outcome
 # ----------------------------------------------------------------------------
 # Why: Fail explicitly if authentication was unsuccessful, naming the cluster
-#      endpoint while ensuring passwords remain unexposed.
+#      endpoint and capturing sanitized CLI diagnostics while ensuring passwords
+#      remain strictly unexposed.
 - name: "Validate login success"
   fail:
     msg: >-
       Authentication failed for cluster '{{ cluster_name }}' at endpoint {{ cluster_api_url }}
-      (exit code {{ oc_login_result.rc }}). Verify cluster reachability, network routing,
-      TLS certificate bypass (--insecure-skip-tls-verify=true), and service account credentials.
+      (exit code {{ oc_login_result.rc }}).
+      Reason: {{ ((oc_login_result.stderr if (oc_login_result.stderr is defined and oc_login_result.stderr | trim | length > 0) else oc_login_result.stdout | default('No diagnostic output captured')) | trim) | replace(cluster_password, '******') if (cluster_password is defined and cluster_password | length > 0) else ((oc_login_result.stderr if (oc_login_result.stderr is defined and oc_login_result.stderr | trim | length > 0) else oc_login_result.stdout | default('No diagnostic output captured')) | trim) }}.
+      Verify cluster reachability, network routing, TLS certificate bypass (--insecure-skip-tls-verify=true), and service account credentials.
   when: oc_login_result.rc != 0
 
 # ----------------------------------------------------------------------------
@@ -171,7 +176,7 @@
 # Why: Guarantees that the session established actually connects to the expected
 #      cluster API URL, preventing DNS spoofing or session hijack.
 - name: "Verify active cluster server identity"
-  command: "{{ oc_binary }} whoami --show-server --kubeconfig={{ kubeconfig_path }}"
+  command: "{{ oc_binary }} whoami --show-server --kubeconfig={{ kubeconfig_path | default(cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default')))) }}"
   register: whoami_server_raw
   changed_when: false
   retries: "{{ oc_command_retries | default(3) }}"
@@ -194,8 +199,9 @@
 # Why: Sets environment facts consumed by all subsequent phase playbooks and roles.
 - name: "Export KUBECONFIG facts for subsequent tasks and roles"
   set_fact:
-    cluster_kubeconfig: "{{ kubeconfig_path }}"
-    ansible_env_kubeconfig: "{{ kubeconfig_path }}"
-    kubeconfig: "{{ kubeconfig_path }}"
+    cluster_kubeconfig: "{{ kubeconfig_path | default(cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default')))) }}"
+    ansible_env_kubeconfig: "{{ kubeconfig_path | default(cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default')))) }}"
+    kubeconfig: "{{ kubeconfig_path | default(cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default')))) }}"
+    kubeconfig_path: "{{ kubeconfig_path | default(cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default')))) }}"
     active_cluster_server: "{{ whoami_server_raw.stdout | trim }}"
     login_result: "{{ oc_login_result }}"

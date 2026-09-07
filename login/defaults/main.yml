@@ -19,6 +19,7 @@ cluster_name: ""
 
 # Scoped temporary kubeconfig path for isolated multi-cluster session state (string, default: path)
 # Sourced from vars/paths.yml or dynamically derived from cluster_name
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig-{{ cluster_name | default('default') }}"
 cluster_kubeconfig: "{{ playbook_dir }}/.kubeconfig-{{ cluster_name | default('default') }}"
 
 # Regular expression pattern for validating active cluster API endpoint URL (string, default: regex)
