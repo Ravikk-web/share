@@ -1,9 +1,0 @@
----
-# Namespaces to exclude from pod failure/crashloop checks
-exclude_namespaces:
-  - openshift-insights
-  - twistlock
-  - openshift-gitops
-  - app00046878-openshift-platform
-  - app00046995-g6
-  - default
