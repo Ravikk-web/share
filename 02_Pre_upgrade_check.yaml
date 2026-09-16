@@ -198,7 +198,32 @@
               {{ preval_mail_to
                  if (preval_mail_to is defined and preval_mail_to | length > 0)
                  else (mail_to | default([])) }}
-          when: send_prevalidation_email | default(true) | bool
+          when:
+            - send_prevalidation_email | default(true) | bool
+            - not (dry_run | default(false) | bool)
+
+        - name: "Phase 02: Audit available report attachments"
+          stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+            - "{{ report_file_path }}"
+          register: preval_attachment_stats
+          when:
+            - send_prevalidation_email | default(true) | bool
+            - not (dry_run | default(false) | bool)
+
+        - name: "Phase 02: Filter available report attachments"
+          set_fact:
+            preval_final_attachments: >-
+              {{ preval_attachment_stats.results
+                 | selectattr('stat.exists', 'defined')
+                 | selectattr('stat.exists', 'equalto', true)
+                 | map(attribute='item')
+                 | list }}
+          when:
+            - send_prevalidation_email | default(true) | bool
+            - not (dry_run | default(false) | bool)
 
         - name: "Phase 02: Dispatch Prevalidation HTML Report email notification"
           block:
@@ -207,8 +232,7 @@
                 mail_to: "{{ resolved_preval_recipients }}"
                 mail_subject: "{{ prevalidation_subject_prefix | default('[ARO Upgrade PREVALIDATION]') }} — {{ overall_verdict | default('PASS') }} — {{ cluster_name }}"
                 mail_template: "phase02-prevalidation.j2"
-                mail_attachments:
-                  - "{{ report_file_path }}"
+                mail_attachments: "{{ preval_final_attachments | default([report_file_path]) }}"
 
             - name: "Dispatch Prevalidation HTML report email via sendmail role"
               include_role:
@@ -217,7 +241,7 @@
             - name: "Log prevalidation email delivery confirmation to text run log"
               lineinfile:
                 path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
-                line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [INFO] [NOTIFICATION] Prevalidation HTML report emailed to: {{ resolved_preval_recipients | join(', ') }} with attachment {{ report_file_path }}."
+                line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [INFO] [NOTIFICATION] Prevalidation HTML report emailed to: {{ resolved_preval_recipients | join(', ') }} with attachments {{ preval_final_attachments | join(', ') }}."
                 create: true
               failed_when: false
           # ------------------------------------------------------------------
@@ -240,6 +264,7 @@
               failed_when: false
           when:
             - send_prevalidation_email | default(true) | bool
+            - not (dry_run | default(false) | bool)
             - (resolved_preval_recipients | default([]) | length) > 0
 
         # 12. Display Structured Confirmation Banner
@@ -257,8 +282,8 @@
               - "Auto-Fixed Checks  : {{ health_summary | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length }}"
               - "Residual Failures  : 0"
               - "Report File        : {{ report_file_path }}"
-              - "Email Notification : {{ 'Dispatched to ' ~ (resolved_preval_recipients | join(', ')) if (send_prevalidation_email | default(true) | bool and (resolved_preval_recipients | default([]) | length > 0)) else 'Disabled / No recipients' }}"
-              - "Session State      : {{ 'Preserved for Phase 03 Upgrade Initiation' if not ((dry_run | default(false) | bool) or (stop_after_phase is defined and (stop_after_phase | int) <= 2)) else 'Terminated (Pre-check / Dry-run completed)' }}"
+              - "Email Notification : {{ 'Deferred to Dry-Run Digest' if (dry_run | default(false) | bool) else ('Dispatched to ' ~ (resolved_preval_recipients | join(', ')) if (send_prevalidation_email | default(true) | bool and (resolved_preval_recipients | default([]) | length > 0)) else 'Disabled / No recipients') }}"
+              - "Session State      : {{ 'Preserved for Phase 05 Validation' if ((dry_run | default(false) | bool) and (dry_run_include_postval | default(true) | bool)) else ('Preserved for Phase 03 Upgrade Initiation' if not ((dry_run | default(false) | bool) or (stop_after_phase is defined and (stop_after_phase | int) <= 2)) else 'Terminated (Pre-check / Dry-run completed)') }}"
               - "============================================================================"
 
       # ----------------------------------------------------------------------
@@ -367,7 +392,7 @@
         - name: "Generate client-facing Prevalidation HTML failure report via report role"
           include_role:
             name: report
-          failed_when: false
+          ignore_errors: true
 
         - name: "Check if Prevalidation failure HTML report was written to disk"
           stat:
