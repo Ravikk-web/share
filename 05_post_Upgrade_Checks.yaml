@@ -61,6 +61,11 @@
             run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
           when: run_timestamp is not defined or run_timestamp | length == 0
 
+        # Reset report_file_path so earlier phases (Phase 02) do not mask failure report generation
+        - name: "Phase 05: Reset report_file_path fact from earlier phases"
+          set_fact:
+            report_file_path: ""
+
         # 2. Display Phase 05 Initiation Banner
         - name: "Display Phase 05 initiation banner"
           debug:
@@ -95,10 +100,11 @@
             - p05_discovered_snapshot_raw.stdout is defined
             - p05_discovered_snapshot_raw.stdout | trim | length > 0
 
-        # In dry-run mode, the cluster was not mutated. Target current version for health audit against baseline.
-        - name: "Phase 05: Target current cluster version in dry-run mode"
+        # In dry-run mode, the cluster was not mutated. Target current version and disable HARD gates for health audit.
+        - name: "Phase 05: Target current cluster version and disable hard gates in dry-run mode"
           set_fact:
             final_target_version: "current"
+            postval_enforce_gate: false
           when: dry_run | default(false) | bool
 
         # 4. Execute 10-Check Postvalidation Contract Scan via postvalidation role
@@ -122,7 +128,7 @@
         - name: "Log Phase 05 postvalidation pass to text run log"
           lineinfile:
             path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
-            line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [PASS] [HARD] Phase 05: Postvalidation contract satisfied for cluster '{{ cluster_name }}' (Total checks: {{ health_summary | length }}, Passed: {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}, Warnings: {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}, Failed: 0). Report generated: {{ report_file_path }}."
+            line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [{{ 'AUDIT' if (dry_run | default(false) | bool) else 'PASS' }}] [{{ 'WARN' if (dry_run | default(false) | bool) else 'HARD' }}] Phase 05: Postvalidation contract {{ 'audited (dry-run)' if (dry_run | default(false) | bool) else 'satisfied' }} for cluster '{{ cluster_name }}' (Total checks: {{ health_summary | length }}, Passed: {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}, Warnings: {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}, Failed: {{ health_summary | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'equalto', 'FAIL') | list | length }}). Report generated: {{ report_file_path }}."
             create: true
 
         # 8. Log Confirmation to CSV Run Log (.csv)
@@ -141,7 +147,7 @@
         - name: "Log Phase 05 postvalidation pass to CSV run log"
           lineinfile:
             path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
-            line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name }}","Phase 05 Post-Upgrade Checks & Baseline Diff","HARD","PASS","Postvalidation contract satisfied (Passed: {{ health_summary | selectattr(''status'', ''equalto'', ''PASS'') | list | length }}/{{ health_summary | length }})","Report: {{ report_file_path }}"'
+            line: '"{{ lookup(''pipe'', ''date +%Y-%m-%dT%H:%M:%S'') }}","{{ cluster_name }}","Phase 05 Post-Upgrade Checks & Baseline Diff","{{ ''WARN'' if (dry_run | default(false) | bool) else ''HARD'' }}","{{ ''PASS (DRY-RUN)'' if (dry_run | default(false) | bool) else ''PASS'' }}","Postvalidation contract {{ ''audited in dry-run mode'' if (dry_run | default(false) | bool) else ''satisfied'' }} (Passed: {{ health_summary | selectattr(''status'', ''equalto'', ''PASS'') | list | length }}/{{ health_summary | length }})","Report: {{ report_file_path }}"'
             create: true
 
         # 9. Display Structured Confirmation Banner (Preserving Session)
@@ -149,14 +155,14 @@
           debug:
             msg:
               - "============================================================================"
-              - "PHASE 05 COMPLETE: POST-UPGRADE CHECKS & BASELINE DIFF SUCCESSFUL"
+              - "PHASE 05 COMPLETE: POST-UPGRADE CHECKS & BASELINE DIFF {{ 'AUDITED (DRY-RUN)' if (dry_run | default(false) | bool) else 'SUCCESSFUL' }}"
               - "============================================================================"
               - "Cluster Name       : {{ cluster_name }}"
               - "Final Version      : {{ postval_cv_data.current_version | default(upgrade_path[-1] | default('unknown')) }}"
               - "Total Checks       : {{ health_summary | length }}"
               - "Passed Checks      : {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}"
               - "Warnings           : {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}"
-              - "Residual Failures  : 0"
+              - "Residual Failures  : {{ health_summary | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'equalto', 'FAIL') | list | length }}"
               - "Report File        : {{ report_file_path }}"
               - "Session State      : PRESERVED for Phase 06 Operator Upgrades"
               - "============================================================================"

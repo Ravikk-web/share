@@ -73,6 +73,11 @@ skip_cgroup_check: false
 # When false, cgroupMode mismatches or RBAC patch restrictions surface as WARN without blocking upgrade.
 cgroup_enforce_gate: false
 
+# Master toggle for enforcing HARD gate failure on residual postvalidation failures (default: true).
+# Overridden dynamically to false in dry-run mode so health audits complete without halting.
+postval_enforce_gate: true
+
+
 
 # ----------------------------------------------------------------------------
 # Monitoring Cadences & Timeout Protection (Phase 04)
