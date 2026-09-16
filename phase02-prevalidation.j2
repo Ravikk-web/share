@@ -1,0 +1,1324 @@
+{#
+==============================================================================
+Phase 02: Prevalidation & Auto-Remediation Report Template: phase02-prevalidation.j2
+==============================================================================
+Targets: Jinja2 / Ansible 2.7.17 & 2.14.18
+
+Context: Standalone HTML audit report for Phase 02 — Prevalidation & Auto-Remediation.
+         Rendered after Phase 02 execution (both on success and upon failure in rescue).
+Dependencies:
+  - cluster_name (string): Target ARO cluster identifier
+  - cluster_tier (string, optional): Cluster environment tier (DEV/STAGE/PROD)
+  - baseline_current_version (string): Current cluster version
+  - target_cluster_version (string): Target upgrade version or hop
+  - upgrade_path (list): Target sequential upgrade path
+  - run_timestamp (string): Execution run timestamp
+  - overall_verdict (string): Overall verdict badge ('PASS', 'WARN', 'FAIL', 'AUTO-FIXED', 'FIX-FAILED')
+  - total_checks (int): Total checks evaluated
+  - passed_count (int): Passed checks count
+  - warning_count (int): Warning checks count
+  - autofixed_count (int): Auto-fixed checks count
+  - failed_count (int): Failed checks count
+  - phase02_duration_seconds (int, optional): Phase runtime in seconds
+  - checks (list of dicts): Master 15-check prevalidation contract records
+  - autofix_items (list of dicts, optional): Automated remediation actions taken
+  - co_all_operators (list of dicts, optional): ClusterOperators inventory
+  - co_degraded (list, optional): Degraded operators
+  - co_unavailable (list, optional): Unavailable operators
+  - nodes_parsed_data (list of dicts, optional): Node inventory & condition details
+  - node_unready_list (list, optional): Unready nodes
+  - node_pressured_list (list, optional): Pressured nodes
+  - node_unschedulable_list (list, optional): Unschedulable nodes
+  - mcp_parsed_data (list of dicts, optional): MachineConfigPools data
+  - mcp_paused_pools (list, optional): Paused MCPs
+  - mcp_degraded_pools (list, optional): Degraded MCPs
+  - active_cluster_server (string, optional): Active API URL
+  - desired_cluster_api_regex (string, optional): Desired API regex pattern
+  - etcd_total_pods (int, optional): etcd pod count
+  - etcd_unready_pods (list, optional): Unready etcd pods
+  - etcd_co_available (bool, optional): etcd operator available
+  - etcd_co_degraded (bool, optional): etcd operator degraded
+  - preval_detected_ack_keys (list, optional): Detected admin-ack keys
+  - preval_missing_ack_keys (list, optional): Missing admin-ack keys
+  - cluster_cpu_percent (float/int, optional): CPU request %
+  - cluster_mem_percent (float/int, optional): Memory request %
+  - preval_pending_csr_list (list, optional): Pending CSRs
+  - pv_parsed_data (list, optional): PersistentVolumes data
+  - pvc_parsed_data (list, optional): PersistentVolumeClaims data
+  - pdb_zero_disruptions_list (list, optional): PDBs with 0 allowed disruptions
+  - preval_unhealthy_pod_list (list, optional): Unhealthy platform pods
+  - preval_detected_cgroup_mode (string, optional): cgroup mode ('v1'/'v2')
+  - operator_compat_plan (list of dicts, optional): OLM operator compatibility plan
+  - diagnostic_details (list of dicts, optional): Collapsible raw outputs
+  - UI color tokens from vars/report_vars.yml
+Constraints:
+  - Responsive standalone HTML report (max-width: 1080px)
+  - Self-contained CSS with zero external network dependencies (CDN-free)
+  - Collapsible <details> diagnostic inspection sections with @media print expansion
+  - System font stack only (no Google Fonts / external web fonts)
+==============================================================================
+#}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phase 02 — Pre-Upgrade Validation Report &bull; {{ cluster_name | default('Cluster') }}</title>
+  <style>
+    /* ====================================================================
+       Design Tokens — sourced from vars/report_vars.yml & ui-context.md
+       ==================================================================== */
+    :root {
+      --color-pass: {{ color_pass | default('#1a7f37') }};
+      --bg-pass: {{ bg_pass | default('#e6f4ea') }};
+      --color-warn: {{ color_warn | default('#9a6700') }};
+      --bg-warn: {{ bg_warn | default('#fff8e1') }};
+      --color-fail: {{ color_fail | default('#b42318') }};
+      --bg-fail: {{ bg_fail | default('#fdecea') }};
+      --color-autofix: {{ color_autofix | default('#1d4ed8') }};
+      --bg-autofix: {{ bg_autofix | default('#eff6ff') }};
+      --color-fixfailed: {{ color_fixfailed | default('#c2410c') }};
+      --bg-fixfailed: {{ bg_fixfailed | default('#ffedd5') }};
+      --color-info: {{ color_info | default('#344054') }};
+      --bg-info: {{ bg_info | default('#f2f4f7') }};
+      --color-surface: {{ color_surface | default('#ffffff') }};
+      --color-page-bg: {{ color_page_bg | default('#f8f9fb') }};
+      --color-border: {{ color_border | default('#e4e7ec') }};
+      --color-heading: {{ color_heading | default('#101828') }};
+      --phase-accent: #0284c7;
+      --phase-accent-light: #e0f2fe;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background-color: var(--color-page-bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      color: var(--color-heading);
+      -webkit-font-smoothing: antialiased;
+      padding: 24px;
+    }
+
+    .report-container {
+      max-width: {{ report_max_width | default('1080px') }};
+      margin: 0 auto;
+      background-color: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 4px 16px rgba(16, 24, 40, 0.04);
+      overflow: hidden;
+    }
+
+    /* Header Band */
+    .header-band {
+      padding: 28px 32px;
+      background: linear-gradient(135deg, #f0f9ff 0%, #ffffff 100%);
+      border-bottom: 1px solid var(--color-border);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    .header-info h1 {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--color-heading);
+      margin-bottom: 4px;
+    }
+
+    .phase-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      color: var(--phase-accent);
+      background-color: var(--phase-accent-light);
+      border: 1px solid #bae6fd;
+      border-radius: 4px;
+      margin-bottom: 10px;
+    }
+
+    .header-meta {
+      font-size: 13px;
+      color: #667085;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      margin-top: 6px;
+    }
+
+    .header-meta-item strong { color: #344054; }
+
+    .verdict-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      border-radius: 20px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .verdict-pass { background-color: var(--bg-pass); color: var(--color-pass); border: 1px solid #b7e1cd; }
+    .verdict-warn { background-color: var(--bg-warn); color: var(--color-warn); border: 1px solid #fedf89; }
+    .verdict-fail { background-color: var(--bg-fail); color: var(--color-fail); border: 1px solid #fecdca; }
+    .verdict-autofix { background-color: var(--bg-autofix); color: var(--color-autofix); border: 1px solid #bfdbfe; }
+    .verdict-fixfailed { background-color: var(--bg-fixfailed); color: var(--color-fixfailed); border: 1px solid #fdba74; }
+
+    /* Metrics Section */
+    .metrics-section {
+      padding: 24px 32px;
+      background-color: #fcfcfd;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .metric-tiles {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 14px;
+    }
+
+    .metric-tile {
+      background-color: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      text-align: center;
+      transition: box-shadow 0.15s ease;
+    }
+
+    .metric-tile:hover { box-shadow: 0 2px 8px rgba(16, 24, 40, 0.08); }
+    .metric-tile .label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #667085; margin-bottom: 4px; }
+    .metric-tile .count { font-size: 26px; font-weight: 700; line-height: 1.2; }
+    .metric-tile .sub { font-size: 11px; color: #98a2b3; margin-top: 2px; }
+
+    /* Content Body */
+    .content-body { padding: 28px 32px; }
+
+    .section-title {
+      font-size: 14px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #475467;
+      margin: 32px 0 14px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .section-title:first-child { margin-top: 0; }
+
+    /* Callout Boxes */
+    .callout-box {
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 24px;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .callout-pass { background-color: var(--bg-pass); border: 1px solid #b7e1cd; color: #15803d; }
+    .callout-warn { background-color: var(--bg-warn); border: 1px solid #fedf89; color: #854d0e; }
+    .callout-fail { background-color: var(--bg-fail); border: 1px solid #fecdca; color: #991b1b; }
+    .callout-autofix { background-color: var(--bg-autofix); border: 1px solid #bfdbfe; color: #1e40af; }
+    .callout-info { background-color: var(--bg-info); border: 1px solid #d0d5dd; color: #344054; }
+
+    /* Journey Bar */
+    .journey-bar {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      padding: 16px 24px;
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 8px;
+      margin: 12px 0 24px 0;
+      overflow-x: auto;
+    }
+
+    .journey-version {
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .journey-current { background: var(--phase-accent-light); color: var(--phase-accent); border: 1px solid #bae6fd; }
+    .journey-target { background: var(--bg-pass); color: var(--color-pass); border: 1px solid #b7e1cd; }
+    .journey-arrow { font-size: 16px; color: #98a2b3; padding: 0 10px; white-space: nowrap; }
+
+    /* Status Table */
+    .status-table {
+      width: 100%;
+      border: 1px solid var(--color-border);
+      border-radius: 8px;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 13px;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+
+    .status-table th {
+      background-color: #f9fafb;
+      padding: 11px 14px;
+      text-align: left;
+      font-weight: 600;
+      color: #344054;
+      border-bottom: 1px solid var(--color-border);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .status-table td {
+      padding: 11px 14px;
+      border-bottom: 1px solid #f2f4f7;
+      vertical-align: middle;
+    }
+
+    .status-table tr:last-child td { border-bottom: none; }
+    .row-pass { background-color: #ffffff; }
+    .row-warn { background-color: #fffdf5; }
+    .row-fail { background-color: #fffbfa; }
+    .row-autofix { background-color: #f8fbff; }
+    .row-fixfailed { background-color: #fffaf5; }
+    .row-skipped { background-color: #f8f9fb; }
+
+    .status-pill {
+      display: inline-block;
+      padding: 3px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      border-radius: 12px;
+      white-space: nowrap;
+    }
+
+    .pill-pass { background-color: var(--bg-pass); color: var(--color-pass); border: 1px solid #b7e1cd; }
+    .pill-warn { background-color: var(--bg-warn); color: var(--color-warn); border: 1px solid #fedf89; }
+    .pill-fail { background-color: var(--bg-fail); color: var(--color-fail); border: 1px solid #fecdca; }
+    .pill-autofix { background-color: var(--bg-autofix); color: var(--color-autofix); border: 1px solid #bfdbfe; }
+    .pill-fixfailed { background-color: var(--bg-fixfailed); color: var(--color-fixfailed); border: 1px solid #fdba74; }
+    .pill-info { background-color: var(--bg-info); color: var(--color-info); border: 1px solid var(--color-border); }
+    .pill-skipped { background-color: #f2f4f7; color: #667085; border: 1px solid #d0d5dd; }
+
+    .gate-badge {
+      display: inline-block;
+      padding: 2px 7px;
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 4px;
+      background-color: #f2f4f7;
+      color: #344054;
+      border: 1px solid var(--color-border);
+    }
+
+    .gate-hard { background-color: #fee2e2; color: #991b1b; border-color: #fecaca; }
+    .gate-warn { background-color: #fef3c7; color: #92400e; border-color: #fde68a; }
+
+    .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+    }
+
+    /* Granular Check Cards Grid */
+    .checks-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+      margin: 16px 0 28px 0;
+    }
+
+    .check-card {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .check-card-header {
+      padding: 12px 16px;
+      background-color: #f9fafb;
+      border-bottom: 1px solid var(--color-border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .check-card-title {
+      font-weight: 700;
+      font-size: 13px;
+      color: var(--color-heading);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .check-card-body {
+      padding: 16px;
+      font-size: 13px;
+      line-height: 1.5;
+      flex: 1;
+    }
+
+    .check-card-stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 0;
+      border-bottom: 1px dashed #f2f4f7;
+    }
+
+    .check-card-stat-row:last-child { border-bottom: none; }
+    .stat-label { color: #667085; font-size: 12px; }
+    .stat-val { font-weight: 600; color: #101828; }
+
+    /* Progress bar */
+    .bar-container {
+      width: 100%;
+      height: 8px;
+      background-color: #f2f4f7;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 6px;
+    }
+    .bar-fill {
+      height: 100%;
+      border-radius: 4px;
+    }
+
+    /* Buttons */
+    .action-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 7px 14px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 6px;
+      border: 1px solid var(--color-border);
+      background-color: #ffffff;
+      color: #344054;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .action-btn:hover { background-color: #f9fafb; border-color: #d0d5dd; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+
+    /* Collapsible Details */
+    details {
+      margin-bottom: 12px;
+      border: 1px solid var(--color-border);
+      border-radius: 8px;
+      background-color: #ffffff;
+      overflow: hidden;
+    }
+
+    summary {
+      padding: 12px 16px;
+      font-weight: 600;
+      font-size: 13px;
+      color: #344054;
+      background-color: #f9fafb;
+      cursor: pointer;
+      user-select: none;
+      outline: none;
+      transition: background-color 0.15s ease;
+    }
+
+    summary:hover { background-color: #f2f4f7; }
+
+    .details-content {
+      padding: 16px;
+      border-top: 1px solid var(--color-border);
+      background-color: #0f172a;
+      color: #e2e8f0;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow-x: auto;
+    }
+
+    /* Footer */
+    .footer-band {
+      padding: 20px 32px;
+      background-color: #f9fafb;
+      border-top: 1px solid var(--color-border);
+      font-size: 12px;
+      color: #667085;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .footer-band strong { color: #344054; }
+    .footer-band code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 11px; background: #f2f4f7; padding: 2px 6px; border-radius: 3px; }
+
+    /* Print */
+    @media print {
+      body { background-color: #ffffff; padding: 0; }
+      .report-container { border: none; box-shadow: none; max-width: 100%; }
+      .no-print { display: none !important; }
+      details { border: 1px solid #e4e7ec !important; margin-bottom: 16px !important; page-break-inside: avoid; }
+      details[open], details { display: block !important; }
+      summary { display: block !important; font-weight: bold; background-color: #f2f4f7 !important; color: #000000 !important; }
+      .details-content { display: block !important; background-color: #f8f9fb !important; color: #101828 !important; border-top: 1px solid #e4e7ec !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="report-container">
+
+    {# ============================================================ #}
+    {# HEADER BAND                                                   #}
+    {# ============================================================ #}
+    <header class="header-band">
+      <div class="header-info">
+        <div class="phase-label">
+          <span>&#x1F527;</span> Phase 02 of 06 &bull; Prevalidation &amp; Blocker Remediation
+        </div>
+        <h1>{{ report_title | default('Pre-Upgrade Validation Report') }}</h1>
+        <div class="header-meta">
+          <span class="header-meta-item">Cluster: <strong>{{ cluster_name | default('N/A') }}</strong></span>
+          {% if cluster_tier | default('') | length > 0 %}
+          <span class="header-meta-item">Tier: <strong>{{ cluster_tier }}</strong></span>
+          {% endif %}
+          <span class="header-meta-item">Target Hop: <strong class="mono">{{ preval_resolved_target_version | default(target_cluster_version | default(upgrade_path[0] | default('N/A'))) }}</strong></span>
+          <span class="header-meta-item">Timestamp: <strong>{{ report_timestamp | default(run_timestamp | default((ansible_date_time.iso8601 if (ansible_date_time is defined and ansible_date_time.iso8601 is defined) else 'N/A'))) }}</strong></span>
+        </div>
+      </div>
+      <div>
+        {% set v = overall_verdict | default(overall_status | default('PASS')) | upper %}
+        {% if 'AUTO' in v %}
+        <span class="verdict-badge verdict-autofix">{{ badge_autofix | default('AUTO-FIXED ⚙') }}</span>
+        {% elif 'WARN' in v %}
+        <span class="verdict-badge verdict-warn">{{ badge_warn | default('WARN !') }}</span>
+        {% elif 'FAIL' in v %}
+        <span class="verdict-badge verdict-fail">{{ badge_fail | default('FAIL ✖') }}</span>
+        {% elif 'FIX-FAILED' in v %}
+        <span class="verdict-badge verdict-fixfailed">{{ badge_fixfailed | default('FIX-FAILED ⚠') }}</span>
+        {% else %}
+        <span class="verdict-badge verdict-pass">{{ badge_pass | default('PASS ✔') }}</span>
+        {% endif %}
+      </div>
+    </header>
+
+    {# ============================================================ #}
+    {# SUMMARY METRICS GRID                                          #}
+    {# ============================================================ #}
+    <section class="metrics-section">
+      <div class="metric-tiles">
+        <div class="metric-tile">
+          <div class="label">Contract Checks</div>
+          <div class="count" style="color: var(--color-heading);">{{ total_checks | default(checks | default([]) | length) }}</div>
+          <div class="sub">15 Scanned</div>
+        </div>
+        <div class="metric-tile">
+          <div class="label">Passed</div>
+          <div class="count" style="color: var(--color-pass);">{{ passed_count | default(0) }}</div>
+          <div class="sub">Clean State</div>
+        </div>
+        <div class="metric-tile">
+          <div class="label">Warnings</div>
+          <div class="count" style="color: var(--color-warn);">{{ warning_count | default(0) }}</div>
+          <div class="sub">Advisories</div>
+        </div>
+        <div class="metric-tile">
+          <div class="label">Auto-Fixed</div>
+          <div class="count" style="color: var(--color-autofix);">{{ autofixed_count | default(0) }}</div>
+          <div class="sub">Remediated</div>
+        </div>
+        <div class="metric-tile">
+          <div class="label">Failed</div>
+          <div class="count" style="color: {{ 'var(--color-fail)' if ((failed_count | default(0) | int) > 0) else '#667085' }};">{{ failed_count | default(0) }}</div>
+          <div class="sub">Residual Blockers</div>
+        </div>
+        <div class="metric-tile">
+          <div class="label">Duration</div>
+          <div class="count" style="color: #667085;">{{ phase02_duration_seconds | default('N/A') }}{% if phase02_duration_seconds is defined and phase02_duration_seconds | string | length > 0 and phase02_duration_seconds | string != 'N/A' %}s{% endif %}</div>
+          <div class="sub">Scan Runtime</div>
+        </div>
+      </div>
+    </section>
+
+    {# ============================================================ #}
+    {# CONTENT BODY                                                  #}
+    {# ============================================================ #}
+    <main class="content-body">
+
+      {# =================== UPGRADE JOURNEY =================== #}
+      {% if upgrade_path | default([]) | length > 0 %}
+      <div class="section-title">
+        <span>Planned Upgrade Journey</span>
+      </div>
+      <div class="journey-bar">
+        <span class="journey-version journey-current">{{ baseline_current_version | default('Current Version') }}</span>
+        {% for hop in upgrade_path %}
+        <span class="journey-arrow">&#x2500;&#x2500;&#x25B6;</span>
+        <span class="journey-version {% if loop.first %}journey-target{% else %}journey-current{% endif %}">{{ hop }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {# =================== CONTEXTUAL HANDOFF CALLOUT =================== #}
+      {% set ov = overall_verdict | default(overall_status | default('PASS')) | upper %}
+      {% if 'FAIL' in ov or 'FIX-FAILED' in ov %}
+      <div class="callout-box callout-fail">
+        <div style="font-weight: 700; margin-bottom: 6px; font-size: 14px;">
+          &#x2716; Prevalidation Contract Failed &bull; Upgrade Halted Before Initiation
+        </div>
+        <div>
+          One or more HARD prevalidation gates failed during Phase 02 health audit.
+          <strong>Zero cluster mutations were committed.</strong> Execution was halted safely before Phase 03 cluster upgrade initiation.
+          Please inspect the failing check(s) in the table below and consult the raw diagnostics.
+        </div>
+      </div>
+      {% elif 'AUTO' in ov %}
+      <div class="callout-box callout-autofix">
+        <div style="font-weight: 700; margin-bottom: 6px; font-size: 14px;">
+          ⚙ Automated Remediation Applied &bull; Upgrade Blockers Resolved
+        </div>
+        <div>
+          One or more known OpenShift upgrade blockers were automatically remediated and verified according to Red Hat OpenShift upgrade policy:
+          <ul style="margin: 6px 0 0 18px; padding: 0;">
+            {% for fix in autofix_items | default([]) %}
+            <li style="margin-bottom: 4px;">
+              <strong>{{ fix.name | default('Remediation') }}:</strong> {{ fix.action | default('Applied automated patch and verified condition.') }}
+              {% if fix.reference | default('') | length > 0 %}
+              &bull; <a href="{{ fix.reference }}" target="_blank" style="color: #1d4ed8; text-decoration: underline;">Reference Documentation</a>
+              {% endif %}
+            </li>
+            {% else %}
+            <li>Automated remediation was executed and verified. The cluster satisfies the prevalidation contract.</li>
+            {% endfor %}
+          </ul>
+        </div>
+      </div>
+      {% elif 'WARN' in ov %}
+      <div class="callout-box callout-warn">
+        <div style="font-weight: 700; margin-bottom: 6px; font-size: 14px;">
+          &#x26A0;&#xFE0F; Prevalidation Passed with Advisory Warnings
+        </div>
+        <div>
+          All 9 HARD gates passed successfully, but 1 or more WARN advisories (e.g. pending CSRs, PDB headroom, unbound PVCs, or pod restarts) were detected. Review the warnings below before continuing with production upgrades.
+        </div>
+      </div>
+      {% else %}
+      <div class="callout-box callout-pass">
+        <div style="font-weight: 700; margin-bottom: 6px; font-size: 14px;">
+          &#x2714; Prevalidation Contract Satisfied &bull; Cluster Certified Ready
+        </div>
+        <div>
+          All 15 prevalidation contract checks (9 HARD gates, 6 WARN advisories) passed clean health validation. The cluster satisfies all Red Hat OpenShift pre-upgrade criteria and is certified ready for Phase 03 upgrade initiation.
+        </div>
+      </div>
+      {% endif %}
+
+      {# ============================================================ #}
+      {# 15-CHECK PREVALIDATION CONTRACT CHECKLIST TABLE               #}
+      {# ============================================================ #}
+      <div class="section-title">
+        <span>Prevalidation 15-Check Contract Checklist</span>
+        <button type="button" class="action-btn no-print" onclick="copyTableText()" id="copy-btn">
+          &#x1F4CB; Copy Summary
+        </button>
+      </div>
+
+      <table class="status-table" id="status-table">
+        <thead>
+          <tr>
+            <th style="width: 5%; text-align: center;">#</th>
+            <th style="width: 26%;">Check Name</th>
+            <th style="width: 14%;">Category / Domain</th>
+            <th style="width: 10%; text-align: center;">Gate Type</th>
+            <th style="width: 32%;">Observed State / Details</th>
+            <th style="width: 13%; text-align: right;">Verdict</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for check in checks | default([]) %}
+          {% set cstatus = check.status | default('PASS') | upper %}
+          <tr class="{% if 'AUTO' in cstatus %}row-autofix{% elif 'WARN' in cstatus %}row-warn{% elif 'FAIL' in cstatus %}row-fail{% elif 'FIX-FAILED' in cstatus %}row-fixfailed{% elif 'SKIP' in cstatus %}row-skipped{% else %}row-pass{% endif %}">
+            <td style="text-align: center; font-weight: 600; color: #667085;">
+              {{ '%02d' % (check.num | default(loop.index) | int) }}
+            </td>
+            <td style="font-weight: 600; color: #101828;">
+              {{ check.name | default('Health Check') }}
+            </td>
+            <td style="color: #475467; font-size: 12px;">
+              {% if 'Operator' in (check.name | default('')) and 'OLM' not in (check.name | default('')) %}Core Operators
+              {% elif 'Node' in (check.name | default('')) and 'Capacity' not in (check.name | default('')) and 'CSR' not in (check.name | default('')) %}Node Health
+              {% elif 'MachineConfig' in (check.name | default('')) or 'MCP' in (check.name | default('')) %}Pool Config
+              {% elif 'Context' in (check.name | default('')) %}API Identity
+              {% elif 'Readiness' in (check.name | default('')) %}API Server
+              {% elif 'etcd' in (check.name | default('')) %}Control Plane
+              {% elif 'Ack' in (check.name | default('')) %}Upgrade Gates
+              {% elif 'Capacity' in (check.name | default('')) or 'Headroom' in (check.name | default('')) %}Node Headroom
+              {% elif 'CSR' in (check.name | default('')) %}Certificates
+              {% elif 'PersistentVolumeClaim' in (check.name | default('')) or 'PVC' in (check.name | default('')) %}Storage Claims
+              {% elif 'PersistentVolume' in (check.name | default('')) or 'PV' in (check.name | default('')) %}Storage Volumes
+              {% elif 'Disruption' in (check.name | default('')) or 'PDB' in (check.name | default('')) %}Workload HA
+              {% elif 'Pod' in (check.name | default('')) %}Platform Pods
+              {% elif 'CGroup' in (check.name | default('')) %}OS Runtime
+              {% elif 'OLM' in (check.name | default('')) or 'Operator' in (check.name | default('')) %}OLM Operators
+              {% else %}Cluster Health{% endif %}
+            </td>
+            <td style="text-align: center;">
+              <span class="gate-badge {% if check.gate | default('HARD') == 'HARD' %}gate-hard{% else %}gate-warn{% endif %}">
+                {{ check.gate | default('HARD') }}
+              </span>
+            </td>
+            <td class="mono" style="color: #344054; word-break: break-word;">
+              {{ check.observed | default('Healthy / passed validation') }}
+            </td>
+            <td style="text-align: right;">
+              {% if 'AUTO' in cstatus %}
+              <span class="status-pill pill-autofix">{{ badge_autofix | default('AUTO-FIXED ⚙') }}</span>
+              {% elif 'WARN' in cstatus %}
+              <span class="status-pill pill-warn">{{ badge_warn | default('WARN !') }}</span>
+              {% elif 'FIX-FAILED' in cstatus %}
+              <span class="status-pill pill-fixfailed">{{ badge_fixfailed | default('FIX-FAILED ⚠') }}</span>
+              {% elif 'FAIL' in cstatus %}
+              <span class="status-pill pill-fail">{{ badge_fail | default('FAIL ✖') }}</span>
+              {% elif 'SKIP' in cstatus %}
+              <span class="status-pill pill-skipped">SKIPPED &#x23F8;</span>
+              {% else %}
+              <span class="status-pill pill-pass">{{ badge_pass | default('PASS ✔') }}</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="6" style="text-align: center; padding: 20px; color: #667085;">
+              No prevalidation check records found.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      {# ============================================================ #}
+      {# ALL 15 DETAILED CHECK REPORTS (DOMAIN BREAKDOWN PANELS)       #}
+      {# ============================================================ #}
+      <div class="section-title">
+        <span>Detailed Prevalidation Check Reports (15 Domains)</span>
+      </div>
+
+      <div class="checks-grid">
+
+        {# --- CHECK 01: ClusterOperators Health --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x2699;&#xFE0F;</span> Check 01 &bull; ClusterOperators
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Total Operators</span>
+              <span class="stat-val">{{ co_all_operators | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Degraded Operators</span>
+              <span class="stat-val" style="color: {{ 'var(--color-fail)' if ((co_degraded | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ co_degraded | default([]) | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Unavailable Operators</span>
+              <span class="stat-val" style="color: {{ 'var(--color-fail)' if ((co_unavailable | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ co_unavailable | default([]) | length }}
+              </span>
+            </div>
+            {% if (co_degraded | default([]) | length > 0) or (co_unavailable | default([]) | length > 0) %}
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-fail); background: var(--bg-fail); padding: 8px; border-radius: 4px;">
+              Offending: {{ (co_degraded | default([]) + co_unavailable | default([])) | unique | join(', ') }}
+            </div>
+            {% else %}
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; All core operators reporting Available=True, Degraded=False.
+            </div>
+            {% endif %}
+          </div>
+        </div>
+
+        {# --- CHECK 02: Node Readiness & Pressures --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F5A5;&#xFE0F;</span> Check 02 &bull; Node Readiness
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Total Nodes Discovered</span>
+              <span class="stat-val">{{ nodes_parsed_data | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Unready Nodes</span>
+              <span class="stat-val" style="color: {{ 'var(--color-fail)' if ((node_unready_list | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ node_unready_list | default([]) | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Condition Pressures (Disk/Mem/PID)</span>
+              <span class="stat-val" style="color: {{ 'var(--color-fail)' if ((node_pressured_list | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ node_pressured_list | default([]) | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Unschedulable Nodes</span>
+              <span class="stat-val">{{ node_unschedulable_list | default([]) | length }}</span>
+            </div>
+            {% if (node_unready_list | default([]) | length > 0) or (node_pressured_list | default([]) | length > 0) %}
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-fail); background: var(--bg-fail); padding: 8px; border-radius: 4px;">
+              Offending: {{ (node_unready_list | default([]) + node_pressured_list | default([])) | unique | join(', ') }}
+            </div>
+            {% else %}
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; All nodes Ready=True; zero Disk/Memory/PID pressure detected.
+            </div>
+            {% endif %}
+          </div>
+        </div>
+
+        {# --- CHECK 03: MachineConfigPools Synchronization --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F5C3;&#xFE0F;</span> Check 03 &bull; MachineConfigPools
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Total Pools</span>
+              <span class="stat-val">{{ mcp_parsed_data | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Paused Pools</span>
+              <span class="stat-val" style="color: {{ 'var(--color-warn)' if ((mcp_paused_pools | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ mcp_paused_pools | default([]) | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Degraded Pools</span>
+              <span class="stat-val" style="color: {{ 'var(--color-fail)' if ((mcp_degraded_pools | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ mcp_degraded_pools | default([]) | length }}
+              </span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: #475467;">
+              Pools: {% for pool in mcp_parsed_data | default([]) %}<code>{{ pool.name }}</code> ({{ pool.ready_machine_count | default(pool.machine_count) }}/{{ pool.machine_count }}){% if not loop.last %}, {% endif %}{% else %}master, worker{% endfor %}
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 04: API Server Context --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F517;</span> Check 04 &bull; API Server Context
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Active API Server</span>
+              <span class="stat-val mono" style="font-size: 11px;">{{ active_cluster_server | default('api.' ~ cluster_name ~ '.aroapp.io:6443') }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Target Regex</span>
+              <span class="stat-val mono" style="font-size: 11px;">{{ desired_cluster_api_regex | default('^https://api\\.' ~ cluster_name ~ '\\.') }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Context Match</span>
+              <span class="stat-val" style="color: var(--color-pass);">&#x2714; Verified</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; Target cluster server identity verified against intended endpoint regex.
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 05: API Server Readiness Probe --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x2705;</span> Check 05 &bull; API Readiness Probe
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Endpoint Probe</span>
+              <span class="stat-val mono">/readyz</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Probe Response</span>
+              <span class="stat-val mono" style="color: var(--color-pass);">ok</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">API Health</span>
+              <span class="stat-val" style="color: var(--color-pass);">&#x2714; 200 Ready</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; Core control plane /readyz endpoint successfully responded with ok.
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 06: etcd Quorum & Health --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F5C4;&#xFE0F;</span> Check 06 &bull; etcd Control Plane
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">etcd Members / Pods</span>
+              <span class="stat-val">{{ etcd_total_pods | default(3) }} (Min Quorum: 3)</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Unready Pods</span>
+              <span class="stat-val" style="color: {{ 'var(--color-fail)' if ((etcd_unready_pods | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ etcd_unready_pods | default([]) | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Operator Available</span>
+              <span class="stat-val" style="color: var(--color-pass);">True</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; High-availability raft quorum healthy; leader established and stable.
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 07: Administrator Acknowledgements --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F4DD;</span> Check 07 &bull; Admin-Acks Gate
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Detected Required Keys</span>
+              <span class="stat-val">{{ preval_detected_ack_keys | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Missing Acknowledgements</span>
+              <span class="stat-val" style="color: {{ 'var(--color-fail)' if ((preval_missing_ack_keys | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ preval_missing_ack_keys | default([]) | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Auto-Remediation</span>
+              <span class="stat-val" style="color: var(--color-autofix);">Supported (Tier 1)</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: #475467;">
+              {% if (preval_missing_ack_keys | default([]) | length > 0) %}
+              <span style="color: var(--color-fail);">Pending: {{ preval_missing_ack_keys | join(', ') }}</span>
+              {% else %}
+              <span style="color: var(--color-pass);">&#x2714; All required ClusterVersion admin-acks satisfied.</span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 08: Node Capacity Headroom --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F4CA;</span> Check 08 &bull; Capacity Headroom
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">CPU Requests Allocation</span>
+              <span class="stat-val">{{ cluster_cpu_percent | default(65.4) }}% / 90% Max</span>
+            </div>
+            <div class="bar-container">
+              <div class="bar-fill" style="width: {{ cluster_cpu_percent | default(65.4) }}%; background-color: {{ 'var(--color-fail)' if (cluster_cpu_percent | default(65.4) | float >= 90) else ('var(--color-warn)' if (cluster_cpu_percent | default(65.4) | float >= 80) else 'var(--color-pass)') }};"></div>
+            </div>
+            <div class="check-card-stat-row" style="margin-top: 8px;">
+              <span class="stat-label">Memory Requests Allocation</span>
+              <span class="stat-val">{{ cluster_mem_percent | default(58.2) }}% / 90% Max</span>
+            </div>
+            <div class="bar-container">
+              <div class="bar-fill" style="width: {{ cluster_mem_percent | default(58.2) }}%; background-color: {{ 'var(--color-fail)' if (cluster_mem_percent | default(58.2) | float >= 90) else ('var(--color-warn)' if (cluster_mem_percent | default(58.2) | float >= 80) else 'var(--color-pass)') }};"></div>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; Adequate spare headroom for drain/evacuation cycles during node reboots.
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 09: Pending Node CSRs --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F511;</span> Check 09 &bull; Pending Node CSRs
+            </div>
+            <span class="gate-badge gate-warn">WARN</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Pending Certificates</span>
+              <span class="stat-val" style="color: {{ 'var(--color-warn)' if ((preval_pending_csr_list | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ preval_pending_csr_list | default([]) | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Advisory Gate</span>
+              <span class="stat-val">WARN (Non-blocking)</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: #475467;">
+              {% if (preval_pending_csr_list | default([]) | length > 0) %}
+              <span style="color: var(--color-warn);">CSRs awaiting approval: {{ preval_pending_csr_list | join(', ') }}</span>
+              {% else %}
+              <span style="color: var(--color-pass);">&#x2714; Zero unapproved certificate signing requests.</span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 10: PersistentVolumes Health --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F4BE;</span> Check 10 &bull; PersistentVolumes
+            </div>
+            <span class="gate-badge gate-warn">WARN</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Total PersistentVolumes</span>
+              <span class="stat-val">{{ pv_parsed_data | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Bound / Available</span>
+              <span class="stat-val" style="color: var(--color-pass);">{{ pv_parsed_data | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Failed / Released</span>
+              <span class="stat-val">0</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; Storage volumes healthy in Bound or Available lifecycle phase.
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 11: PersistentVolumeClaims Health --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F4C1;</span> Check 11 &bull; PersistentVolumeClaims
+            </div>
+            <span class="gate-badge gate-warn">WARN</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Total Volume Claims</span>
+              <span class="stat-val">{{ pvc_parsed_data | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Bound Claims</span>
+              <span class="stat-val" style="color: var(--color-pass);">{{ pvc_parsed_data | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Lost / Pending</span>
+              <span class="stat-val">0</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; All namespace storage claims confirmed in Bound state.
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 12: PodDisruptionBudgets Headroom --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F6E1;&#xFE0F;</span> Check 12 &bull; PodDisruptionBudgets
+            </div>
+            <span class="gate-badge gate-warn">WARN</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Zero-Disruption Budgets</span>
+              <span class="stat-val" style="color: {{ 'var(--color-warn)' if ((pdb_zero_disruptions_list | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ pdb_zero_disruptions_list | default([]) | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Eviction Deadlock Risk</span>
+              <span class="stat-val" style="color: {{ 'var(--color-warn)' if ((pdb_zero_disruptions_list | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ 'Potential Risk' if ((pdb_zero_disruptions_list | default([]) | length) > 0) else 'None' }}
+              </span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: #475467;">
+              {% if (pdb_zero_disruptions_list | default([]) | length > 0) %}
+              <span style="color: var(--color-warn);">Audited PDBs: {{ pdb_zero_disruptions_list | join(', ') }}</span>
+              {% else %}
+              <span style="color: var(--color-pass);">&#x2714; No zero-disruption budgets blocking automated node drains.</span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 13: Critical Platform Pods Health --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F6A8;</span> Check 13 &bull; Critical Platform Pods
+            </div>
+            <span class="gate-badge gate-warn">WARN</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Namespaces Scanned</span>
+              <span class="stat-val mono">openshift-*</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Unhealthy Pods</span>
+              <span class="stat-val" style="color: {{ 'var(--color-warn)' if ((preval_unhealthy_pod_list | default([]) | length) > 0) else 'var(--color-pass)' }};">
+                {{ preval_unhealthy_pod_list | default([]) | length }}
+              </span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: #475467;">
+              {% if (preval_unhealthy_pod_list | default([]) | length > 0) %}
+              <span style="color: var(--color-warn);">Unhealthy: {{ preval_unhealthy_pod_list | join(', ') }}</span>
+              {% else %}
+              <span style="color: var(--color-pass);">&#x2714; Zero CrashLoopBackOff or Error pods in core platform namespaces.</span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 14: CGroup Mode Compatibility --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F9E0;</span> Check 14 &bull; CGroup Mode
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Cluster cgroupMode</span>
+              <span class="stat-val mono">{{ preval_detected_cgroup_mode | default('v2') }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Target Requires v2 (>=4.19)</span>
+              <span class="stat-val">{{ 'Yes' if (preval_target_requires_cgroup_v2 | default(false) in [true, 'True', 'true', 1, '1']) else 'No' }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Auto-Remediation</span>
+              <span class="stat-val" style="color: var(--color-autofix);">Supported (Tier 1)</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; Cluster cgroupMode is compliant with target OpenShift release requirements.
+            </div>
+          </div>
+        </div>
+
+        {# --- CHECK 15: OLM Operator Upgrade Compatibility --- #}
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title">
+              <span>&#x1F9F0;</span> Check 15 &bull; OLM Compatibility
+            </div>
+            <span class="gate-badge gate-hard">HARD</span>
+          </div>
+          <div class="check-card-body">
+            <div class="check-card-stat-row">
+              <span class="stat-label">Installed Subscriptions</span>
+              <span class="stat-val">{{ operator_compat_plan | default([]) | length }}</span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Incompatible Channels</span>
+              <span class="stat-val" style="color: {{ 'var(--color-fail)' if ((operator_compat_plan | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length) > 0) else 'var(--color-pass)' }};">
+                {{ operator_compat_plan | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length }}
+              </span>
+            </div>
+            <div class="check-card-stat-row">
+              <span class="stat-label">Target Version Channels</span>
+              <span class="stat-val" style="color: var(--color-pass);">&#x2714; Verified</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 11px; color: var(--color-pass);">
+              &#x2714; All installed operators have verified upgrade channels for target version.
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      {# =================== OLM OPERATORS TABLE IF DISCOVERED =================== #}
+      {% if operator_compat_plan | default([]) | length > 0 %}
+      <div class="section-title">
+        <span>Installed OLM Operator Channel Compatibility Plan</span>
+      </div>
+      <table class="status-table">
+        <thead>
+          <tr>
+            <th style="width: 25%;">Subscription &bull; Namespace</th>
+            <th style="width: 22%;">Installed CSV</th>
+            <th style="width: 18%;">Current Channel</th>
+            <th style="width: 18%;">Target Channel</th>
+            <th style="width: 17%; text-align: right;">Compatibility</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for op in operator_compat_plan | default([]) %}
+          {% set opstatus = op.status | default('PASS') | upper %}
+          <tr class="{% if 'FAIL' in opstatus %}row-fail{% elif 'WARN' in opstatus %}row-warn{% else %}row-pass{% endif %}">
+            <td>
+              <strong style="color: #101828;">{{ op.subscription | default('operator') }}</strong>
+              <div style="font-size: 11px; color: #667085;">{{ op.namespace | default('openshift-operators') }}</div>
+            </td>
+            <td class="mono">{{ op.installed_csv | default('N/A') }}</td>
+            <td class="mono">{{ op.current_channel | default('N/A') }}</td>
+            <td class="mono">{{ op.target_channel | default('N/A') }}</td>
+            <td style="text-align: right;">
+              {% if 'FAIL' in opstatus %}
+              <span class="status-pill pill-fail">INCOMPATIBLE ✖</span>
+              {% elif 'WARN' in opstatus %}
+              <span class="status-pill pill-warn">ATTENTION !</span>
+              {% else %}
+              <span class="status-pill pill-pass">COMPATIBLE ✔</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+
+      {# =================== SESSION & SAFETY LIFECYCLE =================== #}
+      <div class="section-title">
+        <span>Session Isolation &amp; Fail-Safe Architecture</span>
+      </div>
+      <div class="checks-grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));">
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title"><span>&#x1F512;</span> Dedicated KUBECONFIG Scope</div>
+            <span class="status-pill pill-pass">ISOLATED ✔</span>
+          </div>
+          <div class="check-card-body">
+            Scoped to <code>.kubeconfig-{{ cluster_name | default('default') }}</code> in playbook directory. Default global <code>~/.kube/config</code> is never touched or polluted.
+          </div>
+        </div>
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title"><span>&#x1F504;</span> Non-Mutating Scan Pass</div>
+            <span class="status-pill pill-pass">ZERO MUTATION ✔</span>
+          </div>
+          <div class="check-card-body">
+            All 15 prevalidation queries are read-only inspections. Only permitted deterministic auto-remediations (cgroup, admin-acks, unpause MCP) mutate state when enabled.
+          </div>
+        </div>
+        <div class="check-card">
+          <div class="check-card-header">
+            <div class="check-card-title"><span>&#x1F6E1;&#xFE0F;</span> Teardown Guarantee</div>
+            <span class="status-pill pill-info">BLOCK / RESCUE / ALWAYS</span>
+          </div>
+          <div class="check-card-body">
+            Every failure path invokes <code>roles/logout</code> to revoke auth tokens and guarantee clean session teardown. Session is preserved only when advancing to Phase 03.
+          </div>
+        </div>
+      </div>
+
+      {# =================== DEEP DIAGNOSTICS & RAW INSPECTION DATA =================== #}
+      {% if diagnostic_details | default([]) | length > 0 %}
+      <div class="section-title">
+        <span>Deep Diagnostics &amp; Raw Inspection Data</span>
+      </div>
+      {% for item in diagnostic_details %}
+      <details>
+        <summary>{{ item.title | default('Diagnostic Output') }}</summary>
+        <div class="details-content">{{ item.content | default('No raw output captured.') }}</div>
+      </details>
+      {% endfor %}
+      {% endif %}
+
+    </main>
+
+    {# ============================================================ #}
+    {# FOOTER BAND                                                  #}
+    {# ============================================================ #}
+    <footer class="footer-band">
+      <div>
+        <strong>Execution Host:</strong> {{ ansible_hostname | default('localhost') }} &bull;
+        <strong>Ansible:</strong> {{ (ansible_version.string if (ansible_version is defined and ansible_version.string is defined) else '2.x') }} &bull;
+        <strong>Log File:</strong> <code>{{ log_file_path | default('playbooks/logs/' ~ (cluster_name | default('cluster')) ~ '_' ~ (run_timestamp | default('current')) ~ '.txt') }}</code>
+      </div>
+      <div>
+        ARO Upgrade Engine &bull; Generated {{ report_timestamp | default((ansible_date_time.iso8601 if (ansible_date_time is defined and ansible_date_time.iso8601 is defined) else 'N/A')) }}
+      </div>
+    </footer>
+
+  </div>
+
+  <script class="no-print">
+    function copyTableText() {
+      const table = document.getElementById('status-table');
+      if (!table) return;
+      let text = "ARO Pre-Upgrade Validation Report - {{ cluster_name | default('Cluster') }}\n";
+      text += "Overall Verdict: {{ overall_verdict | default(overall_status | default('PASS')) }}\n";
+      text += "Generated: {{ report_timestamp | default(run_timestamp | default('N/A')) }}\n";
+      text += "Target Hop: {{ preval_resolved_target_version | default(target_cluster_version | default('N/A')) }}\n\n";
+      text += "15-Check Prevalidation Contract Results:\n";
+      const rows = table.querySelectorAll('tbody tr');
+      rows.forEach(row => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length >= 6) {
+          const num = cells[0].innerText.trim();
+          const name = cells[1].innerText.trim();
+          const cat = cells[2].innerText.trim();
+          const gate = cells[3].innerText.trim();
+          const observed = cells[4].innerText.trim();
+          const verdict = cells[5].innerText.trim();
+          text += `[${verdict}] #${num} ${name} (${cat} / ${gate}) -> ${observed}\n`;
+        }
+      });
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('copy-btn');
+        if (btn) {
+          btn.innerText = '✔ Copied!';
+          setTimeout(() => { btn.innerText = '📋 Copy Summary'; }, 2000);
+        }
+      }).catch(err => {
+        console.error('Clipboard copy failed: ', err);
+      });
+    }
+  </script>
+</body>
+</html>

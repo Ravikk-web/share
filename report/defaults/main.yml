@@ -14,7 +14,8 @@
 # ============================================================================
 
 # Type of validation report: 'prevalidation', 'postvalidation', 'operators', or 'phase01' (string, default: "prevalidation")
-# Sourced from calling phase playbook. Automatically resolves phase01-policy-check.j2 when set to 'phase01'.
+# Sourced from calling phase playbook. Automatically resolves phase01-policy-check.j2 when set to 'phase01',
+# and phase02-prevalidation.j2 when set to 'prevalidation'.
 report_type: "prevalidation"
 
 # Display title rendered in the report header band (string, default: "Pre-Upgrade Validation Report")

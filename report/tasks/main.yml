@@ -41,8 +41,10 @@
     report_template: >-
       {{ 'phase01-policy-check.j2'
          if (report_type | default('prevalidation') in ['phase01', 'policy_check'])
-         else report_template }}
-  when: (report_template is not defined) or (report_template == 'health-overview.j2' and report_type | default('prevalidation') in ['phase01', 'policy_check'])
+         else ('phase02-prevalidation.j2'
+               if (report_type | default('prevalidation') in ['prevalidation', 'preval'])
+               else report_template) }}
+  when: (report_template is not defined) or (report_template == 'health-overview.j2' and report_type | default('prevalidation') in ['phase01', 'policy_check', 'prevalidation', 'preval'])
 
 # ----------------------------------------------------------------------------
 # 2. Calculate Summary Counters
