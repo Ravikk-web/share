@@ -31,10 +31,18 @@
          else ('Post-Upgrade Validation Report'
                if (report_type == 'postvalidation')
                else ('Phase 01 — Policy Check & Baseline Capture Report'
-                     if (report_type == 'phase01')
+                     if (report_type in ['phase01', 'policy_check'])
                      else ('OLM Operator Validation Report'
                            if (report_type in ['operator', 'operators'])
                            else (report_type | capitalize ~ ' Validation Report')))) }}
+
+- name: "Resolve report presentation template from report_type"
+  set_fact:
+    report_template: >-
+      {{ 'phase01-policy-check.j2'
+         if (report_type | default('prevalidation') in ['phase01', 'policy_check'])
+         else report_template }}
+  when: (report_template is not defined) or (report_template == 'health-overview.j2' and report_type | default('prevalidation') in ['phase01', 'policy_check'])
 
 # ----------------------------------------------------------------------------
 # 2. Calculate Summary Counters
@@ -97,21 +105,7 @@
          else (checks | selectattr('status', 'defined') | selectattr('status', 'equalto', 'AUTO-FIXED') | list) }}
 
 # ----------------------------------------------------------------------------
-# 4. Resolve Template & Render HTML Content
-# ----------------------------------------------------------------------------
-- name: "Resolve report template path"
-  set_fact:
-    resolved_report_template: >-
-      {{ report_template
-         if (report_template.startswith('/') or (report_template | length > 1 and report_template[1] == ':'))
-         else (playbook_dir ~ '/templates/' ~ (report_template | regex_replace('^templates/', ''))) }}
-
-- name: "Render health overview HTML report content"
-  set_fact:
-    report_html_content: "{{ lookup('template', resolved_report_template) }}"
-
-# ----------------------------------------------------------------------------
-# 5. Write Standalone HTML Artifact to output/ & Export Fact
+# 4. Resolve Template & Ensure Output Directory
 # ----------------------------------------------------------------------------
 - name: "Determine destination report file path"
   set_fact:
@@ -126,11 +120,27 @@
     state: directory
     mode: '0755'
 
+- name: "Resolve report template path"
+  set_fact:
+    resolved_report_template: >-
+      {{ report_template
+         if (report_template is match('^(/|[a-zA-Z]:)'))
+         else (playbook_dir ~ '/templates/' ~ (report_template | regex_replace('^templates/', ''))) }}
+
+# ----------------------------------------------------------------------------
+# 5. Write Standalone HTML Artifact to output/ via Template Module
+# Why: Uses native template module to stream rendered HTML directly to destination,
+#      avoiding fact memory limits and Jinja2 recursive interpolation issues.
+# ----------------------------------------------------------------------------
 - name: "Write standalone validation HTML report"
-  copy:
-    content: "{{ report_html_content }}"
+  template:
+    src: "{{ resolved_report_template }}"
     dest: "{{ report_file_path }}"
     mode: '0644'
+
+- name: "Capture rendered HTML report content in fact for notifications"
+  set_fact:
+    report_html_content: "{{ lookup('file', report_file_path) }}"
 
 - name: "Confirm HTML report artifact generation"
   debug:

@@ -13,12 +13,12 @@
 # Outputs: Default variables consumed by report tasks
 # ============================================================================
 
-# Type of validation report: 'prevalidation', 'postvalidation', or 'operators' (string, default: "prevalidation")
-# Sourced from calling phase playbook
+# Type of validation report: 'prevalidation', 'postvalidation', 'operators', or 'phase01' (string, default: "prevalidation")
+# Sourced from calling phase playbook. Automatically resolves phase01-policy-check.j2 when set to 'phase01'.
 report_type: "prevalidation"
 
 # Display title rendered in the report header band (string, default: "Pre-Upgrade Validation Report")
-# Sourced from calling phase playbook
+# Sourced from calling phase playbook (automatically resolves dedicated title when report_type is 'phase01')
 report_title: "Pre-Upgrade Validation Report"
 
 # Fallback overall status verdict badge ('PASS', 'WARN', 'FAIL', 'AUTO-FIXED', 'FIX-FAILED') (string, default: "PASS")

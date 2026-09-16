@@ -656,7 +656,7 @@ Constraints:
           <span style="font-size: 18px; color: #98a2b3;">&rarr;</span>
           <div>
             <span style="font-size: 12px; color: #667085; text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600;">Target First Hop</span><br>
-            {% if (is_valid_target_edge | default(false) in [true, 'True', 'true', 1, '1']) or ('PASS' in (overall_verdict | default('PASS') | upper) and (target_first_hop in (all_valid_update_edges | default([])))) %}
+            {% if (is_valid_target_edge | default(false) in [true, 'True', 'true', 1, '1']) or ('PASS' in (overall_verdict | default('PASS') | upper) and ((target_first_hop | default('')) in (all_valid_update_edges | default([])))) %}
             <span class="edge-target">&#x2714; {{ target_first_hop | default('N/A') }}</span>
             {% else %}
             <span class="edge-target" style="background: var(--bg-fail); border-color: #fecdd3; color: var(--color-fail);">&#x2716; {{ target_first_hop | default('N/A') }} (INVALID)</span>
@@ -674,7 +674,7 @@ Constraints:
           <strong>Available Edges ({{ available_edges_list | length }}):</strong>
         </div>
         <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px;">
-          {% for edge in available_edges_list %}
+          {% for edge in available_edges_list | default([]) %}
           {% if edge == target_first_hop | default('') %}
           <span class="edge-chip edge-chip-match">{{ edge }} &#x2714;</span>
           {% else %}
@@ -689,7 +689,7 @@ Constraints:
           <strong>Conditional Edges ({{ conditional_edges_list | length }}):</strong>
         </div>
         <div style="display: flex; flex-wrap: wrap; gap: 6px;">
-          {% for edge in conditional_edges_list %}
+          {% for edge in conditional_edges_list | default([]) %}
           {% if edge == target_first_hop | default('') %}
           <span class="edge-chip edge-chip-match">{{ edge }} &#x2714;</span>
           {% else %}
@@ -706,10 +706,10 @@ Constraints:
       </div>
 
       <div class="lifecycle-grid">
-        <div class="lifecycle-card lc-success">
+        <div class="lifecycle-card {{ 'lc-fail' if (overall_verdict | default('PASS') | upper == 'FAIL' and not (p01_login_succeeded | default(true))) else 'lc-success' }}">
           <div class="lc-header">&#x1F510; Authentication</div>
           <div class="lc-body">
-            <strong>Status:</strong> Login Successful<br>
+            <strong>Status:</strong> {{ 'Login Failed' if (overall_verdict | default('PASS') | upper == 'FAIL' and not (p01_login_succeeded | default(true))) else 'Login Successful' }}<br>
             <strong>Method:</strong> <code class="mono">oc login</code> with service account<br>
             <strong>Kubeconfig:</strong> <code class="mono">.kubeconfig-{{ cluster_name | default('cluster') }}</code><br>
             <strong>Scope:</strong> Dedicated file under playbook_dir
