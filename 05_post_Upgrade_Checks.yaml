@@ -61,10 +61,13 @@
             run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
           when: run_timestamp is not defined or run_timestamp | length == 0
 
-        # Reset report_file_path so earlier phases (Phase 02) do not mask failure report generation
-        - name: "Phase 05: Reset report_file_path fact from earlier phases"
+        # Reset report_file_path and attachments so earlier phases (Phase 02) do not leak
+        - name: "Phase 05: Reset reporting and attachment facts from earlier phases"
           set_fact:
             report_file_path: ""
+            mail_attachments: []
+            attached_reports: []
+            report_template: "health-overview.j2"
 
         # 2. Display Phase 05 Initiation Banner
         - name: "Display Phase 05 initiation banner"
@@ -255,20 +258,101 @@
             failure_observed: "{{ resolved_error }}"
             phase_05_failed: true
 
-        - name: "Generate client-facing Postvalidation HTML report on failure if health summary present"
-          block:
-            - name: "Pre-compute report facts for client-facing HTML postvalidation report on failure"
-              set_fact:
-                report_type: "postvalidation"
-                report_title: "Post-Upgrade Validation Report"
-                checks: "{{ health_summary }}"
-            - name: "Generate Postvalidation HTML report on failure"
-              include_role:
-                name: report
-          when:
-            - health_summary is defined
-            - (health_summary | length) > 0
-            - (report_file_path is not defined) or (report_file_path | length == 0)
+        # 4. Generate client-facing Postvalidation HTML failure report
+        - name: "Determine destination postvalidation failure report file path"
+          set_fact:
+            p05_rescue_report_path: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_postvalidation_{{ run_timestamp }}.html"
+
+        - name: "Assemble complete 10-check postvalidation contract list for failure report"
+          set_fact:
+            p05_failure_checks: >-
+              {%- set canon = [
+                {'num': 1, 'name': 'Final ClusterVersion', 'gate': 'HARD'},
+                {'num': 2, 'name': 'ClusterOperators Status', 'gate': 'HARD'},
+                {'num': 3, 'name': 'MachineConfigPool Status', 'gate': 'HARD'},
+                {'num': 4, 'name': 'Node Readiness & Version', 'gate': 'HARD'},
+                {'num': 5, 'name': 'Node Pressures', 'gate': 'HARD'},
+                {'num': 6, 'name': 'etcd Cluster Health', 'gate': 'HARD'},
+                {'num': 7, 'name': 'PersistentVolume Status', 'gate': 'WARN'},
+                {'num': 8, 'name': 'Core Namespace Pods', 'gate': 'WARN'},
+                {'num': 9, 'name': 'Firing Critical Alerts', 'gate': 'WARN'},
+                {'num': 10, 'name': 'Baseline Diff Audit', 'gate': 'WARN'}
+              ] -%}
+              {%- set res = [] -%}
+              {%- for c in canon -%}
+                {%- set matched = [] -%}
+                {%- for h in health_summary | default([]) -%}
+                  {%- if (h.num | default(0) | int == c.num) or (c.name | lower in (h.name | default('') | lower)) or ((h.name | default('') | lower) in c.name | lower) -%}
+                    {%- set _ = matched.append(h) -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- if matched | length > 0 -%}
+                  {%- set _ = res.append(matched[0]) -%}
+                {%- else -%}
+                  {%- set is_first_unrun = (res | length == (health_summary | default([]) | length)) -%}
+                  {%- set _ = res.append({
+                    'num': c.num,
+                    'name': c.name,
+                    'gate': c.gate,
+                    'status': ('FAIL' if is_first_unrun else 'SKIPPED'),
+                    'observed': (('Halted with error: ' ~ resolved_error) if is_first_unrun else 'Check was not evaluated due to prior failure in postvalidation sequence')
+                  }) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ res }}
+
+        - name: "Configure failure report parameters for Postvalidation report"
+          set_fact:
+            report_type: "postvalidation"
+            report_title: "Post-Upgrade Validation Report"
+            report_template: "health-overview.j2"
+            overall_status: "FAIL"
+            overall_verdict: "FAIL"
+            checks: "{{ p05_failure_checks }}"
+            output_file: "{{ p05_rescue_report_path }}"
+
+        - name: "Ensure report output directory exists on failure"
+          file:
+            path: "{{ output_dir | default(playbook_dir ~ '/output') }}"
+            state: directory
+            mode: '0755'
+
+        - name: "Generate client-facing Postvalidation HTML failure report via report role"
+          include_role:
+            name: report
+          ignore_errors: true
+
+        - name: "Check if Postvalidation failure HTML report was written to disk"
+          stat:
+            path: "{{ p05_rescue_report_path }}"
+          register: p05_rescue_report_stat
+
+        - name: "Fallback: Directly stream health-overview.j2 to output if needed"
+          template:
+            src: "{{ playbook_dir }}/templates/health-overview.j2"
+            dest: "{{ p05_rescue_report_path }}"
+            mode: '0644'
+          when: not (p05_rescue_report_stat.stat.exists | default(false))
+          failed_when: false
+
+        - name: "Verify Postvalidation failure report disk presence and export facts"
+          stat:
+            path: "{{ p05_rescue_report_path }}"
+          register: p05_final_rescue_stat
+
+        - name: "Attach Postvalidation HTML report to mail_attachments for alert email"
+          set_fact:
+            report_file_path: "{{ p05_rescue_report_path }}"
+            mail_attachments: "{{ [p05_rescue_report_path] }}"
+            attached_reports: "{{ [p05_rescue_report_path | basename] }}"
+          when: p05_final_rescue_stat.stat.exists | default(false)
+
+        - name: "Ensure mail_attachments is empty if no postvalidation report on disk"
+          set_fact:
+            report_file_path: ""
+            mail_attachments: []
+            attached_reports: []
+          when: not (p05_final_rescue_stat.stat.exists | default(false))
 
         - name: "Record Phase 05 failure and alert via error_handle role"
           include_role:
