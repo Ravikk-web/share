@@ -498,18 +498,39 @@ Constraints:
         </div>
         <div class="metric-tile">
           <div class="label">Edge Validated</div>
+          {% if is_valid_target_edge | default(false) in [true, 'True', 'true', 1, '1'] %}
           <div class="count" style="color: var(--color-pass);">&#x2714;</div>
           <div class="sub">First Hop Verified</div>
+          {% elif 'FAIL' in (overall_verdict | default('PASS') | upper) %}
+          <div class="count" style="color: var(--color-fail);">&#x2716;</div>
+          <div class="sub">Validation Failed</div>
+          {% else %}
+          <div class="count" style="color: var(--color-pass);">&#x2714;</div>
+          <div class="sub">First Hop Verified</div>
+          {% endif %}
         </div>
         <div class="metric-tile">
           <div class="label">Snapshot</div>
+          {% if baseline_snapshot_file_path is defined and baseline_snapshot_file_path | length > 0 %}
           <div class="count" style="color: var(--phase-accent);">1</div>
           <div class="sub">Baseline Captured</div>
+          {% elif 'FAIL' in (overall_verdict | default('PASS') | upper) %}
+          <div class="count" style="color: var(--color-fail);">0</div>
+          <div class="sub">Capture Failed</div>
+          {% else %}
+          <div class="count" style="color: var(--phase-accent);">1</div>
+          <div class="sub">Baseline Captured</div>
+          {% endif %}
         </div>
         <div class="metric-tile">
           <div class="label">Session</div>
+          {% if phase_01_failed | default(false) in [true, 'True', 'true', 1, '1'] %}
+          <div class="count" style="color: var(--color-warn);">&#x26A0;&#xFE0F;</div>
+          <div class="sub">Session Torn Down</div>
+          {% else %}
           <div class="count" style="color: var(--color-pass);">&#x2714;</div>
           <div class="sub">Authenticated</div>
+          {% endif %}
         </div>
         <div class="metric-tile">
           <div class="label">Duration</div>
@@ -635,7 +656,11 @@ Constraints:
           <span style="font-size: 18px; color: #98a2b3;">&rarr;</span>
           <div>
             <span style="font-size: 12px; color: #667085; text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600;">Target First Hop</span><br>
+            {% if (is_valid_target_edge | default(false) in [true, 'True', 'true', 1, '1']) or ('PASS' in (overall_verdict | default('PASS') | upper) and (target_first_hop in (all_valid_update_edges | default([])))) %}
             <span class="edge-target">&#x2714; {{ target_first_hop | default('N/A') }}</span>
+            {% else %}
+            <span class="edge-target" style="background: var(--bg-fail); border-color: #fecdd3; color: var(--color-fail);">&#x2716; {{ target_first_hop | default('N/A') }} (INVALID)</span>
+            {% endif %}
           </div>
           <span style="font-size: 18px; color: #98a2b3;">on</span>
           <div>
@@ -726,11 +751,17 @@ Constraints:
           </tr>
         </thead>
         <tbody>
-          <tr class="row-pass">
+          <tr class="{% if baseline_snapshot_file_path is defined and (baseline_snapshot_file_path | length > 0) %}row-pass{% else %}row-fail{% endif %}">
             <td style="font-weight: 600; color: #101828;">Baseline JSON Snapshot</td>
             <td class="mono" style="color: #344054;">{{ baseline_snapshot_file_path | default('snapshots/' ~ (cluster_name | default('cluster')) ~ '_baseline.json') }}</td>
             <td><span class="gate-badge">JSON</span></td>
-            <td style="text-align: right;"><span class="status-pill pill-pass">WRITTEN &#x2714;</span></td>
+            <td style="text-align: right;">
+              {% if baseline_snapshot_file_path is defined and (baseline_snapshot_file_path | length > 0) %}
+              <span class="status-pill pill-pass">WRITTEN &#x2714;</span>
+              {% else %}
+              <span class="status-pill pill-fail">FAILED &#x2716;</span>
+              {% endif %}
+            </td>
           </tr>
           <tr class="row-pass">
             <td style="font-weight: 600; color: #101828;">Text Run Log</td>
@@ -748,7 +779,13 @@ Constraints:
             <td style="font-weight: 600; color: #101828;">Scoped Kubeconfig</td>
             <td class="mono" style="color: #344054;">.kubeconfig-{{ cluster_name | default('cluster') }}</td>
             <td><span class="gate-badge">CONFIG</span></td>
-            <td style="text-align: right;"><span class="status-pill pill-pass">ACTIVE &#x2714;</span></td>
+            <td style="text-align: right;">
+              {% if phase_01_failed | default(false) in [true, 'True', 'true', 1, '1'] %}
+              <span class="status-pill pill-warn">TEARDOWN &#x2714;</span>
+              {% else %}
+              <span class="status-pill pill-pass">ACTIVE &#x2714;</span>
+              {% endif %}
+            </td>
           </tr>
         </tbody>
       </table>
@@ -766,7 +803,22 @@ Constraints:
       {% endfor %}
       {% endif %}
 
-      {# =================== PHASE HANDOFF =================== #}
+      {# =================== PHASE HANDOFF / STATUS =================== #}
+      {% set v = overall_verdict | default('PASS') | upper %}
+      {% if 'FAIL' in v %}
+      <div class="callout-box" style="background: var(--bg-fail); border: 1px solid #fecdd3; border-radius: 8px; padding: 16px 20px; margin-top: 24px;">
+        <div style="font-weight: 700; margin-bottom: 6px; font-size: 14px; color: var(--color-fail);">
+          &#x2716; Phase 01 Failed &mdash; Upgrade Halted Prior to Cluster Mutations
+        </div>
+        <div style="color: #344054;">
+          A policy check, baseline capture, or update edge enforcement failure halted execution during Phase 01.
+          <strong>Zero cluster mutations were performed.</strong> The cluster remains on version
+          <strong>{{ baseline_current_version | default('current') }}</strong>. The authenticated session has been safely
+          torn down via <strong>block/rescue/always</strong>. Inspect the step-by-step execution results and deep diagnostics
+          below for root-cause details.
+        </div>
+      </div>
+      {% else %}
       <div class="callout-pass callout-box">
         <div style="font-weight: 700; margin-bottom: 6px; font-size: 14px;">
           &#x2714; Phase 01 Complete &mdash; Ready for Phase 02 Prevalidation
@@ -778,6 +830,7 @@ Constraints:
           <strong>Phase 05: Postvalidation &amp; Baseline Diff</strong> for structural comparison.
         </div>
       </div>
+      {% endif %}
 
     </main>
 

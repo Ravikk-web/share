@@ -15,7 +15,7 @@
 #               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
 #               roles/login, roles/logout, roles/snapshot, roles/error_handle
 # Gate Type: HARD (fails immediately if edge check fails or cluster unreachable)
-# Outputs: snapshots/<cluster>_<ts>_baseline.json, baseline_snapshot_file_path fact, authenticated session
+# Outputs: snapshots/<cluster>_<ts>_baseline.json, baseline_snapshot_file_path fact, output/<cluster>_phase01_<ts>.html (success and failure), authenticated session
 # ============================================================================
 
 - name: "Phase 01 — Policy Check & Baseline Capture"
@@ -232,7 +232,23 @@
                 status: "PASS"
                 observed: "PHASE 01 COMPLETE — Session preserved for Phase 02 Prevalidation"
 
-        # 13. Configure report parameters for Phase 01 report generation
+        # 13. Configure deep diagnostic details for Phase 01 report
+        - name: "Configure deep diagnostic details for Phase 01 report"
+          set_fact:
+            diagnostic_details:
+              - title: "Live Cluster Version & Channel Configuration"
+                content: >-
+                  Cluster: {{ cluster_name }}
+                  Current Version: {{ baseline_current_version }}
+                  Channel: {{ baseline_channel }}
+                  Target First Hop: {{ target_first_hop }}
+                  Verified Edge: true
+              - title: "Available Update Edges (Raw)"
+                content: "{{ available_edges_list | default([]) | to_nice_json }}"
+              - title: "Conditional Update Edges (Raw)"
+                content: "{{ conditional_edges_list | default([]) | to_nice_json }}"
+
+        # 14. Configure report parameters for Phase 01 report generation
         # Why: Pre-computes facts consumed by the report role to prevent Jinja2 lazy recursion.
         #      Uses phase01-policy-check.j2 template instead of health-overview.j2 because
         #      Phase 01 content (edge validation, snapshot grid, session lifecycle) differs
@@ -244,17 +260,18 @@
             report_template: "phase01-policy-check.j2"
             checks: "{{ phase01_checks }}"
 
-        # 14. Generate client-facing Phase 01 HTML report via report role
+        # 15. Generate client-facing Phase 01 HTML report via report role
         - name: "Generate client-facing Phase 01 Policy Check HTML report via report role"
           include_role:
             name: report
 
       # ----------------------------------------------------------------------
-      # Rescue: Error Extraction, Alert Dispatch & Clean Session Logout
+      # Rescue: Error Extraction, Report Generation, Alert Dispatch & Session Logout
       # ----------------------------------------------------------------------
       # 1. Error extraction cascade: ansible_failed_result.stderr -> stderr_lines -> msg -> fallback.
-      # 2. Alerts dispatched: error_handle triggers failure alert email (error-report.j2) and dual run logs.
-      # 3. Teardown guarantee: session logout is guaranteed by caller always: block and rescue handler.
+      # 2. Fail-safe report: generates phase01-policy-check.j2 HTML report on failure if not yet created.
+      # 3. Alerts dispatched: error_handle triggers failure alert email (error-report.j2) with attached report.
+      # 4. Teardown guarantee: session logout is guaranteed by caller always: block and rescue handler.
       # ----------------------------------------------------------------------
       rescue:
         - name: "Extract sanitized error message from failure result in Phase 01"
@@ -284,6 +301,160 @@
             failure_reason: "Phase 01 Policy Check or Baseline Snapshot failed"
             failure_observed: "{{ resolved_error }}"
             phase_01_failed: true
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+
+        # Why: Guarantees client-facing HTML audit report is produced even on failure,
+        #      recording which steps passed, which failed, and deep error trace diagnostics.
+        - name: "Phase 01 Rescue: Check if Phase 01 report was already generated on disk"
+          stat:
+            path: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+          register: p01_rescue_report_stat
+
+        - name: "Phase 01 Rescue: Generate client-facing Policy Check HTML report on failure"
+          block:
+            - name: "Phase 01 Rescue: Calculate execution duration on failure"
+              set_fact:
+                phase01_duration_seconds: "{{ (lookup('pipe', 'date +%s') | int) - (phase01_start_epoch | default(lookup('pipe', 'date +%s')) | int) }}"
+
+            - name: "Phase 01 Rescue: Assemble execution step records for failure report"
+              set_fact:
+                phase01_checks:
+                  - num: 0
+                    name: "Establish Authenticated Cluster Session"
+                    gate: "HARD"
+                    status: "PASS"
+                    observed: "Login successful via oc login — kubeconfig scoped to playbook_dir (.kubeconfig-{{ cluster_name }})"
+                  - num: 1
+                    name: "Establish Run Timestamp"
+                    gate: "INFO"
+                    status: "PASS"
+                    observed: "run_timestamp: {{ run_timestamp }}"
+                  - num: 2
+                    name: "Capture Cluster Baseline Snapshot"
+                    gate: "HARD"
+                    status: >-
+                      {{ 'PASS' if (baseline_snapshot_file_path is defined and baseline_snapshot_file_path | length > 0) else 'FAIL' }}
+                    observed: >-
+                      {{ (baseline_snapshot_file_path ~ ' — Nodes: ' ~ (baseline_nodes_count | default(0)) ~ ', Operators: ' ~ (baseline_operators_count | default(0)) ~ ', Routes: ' ~ (baseline_routes_count | default(0)))
+                         if (baseline_snapshot_file_path is defined and baseline_snapshot_file_path | length > 0)
+                         else ('Failed to capture baseline snapshot: ' ~ resolved_error) }}
+                  - num: 3
+                    name: "Query Live Available Update Edges"
+                    gate: "HARD"
+                    status: >-
+                      {{ 'PASS' if (available_edges_list is defined and available_edges_list | length > 0)
+                         else ('SKIPPED' if (baseline_snapshot_file_path is not defined or baseline_snapshot_file_path | length == 0)
+                               else 'FAIL') }}
+                    observed: >-
+                      {{ ((available_edges_list | length | string) ~ ' available edges discovered from ClusterVersion status.availableUpdates')
+                         if (available_edges_list is defined and available_edges_list | length > 0)
+                         else ('Skipped due to prior failure'
+                               if (baseline_snapshot_file_path is not defined or baseline_snapshot_file_path | length == 0)
+                               else ('Failed querying available update edges: ' ~ resolved_error)) }}
+                  - num: 4
+                    name: "Query Live Conditional Update Edges"
+                    gate: "HARD"
+                    status: >-
+                      {{ 'PASS' if (conditional_edges_list is defined)
+                         else ('SKIPPED' if (available_edges_list is not defined)
+                               else 'FAIL') }}
+                    observed: >-
+                      {{ ((conditional_edges_list | length | string) ~ ' conditional edges discovered from ClusterVersion status.conditionalUpdates')
+                         if (conditional_edges_list is defined)
+                         else ('Skipped due to prior query failure'
+                               if (available_edges_list is not defined)
+                               else ('Failed querying conditional update edges: ' ~ resolved_error)) }}
+                  - num: 5
+                    name: "Consolidate Verified Update Edge Set"
+                    gate: "INFO"
+                    status: >-
+                      {{ 'PASS' if (all_valid_update_edges is defined and all_valid_update_edges | length > 0)
+                         else ('SKIPPED' if (available_edges_list is not defined)
+                               else 'FAIL') }}
+                    observed: >-
+                      {{ ((all_valid_update_edges | length | string) ~ ' unique valid update edges assembled')
+                         if (all_valid_update_edges is defined and all_valid_update_edges | length > 0)
+                         else ('Skipped due to prior query failure'
+                               if (available_edges_list is not defined)
+                               else 'No valid update edges assembled') }}
+                  - num: 6
+                    name: "Verify Target First Hop in Update Graph"
+                    gate: "INFO"
+                    status: >-
+                      {{ 'PASS' if (is_valid_target_edge is defined and is_valid_target_edge | bool)
+                         else ('FAIL' if (is_valid_target_edge is defined and not (is_valid_target_edge | bool))
+                               else 'SKIPPED') }}
+                    observed: >-
+                      {{ ('Target ' ~ (target_first_hop | default('unknown')) ~ ' confirmed present in combined edge set')
+                         if (is_valid_target_edge is defined and is_valid_target_edge | bool)
+                         else (('Target \'' ~ (target_first_hop | default('unknown')) ~ '\' is NOT a valid update edge from ' ~ (baseline_current_version | default('cluster')) ~ ' on channel ' ~ (baseline_channel | default('unknown')))
+                               if (is_valid_target_edge is defined and not (is_valid_target_edge | bool))
+                               else 'Skipped due to prior edge query failure') }}
+                  - num: 7
+                    name: "HARD Gate: Enforce Verified Update Edge"
+                    gate: "HARD"
+                    status: >-
+                      {{ 'PASS' if (is_valid_target_edge is defined and is_valid_target_edge | bool)
+                         else 'FAIL' }}
+                    observed: >-
+                      {{ ('Gate passed — target version ' ~ (target_first_hop | default('unknown')) ~ ' is a verified update edge')
+                         if (is_valid_target_edge is defined and is_valid_target_edge | bool)
+                         else ('HARD GATE HALTED: ' ~ resolved_error) }}
+                  - num: 8
+                    name: "Phase 01 Overall Execution Status"
+                    gate: "HARD"
+                    status: "FAIL"
+                    observed: "Execution halted in Phase 01: {{ resolved_error }}"
+
+            - name: "Phase 01 Rescue: Configure deep diagnostic details for failure report"
+              set_fact:
+                diagnostic_details:
+                  - title: "Phase 01 Failure Context & Root-Cause Error"
+                    content: >-
+                      Cluster: {{ cluster_name }}
+                      Current Version: {{ baseline_current_version | default('unknown') }}
+                      Target First Hop: {{ target_first_hop | default('unknown') }}
+                      Channel: {{ baseline_channel | default('unknown') }}
+                      Failed Task: {{ current_task_name | default('Phase 01 Policy Check') }}
+                      Gate Type: {{ current_gate_type | default('HARD') }}
+                      Error: {{ resolved_error }}
+
+            - name: "Phase 01 Rescue: Configure report parameters for failure report"
+              set_fact:
+                report_type: "phase01"
+                report_title: "Phase 01 — Policy Check & Baseline Capture Report"
+                report_template: "phase01-policy-check.j2"
+                overall_status: "FAIL"
+                checks: "{{ phase01_checks }}"
+
+            - name: "Phase 01 Rescue: Generate client-facing HTML report on failure via report role"
+              include_role:
+                name: report
+          rescue:
+            - name: "Phase 01 Rescue: Log warning if fail-safe report generation encountered error"
+              debug:
+                msg: "[WARN] Fail-safe Phase 01 report generation in rescue block encountered error: {{ ansible_failed_result.msg | default('Error') }}"
+          when: not (p01_rescue_report_stat.stat.exists | default(false))
+
+        # Why: Resolves the Phase 01 HTML report path (freshly created or pre-existing)
+        #      and attaches it to mail_attachments and attached_reports for error_handle.
+        - name: "Phase 01 Rescue: Resolve report artifact path for error email attachment"
+          set_fact:
+            p01_rescue_report_path: >-
+              {{ report_file_path
+                 if (report_file_path is defined and report_file_path | length > 0)
+                 else ((output_dir | default(playbook_dir ~ '/output')) ~ '/' ~ (cluster_name | default('cluster')) ~ '_phase01_' ~ (run_timestamp | default('current')) ~ '.html') }}
+
+        - name: "Phase 01 Rescue: Check presence of report artifact on disk"
+          stat:
+            path: "{{ p01_rescue_report_path }}"
+          register: p01_rescue_report_file_stat
+
+        - name: "Phase 01 Rescue: Attach Phase 01 HTML report to failure alert email"
+          set_fact:
+            mail_attachments: "{{ (mail_attachments | default([])) + [p01_rescue_report_path] }}"
+            attached_reports: "{{ (attached_reports | default([])) + [p01_rescue_report_path | basename] }}"
+          when: p01_rescue_report_file_stat.stat.exists | default(false)
 
         - name: "Record Phase 01 failure and alert via error_handle role"
           include_role:

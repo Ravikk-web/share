@@ -1,0 +1,74 @@
+---
+# ============================================================================
+# Role Defaults: error_handle
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default configuration parameters for unified rescue handling,
+#          hierarchical error extraction, dual audit logging (.txt and .csv),
+#          RBAC permission failure detection, and alert email dispatch.
+# Role / Playbook Dependencies: vars/smtp.yml, vars/paths.yml, vars/report_vars.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by error_handle tasks
+# ============================================================================
+
+# Step number of the currently executing phase/sub-playbook (integer or string, default: 0)
+# Sourced from calling phase playbook before error_handle invocation
+current_step_no: 0
+
+# Human-readable descriptive name of the failed task (string, default: "")
+# Sourced from calling phase playbook; avoids referencing internal failed task objects
+current_task_name: ""
+
+# Gate severity type: 'HARD' (immediate abort) or 'WARN' (advisory) (string, default: "HARD")
+# Sourced from calling phase playbook
+current_gate_type: "HARD"
+
+# High-level failure reason classification (string, default: "Upgrade gate failed")
+# Sourced from calling phase playbook
+failure_reason: "Upgrade gate failed"
+
+# Specific observed condition or failure description (string, default: "")
+# Sourced from calling phase playbook
+failure_observed: ""
+
+# Sanitized failure error message or stderr output (string, default: "")
+# Sourced from hierarchical error extraction cascade in rescue block
+resolved_error: ""
+
+# Flag indicating whether failure was caused by OpenShift RBAC/authorization denial (boolean, default: false)
+# Sourced from RBAC pattern detection in rescue block
+is_rbac_error: false
+
+# Directory where dual run logs (.txt and .csv) are persisted (string, default: "")
+# Sourced from vars/paths.yml or dynamically derived from playbook_dir
+log_dir: ""
+
+# Unique execution timestamp identifier for file naming (string, default: "")
+# Sourced from master orchestrator or dynamically resolved at runtime
+run_timestamp: ""
+
+# Target ARO cluster name (string, default: "cluster")
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: "cluster"
+
+# Jinja2 presentation template to render for failure notification email (string, default: "error-report.j2")
+# Sourced from role defaults
+mail_template: "error-report.j2"
+
+# Name of the Kubernetes resource that was forbidden/denied by RBAC (string, default: "")
+# Sourced from RBAC error extraction logic in rescue block
+rbac_missing_resource: ""
+
+# Missing Kubernetes API verb that caused the RBAC denial (string, default: "")
+# Sourced from RBAC error extraction logic in rescue block
+rbac_missing_verb: ""
+
+# Actionable remediation command suggested to the operator (string, default: "")
+# Sourced from RBAC error extraction logic in rescue block
+rbac_remediation_command: ""
+
+# List of file attachment paths to include in failure notification email (list of strings, default: [])
+# Sourced from calling phase playbook
+mail_attachments: []
