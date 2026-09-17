@@ -43,11 +43,19 @@
       stat:
         path: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
       register: p05_kubeconfig_stat
+      when:
+        - (not (dry_run | default(false) | bool)) or (dry_run_include_postval | default(true) | bool)
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 5
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 5 or (dry_run | default(false) | bool and dry_run_include_postval | default(true) | bool)
 
     - name: "Phase 05: Establish authenticated cluster session via login role if needed"
       include_role:
         name: login
-      when: not (p05_kubeconfig_stat.stat.exists | default(false))
+      when:
+        - (not (dry_run | default(false) | bool)) or (dry_run_include_postval | default(true) | bool)
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 5
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 5 or (dry_run | default(false) | bool and dry_run_include_postval | default(true) | bool)
+        - not (p05_kubeconfig_stat.stat.exists | default(false))
 
   # --------------------------------------------------------------------------
   # Main Tasks: 10-Check Postvalidation, Baseline Diff & Report Generation
@@ -221,6 +229,16 @@
             - send_postvalidation_email | default(true) | bool
             - not (dry_run | default(false) | bool)
             - (resolved_postval_recipients | default([]) | length) > 0
+
+        # Teardown Session on Standalone / Phase 05 Stop
+        - name: "Phase 05: Teardown cluster session if stopping after Phase 05 or standalone"
+          include_role:
+            name: logout
+          when: (standalone_phase | default(false) | bool) or (stop_after_phase is defined and (stop_after_phase | int) == 5)
+      when:
+        - (not (dry_run | default(false) | bool)) or (dry_run_include_postval | default(true) | bool)
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 5
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 5 or (dry_run | default(false) | bool and dry_run_include_postval | default(true) | bool)
 
       # ----------------------------------------------------------------------
       # Rescue: Error Extraction, Alert Dispatch & Clean Session Logout

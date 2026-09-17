@@ -1,0 +1,286 @@
+---
+# ============================================================================
+# Master Orchestrator — ARO Cluster Upgrade Automation
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses import_playbook for isolated phase execution;
+#                 compatible without modification across Ansible 2.7 and 2.14.
+#
+# Purpose: Master orchestration playbook chaining the seven-file process surface.
+#          Ingests global variables, validates CLI parameters, enforces dry-run
+#          intercepts, and executes Phases 01 through 06 with selective skip-to-phase
+#          and stop-after-phase lifecycle boundaries.
+# Role / Playbook Dependencies: vars/*.yml, 01_Policy_Check.yaml, 02_Pre_upgrade_check.yaml,
+#                               03_Initiate_upgrade.yaml, 05_post_Upgrade_Checks.yaml,
+#                               06_Operator_Upgrade.yaml, roles/logout
+# Gate Type: N/A (Master Orchestrator)
+# Outputs: End-to-end upgrade workflow orchestration and phase execution control
+# ============================================================================
+
+- name: "ARO Upgrade Automation — Initialization & Variable Loading"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+  tasks:
+    - name: "Validate mandatory execution variables"
+      assert:
+        that:
+          - cluster_name is defined
+          - cluster_name | length > 0
+          - upgrade_path is defined
+          - upgrade_path | length > 0
+        fail_msg: "Mandatory parameters 'cluster_name' and 'upgrade_path' must be defined and non-empty."
+        success_msg: "Input validation passed for target cluster: {{ cluster_name }}"
+
+    - name: "Ensure unified run timestamp is established for logs, snapshots and reports"
+      set_fact:
+        run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+
+    - name: "Display workflow initialization banner"
+      debug:
+        msg:
+          - "========================================================"
+          - "  ARO Cluster Upgrade Automation — One-Touch Engine"
+          - "========================================================"
+          - "Target Cluster : {{ cluster_name }}"
+          - "Upgrade Path   : {{ upgrade_path | join(' -> ') }}"
+          - "Dry Run Mode   : {{ dry_run | default(false) }}"
+          - "Auto-Remediate : {{ auto_remediation_enabled | default(true) }}"
+          - "Skip To Phase  : {{ skip_to_phase | default('None (Full Run)') }}"
+          - "Stop After     : {{ stop_after_phase | default('None (Full Run)') }}"
+          - "========================================================"
+
+# --- Phase 01: Policy Check, Baseline Snapshot & Edge Validation ---
+- import_playbook: 01_Policy_Check.yaml
+
+# --- Phase 02: 15-Check Prevalidation & Auto-Remediation ---
+- import_playbook: 02_Pre_upgrade_check.yaml
+
+# --- Pre-Check Only Intercept: Clean Stop after Phase 02 when explicitly requested ---
+- name: "Pre-Check Intercept & Multi-Report Dispatch"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+  tasks:
+    - name: "Halt workflow cleanly and dispatch reports when stopping after Phase 02"
+      block:
+        - name: "Audit available report attachments on disk"
+          stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+            - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_prevalidation_{{ run_timestamp }}.html"
+            - "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+            - "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+          register: p02_early_stats
+
+        - name: "Filter existing attachments for dispatch"
+          set_fact:
+            p02_early_attachments: >-
+              {{ p02_early_stats.results
+                 | selectattr('stat.exists', 'defined')
+                 | selectattr('stat.exists', 'equalto', true)
+                 | map(attribute='item')
+                 | list }}
+
+        - name: "Resolve pre-check email recipients"
+          set_fact:
+            resolved_early_recipients: >-
+              {{ dry_run_mail_to
+                 if (dry_run_mail_to is defined and dry_run_mail_to | length > 0)
+                 else (preval_mail_to
+                       if (preval_mail_to is defined and preval_mail_to | length > 0)
+                       else (mail_to | default([]))) }}
+
+        - name: "Configure Pre-check early digest email parameters"
+          set_fact:
+            mail_to: "{{ resolved_early_recipients }}"
+            mail_subject: "{{ prevalidation_subject_prefix | default('[ARO Upgrade PREVALIDATION]') }} — PREVALIDATION AUDIT COMPLETE — {{ cluster_name }}"
+            mail_template: "progress-mail.j2"
+            is_dry_run: true
+            dry_run_complete: true
+            all_phases_complete: false
+            is_upgrade_complete: false
+            target_version: "{{ (upgrade_path[0] if (upgrade_path is defined and upgrade_path | length > 0) else 'N/A') }}"
+            percent_complete: 100
+            elapsed_time: "Prevalidation Complete"
+            attached_reports: >-
+              {{ p02_early_attachments | default([]) | map('basename') | list }}
+            mail_attachments: "{{ p02_early_attachments | default([]) }}"
+
+        - name: "Dispatch Pre-check multi-report digest email via sendmail role"
+          block:
+            - name: "Dispatch early multi-report digest email"
+              include_role:
+                name: sendmail
+          rescue:
+            - name: "Log warning if early digest email dispatch encountered SMTP error"
+              debug:
+                msg: "[WARN] Prevalidation complete, but email dispatch failed: {{ ansible_failed_result.msg | default('SMTP error') }}"
+          when:
+            - send_prevalidation_email | default(true) | bool or send_dry_run_email | default(true) | bool
+            - (resolved_early_recipients | default([]) | length) > 0
+
+        - name: "Log prevalidation completion"
+          debug:
+            msg: "✔ Prevalidation complete. Reports generated and dispatched. Stopping before Phase 03."
+
+        - name: "Teardown cluster session"
+          include_role:
+            name: logout
+
+        - name: "Terminate execution cleanly"
+          meta: end_play
+      when:
+        - stop_after_phase is defined and (stop_after_phase | int) <= 2
+        - not (dry_run | default(false) | bool and dry_run_include_postval | default(true) | bool)
+
+# --- Phase 03 & 04: Sequential Upgrade Hops & Live Monitoring ---
+- import_playbook: 03_Initiate_upgrade.yaml
+
+# --- Phase 03 Intercept: Clean Stop after Phase 03 when explicitly requested ---
+- name: "Phase 03 Intercept: Clean Stop & Session Teardown"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+  tasks:
+    - name: "Halt workflow cleanly after Phase 03 when stop_after_phase is 3"
+      block:
+        - name: "Log Phase 03 completion"
+          debug:
+            msg: "✔ Phase 03: Sequential upgrade hops completed. Stopping before Phase 05 as requested."
+
+        - name: "Teardown cluster session"
+          include_role:
+            name: logout
+
+        - name: "Terminate execution cleanly"
+          meta: end_play
+      when:
+        - stop_after_phase is defined and (stop_after_phase | int) == 3
+
+# --- Phase 05: 10-Check Postvalidation & Baseline Diff ---
+- import_playbook: 05_post_Upgrade_Checks.yaml
+
+# --- Dry-Run / Validation Intercept & Multi-Report Dispatch: Clean Stop after Phase 05 ---
+- name: "Dry-Run / Validation Intercept & Multi-Report Dispatch"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+  tasks:
+    - name: "Halt workflow cleanly and dispatch multi-report email when dry-run or post-check only is requested"
+      block:
+        - name: "Audit generated report and log presence on disk"
+          stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+            - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_prevalidation_{{ run_timestamp }}.html"
+            - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_postvalidation_{{ run_timestamp }}.html"
+            - "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+            - "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+          register: validation_intercept_stats
+
+        - name: "Filter existing reports and logs for multi-attachment email dispatch"
+          set_fact:
+            validation_intercept_attachments: >-
+              {{ validation_intercept_stats.results
+                 | selectattr('stat.exists', 'defined')
+                 | selectattr('stat.exists', 'equalto', true)
+                 | map(attribute='item')
+                 | list }}
+
+        - name: "Resolve dry run email recipients"
+          set_fact:
+            resolved_intercept_recipients: >-
+              {{ dry_run_mail_to
+                 if (dry_run_mail_to is defined and dry_run_mail_to | length > 0)
+                 else (preval_mail_to
+                       if (preval_mail_to is defined and preval_mail_to | length > 0)
+                       else (mail_to | default([]))) }}
+
+        - name: "Configure Dry Run multi-report digest email parameters"
+          set_fact:
+            mail_to: "{{ resolved_intercept_recipients }}"
+            mail_subject: "{{ dry_run_subject_prefix | default('[ARO Upgrade DRY-RUN]') }} — ALL VALIDATION REPORTS GENERATED — {{ cluster_name }}"
+            mail_template: "progress-mail.j2"
+            is_dry_run: true
+            dry_run_complete: true
+            all_phases_complete: false
+            is_upgrade_complete: false
+            target_version: "{{ (upgrade_path[0] if (upgrade_path is defined and upgrade_path | length > 0) else 'N/A (Dry Run)') }}"
+            percent_complete: 100
+            elapsed_time: "Completed"
+            attached_reports: >-
+              {{ validation_intercept_attachments | default([]) | map('basename') | list }}
+            mail_attachments: "{{ validation_intercept_attachments | default([]) }}"
+
+        - name: "Dispatch Dry Run multi-report digest email via sendmail role"
+          block:
+            - name: "Dispatch multi-report digest email"
+              include_role:
+                name: sendmail
+
+            - name: "Log dry run multi-report delivery confirmation to text run log"
+              lineinfile:
+                path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+                line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [INFO] [NOTIFICATION] Dry-run validation digest emailed to: {{ resolved_intercept_recipients | join(', ') }} with {{ validation_intercept_attachments | length }} attachment(s): {{ validation_intercept_attachments | map('basename') | join(', ') }}."
+                create: true
+              failed_when: false
+          rescue:
+            - name: "Log warning if dry run email dispatch encountered SMTP error"
+              debug:
+                msg: "[WARN] Dry run validation completed, but email dispatch failed: {{ ansible_failed_result.msg | default('SMTP error') }}"
+
+            - name: "Log email dispatch warning to text run log"
+              lineinfile:
+                path: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+                line: "[{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}] [WARN] [NOTIFICATION] Dry run completed, but email dispatch failed."
+                create: true
+              failed_when: false
+          when:
+            - send_dry_run_email | default(true) | bool
+            - (resolved_intercept_recipients | default([]) | length) > 0
+
+        - name: "Log validation completion"
+          debug:
+            msg: "✔ Dry-run / validation complete. All reports and logs generated. Stopping before Phase 06."
+
+        - name: "Teardown cluster session"
+          include_role:
+            name: logout
+
+        - name: "Terminate execution cleanly"
+          meta: end_play
+      when: (dry_run | default(false) | bool and dry_run_include_postval | default(true) | bool) or (stop_after_phase is defined and (stop_after_phase | int) == 5)
+
+# --- Phase 06: Operator Compatibility, Upgrades & Closeout ---
+- import_playbook: 06_Operator_Upgrade.yaml

@@ -51,11 +51,19 @@
       stat:
         path: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
       register: p03_kubeconfig_stat
+      when:
+        - not (dry_run | default(false) | bool)
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 3
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 3
 
     - name: "Phase 03: Establish authenticated cluster session via login role if needed"
       include_role:
         name: login
-      when: not (p03_kubeconfig_stat.stat.exists | default(false))
+      when:
+        - not (dry_run | default(false) | bool)
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 3
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 3
+        - not (p03_kubeconfig_stat.stat.exists | default(false))
 
   # --------------------------------------------------------------------------
   # Main Tasks: Sequential Upgrade Hop Loop
@@ -122,6 +130,16 @@
               - "Final Cluster Version: {{ upgrade_path[-1] }}"
               - "Next Step            : Proceed to Phase 05 Postvalidation"
               - "============================================================================"
+
+        # 6. Teardown Session on Standalone / Phase 03 Stop
+        - name: "Phase 03: Teardown cluster session if stopping after Phase 03 or standalone"
+          include_role:
+            name: logout
+          when: (standalone_phase | default(false) | bool) or (stop_after_phase is defined and (stop_after_phase | int) == 3)
+      when:
+        - not (dry_run | default(false) | bool)
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 3
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 3
 
       # ----------------------------------------------------------------------
       # Rescue: Error Extraction, Alert Dispatch & Clean Session Logout
