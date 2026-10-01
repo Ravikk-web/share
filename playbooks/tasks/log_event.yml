@@ -1,0 +1,55 @@
+---
+# ============================================================================
+# Task Include: log_event.yml — Append-Only Structured Run Log Writer
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed. Uses shell with the quote filter only.
+#
+# Purpose: Appends one structured event line to logs/<cluster>_<ts>.txt and one
+#          row to logs/<cluster>_<ts>.csv (creating the CSV header on first use).
+#          Replaces lineinfile for run logs.
+# Why:     00_Run.sh tees the live console output into the same .txt file.
+#          lineinfile rewrites a file by atomic rename, which detached the tee
+#          writer from the file and silently dropped the rest of the console log.
+#          printf >> appends to the same inode, so both writers are preserved.
+# Role / Playbook Dependencies: vars/paths.yml (log_dir), cluster_name, run_timestamp
+# Gate Type: N/A (audit logging; never fails the run)
+# Inputs:  event_status   (string, e.g. PASS, FAIL, WARN, INFO, START, AUTO-FIX)
+#          event_gate     (string, e.g. HARD, WARN, INFO; default INFO)
+#          event_task     (string, short task / phase label)
+#          event_reason   (string, human-readable reason)
+#          event_observed (string, optional observed value / detail)
+# Outputs: Appended .txt line and .csv row
+# ============================================================================
+
+- name: "Log event: append structured entry to .txt and .csv run logs"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    mkdir -p {{ _event_dir | quote }}
+    ts="$(date +%Y-%m-%dT%H:%M:%S)"
+    printf '[%s] %s\n' "$ts" {{ _event_line | quote }} >> {{ _event_txt | quote }}
+    [ -s {{ _event_csv | quote }} ] || printf '%s\n' 'timestamp,cluster,task_name,gate_type,status,reason,observed' >> {{ _event_csv | quote }}
+    printf '"%s",%s\n' "$ts" {{ _event_csv_row | quote }} >> {{ _event_csv | quote }}
+  args:
+    executable: /bin/bash
+  vars:
+    _event_dir: "{{ log_dir | default(playbook_dir ~ '/logs') }}"
+    _event_txt: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.txt"
+    _event_csv: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.csv"
+    # Why: collapse newlines so every event is exactly one line in the text log.
+    _event_line: >-
+      {{ ('[' ~ (event_status | default('INFO')) ~ '] [' ~ (event_gate | default('INFO')) ~ '] '
+          ~ (event_task | default('Event')) ~ ': ' ~ (event_reason | default(''))
+          ~ ((' | Observed: ' ~ (event_observed | string)) if (event_observed | default('') | string | length > 0) else ''))
+         | regex_replace('[\r\n]+', ' ') }}
+    # Why: RFC 4180 quoting — double embedded quotes, one physical line per row.
+    _event_csv_row: >-
+      {{ '"' ~ (cluster_name | default('cluster') | string | replace('"', '""')) ~ '","'
+         ~ (event_task | default('Event') | string | replace('"', '""') | regex_replace('[\r\n]+', ' ')) ~ '","'
+         ~ (event_gate | default('INFO') | string | replace('"', '""')) ~ '","'
+         ~ (event_status | default('INFO') | string | replace('"', '""')) ~ '","'
+         ~ (event_reason | default('') | string | replace('"', '""') | regex_replace('[\r\n]+', ' ')) ~ '","'
+         ~ (event_observed | default('') | string | replace('"', '""') | regex_replace('[\r\n]+', ' ')) ~ '"' }}
+  changed_when: false
+  failed_when: false

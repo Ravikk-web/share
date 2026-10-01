@@ -1,0 +1,118 @@
+---
+# ============================================================================
+# Role Tasks: report
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (set_fact, file, template, debug).
+#
+# Purpose: Renders one client-facing HTML report to output/ and exports
+#          report_file_path. Counts the check statuses, derives the verdict badge
+#          and picks the presentation template from report_type.
+# Inputs (set by the caller immediately before each include):
+#          report_type (phase01 | prevalidation | postvalidation | operators),
+#          report_title, report_template, checks (list of {num, name, gate, status,
+#          observed}), autofix_items (list of {name, action, reference}),
+#          diagnostic_details (optional), output_file (optional path),
+#          operators (Phase 06 operator rows, optional)
+# Why:     These inputs are host facts that live for the whole run. They are cleared
+#          after every render so one phase's check list, auto-fix list or output path
+#          can never leak into the next report (previously Phase 02's auto-fix list
+#          and file path could reappear in the Phase 05 report).
+# Role / Playbook Dependencies: templates/*.j2, vars/report_vars.yml, vars/paths.yml
+# Gate Type: N/A (presentation artifact)
+# Outputs: output/<cluster>_<report_type>_<ts>.html, report_file_path, overall_verdict
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Inputs
+# ----------------------------------------------------------------------------
+- name: "Report: Resolve inputs for this report"
+  set_fact:
+    checks: "{{ checks | default([]) }}"
+    is_operator_report: "{{ (report_type | default('prevalidation')) in ['operator', 'operators'] }}"
+    report_template: >-
+      {{ 'phase01-policy-check.j2' if (report_type | default('')) in ['phase01', 'policy_check']
+         else ('phase02-prevalidation.j2' if (report_type | default('')) in ['prevalidation', 'preval']
+         else (report_template | default('health-overview.j2', true))) }}
+    report_title: >-
+      {{ report_title if (report_title | default('') | length > 0)
+         else ({'phase01': 'Phase 01 - Policy Check & Baseline Capture Report',
+                'prevalidation': 'Pre-Upgrade Validation Report',
+                'postvalidation': 'Post-Upgrade Validation Report',
+                'operators': 'OLM Operator Validation Report'}[report_type | default('prevalidation')]
+               | default('Validation Report')) }}
+
+# ----------------------------------------------------------------------------
+# 2. Counters and verdict
+# ----------------------------------------------------------------------------
+- name: "Report: Count check statuses"
+  set_fact:
+    _report_rows: "{{ checks if (checks | length > 0) else (operators | default([]) if (is_operator_report | bool) else []) }}"
+
+- name: "Report: Calculate summary counters"
+  set_fact:
+    total_checks: "{{ _report_rows | length }}"
+    passed_count: "{{ _report_rows | selectattr('status', 'defined') | selectattr('status', 'equalto', 'PASS') | list | length }}"
+    warning_count: "{{ _report_rows | selectattr('status', 'defined') | selectattr('status', 'equalto', 'WARN') | list | length }}"
+    autofixed_count: "{{ _report_rows | selectattr('status', 'defined') | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length }}"
+    failed_count: "{{ _report_rows | selectattr('status', 'defined') | selectattr('status', 'match', '^(FAIL|FIX-FAILED)$') | list | length }}"
+    skipped_count: "{{ _report_rows | selectattr('status', 'defined') | selectattr('status', 'equalto', 'SKIPPED') | list | length }}"
+
+# Why: FAIL (including FIX-FAILED) > AUTO-FIXED > WARN > PASS.
+- name: "Report: Determine the verdict badge"
+  set_fact:
+    overall_verdict: >-
+      {{ 'FAIL' if ((failed_count | int) > 0)
+         else ('AUTO-FIXED' if ((autofixed_count | int) > 0)
+         else ('WARN' if ((warning_count | int) > 0) else 'PASS')) }}
+    overall_status: >-
+      {{ 'FAIL' if ((failed_count | int) > 0)
+         else ('AUTO-FIXED' if ((autofixed_count | int) > 0)
+         else ('WARN' if ((warning_count | int) > 0) else 'PASS')) }}
+    # Why: the caller's list (with action and reference) is preferred; otherwise the
+    #      AUTO-FIXED rows of this report are shown.
+    autofix_items: >-
+      {{ autofix_items if (autofix_items | default([]) | length > 0)
+         else (_report_rows | selectattr('status', 'defined') | selectattr('status', 'equalto', 'AUTO-FIXED') | list) }}
+
+# ----------------------------------------------------------------------------
+# 3. Render
+# ----------------------------------------------------------------------------
+- name: "Report: Determine the destination path"
+  set_fact:
+    report_file_path: >-
+      {{ output_file if (output_file | default('') | length > 0)
+         else ((output_dir | default(playbook_dir ~ '/output')) ~ '/' ~ (cluster_name | default('cluster')) ~ '_'
+               ~ (report_type | default('prevalidation')) ~ '_' ~ (run_timestamp | default('current')) ~ '.html') }}
+
+- name: "Report: Ensure the output directory exists"
+  file:
+    path: "{{ report_file_path | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: "Report: Write the HTML report"
+  template:
+    src: "{{ report_template if (report_template is match('^(/|[a-zA-Z]:)')) else (playbook_dir ~ '/templates/' ~ (report_template | regex_replace('^templates/', ''))) }}"
+    dest: "{{ report_file_path }}"
+    mode: "0644"
+
+- name: "Report: Confirm the report"
+  debug:
+    msg: >-
+      {{ report_title }} written to {{ report_file_path }} - {{ overall_verdict }}
+      (checks {{ total_checks }}: pass {{ passed_count }}, warn {{ warning_count }}, auto-fixed {{ autofixed_count }},
+      failed {{ failed_count }}, skipped {{ skipped_count }})
+
+# ----------------------------------------------------------------------------
+# 4. Clear per-report inputs
+# ----------------------------------------------------------------------------
+- name: "Report: Clear per-report inputs"
+  set_fact:
+    checks: []
+    autofix_items: []
+    diagnostic_details: []
+    output_file: ""
+    report_title: ""
+    report_template: "health-overview.j2"
+    _report_rows: []

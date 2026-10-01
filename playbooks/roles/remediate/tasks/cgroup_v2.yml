@@ -1,0 +1,84 @@
+---
+# ============================================================================
+# Role Tasks: remediate - cgroup_v2 (Check 14)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, include_tasks).
+#
+# Purpose: Sets nodes.config/cluster spec.cgroupMode to "v2" when a hop in the path
+#          is OpenShift 4.19+ and the cluster is on cgroup v1.
+# Impact:  The Machine Config Operator immediately rolls a new configuration to
+#          every pool, rebooting all nodes. Phase 02 waits for that rollout
+#          (roles/monitor, heartbeats and degradation alerts included) and then
+#          re-runs the scan before any upgrade hop starts.
+# Why:     A forbidden patch is a failure, not a warning: the automation account is
+#          expected to be cluster-admin, and a 4.19+ hop cannot succeed on v1.
+# Role / Playbook Dependencies: vars/upgrade.yml, tasks/log_event.yml
+# Gate Type: HARD (verified by the Phase 02 re-scan: AUTO-FIXED / FIX-FAILED)
+# Outputs: nodes.config/cluster patch, remediation_attempted_nums, preval_autofix_items
+# ============================================================================
+
+- name: "cgroup v2: Query current cgroupMode on nodes.config/cluster"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "") | tostring'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: cgroup_detect_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: cgroup_detect_raw.rc == 0
+
+- name: "cgroup v2: Apply spec.cgroupMode v2 (all nodes will reboot)"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc patch nodes.config/cluster --type=merge -p '{"spec":{"cgroupMode":"v2"}}'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: cgroup_patch_result
+  changed_when: cgroup_patch_result.rc == 0
+  failed_when: false
+  when: (cgroup_detect_raw.stdout | trim) != 'v2'
+
+- name: "cgroup v2: Verify the new cgroupMode was accepted"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "") | tostring'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: cgroup_verify_raw
+  changed_when: false
+  failed_when: false
+  when: (cgroup_detect_raw.stdout | trim) != 'v2'
+
+- name: "cgroup v2: Record remediation attempt"
+  set_fact:
+    remediation_attempted_nums: "{{ (remediation_attempted_nums | default([])) + [14] }}"
+    remediation_rollout_needed: "{{ (remediation_rollout_needed | default(false) | bool) or ((cgroup_verify_raw.stdout | default('') | trim) == 'v2') }}"
+    preval_autofix_items: >-
+      {{ (preval_autofix_items | default([])) + ([{
+           'name': 'CGroup v2 migration',
+           'action': 'Set nodes.config/cluster spec.cgroupMode to v2; every node was rebooted with cgroup v2 before the first hop.',
+           'reference': 'https://docs.openshift.com/container-platform/latest/nodes/clusters/nodes-cluster-cgroups-2.html'
+         }] if ((cgroup_verify_raw.stdout | default('') | trim) == 'v2') else []) }}
+  when: (cgroup_detect_raw.stdout | trim) != 'v2'
+
+- name: "cgroup v2: Log remediation outcome"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "{{ 'AUTO-FIX' if ((cgroup_verify_raw.stdout | default('') | trim) == 'v2') else 'FIX-FAILED' }}"
+    event_gate: "HARD"
+    event_task: "CGroup v2 migration (Check 14)"
+    event_reason: "{{ 'Patched nodes.config/cluster spec.cgroupMode to v2; waiting for the node rollout' if ((cgroup_verify_raw.stdout | default('') | trim) == 'v2') else 'Patch was not applied' }}"
+    event_observed: "{{ (cgroup_patch_result.stderr | default('') | trim) or ('cgroupMode now: ' ~ (cgroup_verify_raw.stdout | default('unknown') | trim)) }}"
+  when: (cgroup_detect_raw.stdout | trim) != 'v2'

@@ -1,0 +1,73 @@
+---
+# ============================================================================
+# Role Defaults: monitor (Live Upgrade Monitoring & Settle-Gate)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defaults for the monitor role: polling cadence, no-progress timeout and
+#          hard limit, API outage tolerance, settle requirement, degradation grace
+#          periods, heartbeat cadence and the Tier 2 machine-config daemon force.
+#          The authoritative values live in vars/upgrade.yml.
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/smtp.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by monitor tasks
+# ============================================================================
+
+# What is being watched: "hop" (an upgrade hop) or "rollout" (Phase 02 remediation
+# node rollout). Set by the caller.
+monitor_mode: "hop"
+
+# Hop inputs (set by tasks/hop.yml; Phase 02 passes the current version in rollout mode)
+hop_target_version: ""
+hop_number: 1
+hop_total: 1
+hop_label: "1/1"
+
+# Minutes between polls (integer, default: 2)
+poll_interval_minutes: 2
+
+# Minutes without any observable progress before the hop fails (integer, default: 90)
+hop_timeout_minutes: 90
+
+# Hard limit in minutes for one hop or rollout, progressing or not (integer, default: 480)
+hop_max_minutes: 480
+
+# Minutes the cluster API may stay unreadable before monitoring fails (integer, default: 10)
+monitor_api_outage_minutes: 10
+
+# Consecutive settled polls required before the hop counts as settled (integer, default: 2)
+settle_consecutive_polls: 2
+
+# Minutes ClusterVersion may reject the release (or show another desired version)
+# before the hop fails (integer, default: 10)
+release_not_accepted_fail_minutes: 10
+
+# Minutes ClusterVersion may report Failing=True before the hop fails (integer, default: 30)
+cv_failing_fail_minutes: 30
+
+# Heartbeat email cadence in minutes (integer, default: 20)
+heartbeat_minutes: 20
+
+# Degradation alert grace periods in minutes — a condition must stay open this long
+# before its (single) alert is sent
+degradation_node_notready_minutes: 15        # NotReady while cordoned by the update (reboot)
+degradation_uncordoned_notready_minutes: 5   # NotReady while NOT cordoned (unexpected)
+degradation_pressure_minutes: 5              # Disk / Memory / PID pressure
+degradation_co_minutes: 10                   # ClusterOperator Degraded / unavailable, pool or daemon Degraded
+degradation_cv_failing_minutes: 10           # ClusterVersion Failing (alert; failure at cv_failing_fail_minutes)
+
+# A node still updating after this many minutes raises a degradation alert; a node whose
+# machine-config daemon is Degraded this long is eligible for the Tier 2 force (integer, default: 30)
+node_stall_threshold_minutes: 30
+
+# Tier 2 (opt-in): create /run/machine-config-daemon-force on a node whose daemon has
+# been Degraded for node_stall_threshold_minutes (boolean, default: false)
+auto_force_stalled_node: false
+
+# ClusterOperators ignored by the settle gate and degradation alerts (list of strings)
+co_allow_list: []
+
+# Retries for oc queries outside the poll loop (integer) and delay in seconds
+oc_command_retries: 3
+oc_command_retry_delay: 10

@@ -1,0 +1,29 @@
+---
+# ============================================================================
+# Role Defaults: operator_upgrade
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defaults for Phase 06 InstallPlan approvals and the CSV rollout wait.
+#          Authoritative values live in vars/upgrade.yml.
+# Role / Playbook Dependencies: vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by operator_upgrade tasks
+# ============================================================================
+
+# Seconds to wait for approved operators' CSVs to reach Succeeded (integer)
+operator_upgrade_timeout_seconds: 600
+
+# Seconds between CSV polls during that wait (integer)
+operator_upgrade_poll_interval_seconds: 15
+
+# Restart (once) the operator Deployments of an approved operator whose CSV is Failed (boolean)
+operator_upgrade_auto_recover: true
+
+# Skip InstallPlan approvals entirely (boolean); validation and closeout still run
+skip_operator_upgrade: false
+
+# Retries for oc queries (integer) and delay between them in seconds (integer)
+oc_command_retries: 3
+oc_command_retry_delay: 10

@@ -1,0 +1,177 @@
+---
+# ============================================================================
+# Tasks: login
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses shell (with stdin), set_fact, assert and fail; compatible
+#                 across Ansible 2.7 and 2.14 without modification.
+#
+# Purpose: Authenticates the automation account (NPID) against the target cluster
+#          into a dedicated kubeconfig under playbook_dir, proves the session works,
+#          verifies it reached the configured cluster, and exports the session facts.
+# Why:     - The password is fed on stdin, never on the command line, so it is not
+#            visible in the jump server's process list.
+#          - A rejected password is never retried (repeated failures can lock the
+#            NPID); only connection errors are retried.
+#          - `oc whoami --show-server` only echoes the local kubeconfig, so identity
+#            is proven with `oc whoami` (server round trip), an exact API URL match,
+#            and an optional pinned clusterID from vars/secrets.yml.
+# Role / Playbook Dependencies: vars/secrets.yml, vars/upgrade.yml, vars/paths.yml, vars/api_regex.yml
+# Gate Type: HARD (fails immediately and triggers the phase rescue if login or identity fails)
+# Outputs: .kubeconfig-<cluster> (0600, written by oc), cluster_kubeconfig, active_cluster_* facts
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Resolve Credentials, Endpoint and Kubeconfig
+# ----------------------------------------------------------------------------
+# Why: Supports individual variables (cluster_*), a 'cluster' map, or the
+#      structured 'clusters' map in vars/secrets.yml.
+- name: "login: Resolve cluster endpoint, credentials and identity pin"
+  set_fact:
+    cluster_api_url: >-
+      {{ cluster_api_url
+         if (cluster_api_url is defined and cluster_api_url | length > 0)
+         else (cluster.api_url | default(''))
+         if (cluster is defined and cluster.api_url is defined)
+         else (clusters[cluster_name].api_url | default(''))
+         if (clusters is defined and cluster_name in clusters)
+         else '' }}
+    cluster_username: >-
+      {{ cluster_username
+         if (cluster_username is defined and cluster_username | length > 0)
+         else (cluster.username | default(''))
+         if (cluster is defined and cluster.username is defined)
+         else (clusters[cluster_name].username | default(''))
+         if (clusters is defined and cluster_name in clusters)
+         else '' }}
+    cluster_password: >-
+      {{ cluster_password
+         if (cluster_password is defined and cluster_password | length > 0)
+         else (cluster.password | default(''))
+         if (cluster is defined and cluster.password is defined)
+         else (clusters[cluster_name].password | default(''))
+         if (clusters is defined and cluster_name in clusters)
+         else '' }}
+    cluster_expected_id: >-
+      {{ (clusters[cluster_name].cluster_id | default(''))
+         if (clusters is defined and cluster_name in clusters and clusters[cluster_name] is mapping)
+         else '' }}
+    login_kubeconfig: >-
+      {{ cluster_kubeconfig
+         if (cluster_kubeconfig | default('') | length > 0)
+         else (kubeconfig_path if (kubeconfig_path | default('') | length > 0)
+               else (playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default')))) }}
+  no_log: true
+
+- name: "login: Validate cluster name and credentials exist"
+  assert:
+    that:
+      - cluster_name | default('') | length > 0
+      - cluster_api_url | length > 0
+      - cluster_username | length > 0
+      - cluster_password | length > 0
+    fail_msg: >-
+      Authentication prerequisites failed for cluster '{{ cluster_name | default('') }}': api_url, username
+      and password must all be set in vars/secrets.yml (password via its vault_* variable).
+    success_msg: "Cluster credentials present for: {{ cluster_name }}"
+  no_log: true
+
+# ----------------------------------------------------------------------------
+# 2. Authenticate
+# ----------------------------------------------------------------------------
+# Why: the password is read from the task's stdin into a shell variable and piped to
+#      `oc login`, which prompts for it; printf is a bash builtin, so the password
+#      never appears in any process's command line. Set
+#      login_password_via_stdin: false only if the identity provider rejects that.
+- name: "login: Authenticate to {{ cluster_name }} (connection errors retried, rejected credentials not retried)"
+  shell: |
+    set -o pipefail
+    IFS= read -r LOGIN_PW
+    attempt=0
+    while :; do
+      attempt=$((attempt + 1))
+      out="$(printf '%s\n' "$LOGIN_PW" | {{ oc_binary | default('oc') | quote }} login {{ cluster_api_url | quote }} \
+        --username={{ cluster_username | quote }} \
+        {{ '' if (login_password_via_stdin | default(true) | bool) else '--password="$LOGIN_PW"' }} \
+        --kubeconfig={{ login_kubeconfig | quote }} \
+        --insecure-skip-tls-verify={{ insecure_skip_tls_verify | default(true) | bool | lower }} 2>&1)"
+      rc=$?
+      if [ "$rc" -eq 0 ]; then result=ok; break; fi
+      if printf '%s' "$out" | grep -qiE 'login failed|unauthorized|forbidden|invalid (username|password|credentials)'; then result=auth_failed; break; fi
+      if [ "$attempt" -gt {{ oc_command_retries | default(3) | int }} ]; then result=unreachable; break; fi
+      sleep {{ oc_command_retry_delay | default(10) | int }}
+    done
+    printf '%s\n' "$out" | tail -n 6
+    echo "LOGIN_RESULT=${result} ATTEMPTS=${attempt}"
+  args:
+    executable: /bin/bash
+    stdin: "{{ cluster_password }}"
+  register: oc_login_result
+  changed_when: "'LOGIN_RESULT=ok' in (oc_login_result.stdout | default(''))"
+  failed_when: false
+  no_log: true
+
+- name: "login: Stop if authentication did not succeed"
+  fail:
+    msg: >-
+      Login to cluster '{{ cluster_name }}' at {{ cluster_api_url }} failed:
+      {{ 'the credentials were rejected (not retried, to avoid locking the account)'
+         if ('LOGIN_RESULT=auth_failed' in (oc_login_result.stdout | default('')))
+         else 'the API server could not be reached after retries' }}.
+      oc output: {{ (oc_login_result.stdout | default('') | regex_replace('LOGIN_RESULT=.*$', '') | trim
+                     | replace(cluster_password, '******')) | truncate(700) }}
+      {{ 'If the identity provider does not accept a password on stdin, set login_password_via_stdin: false in vars/upgrade.yml.'
+         if ((login_password_via_stdin | default(true) | bool) and ('LOGIN_RESULT=auth_failed' not in (oc_login_result.stdout | default('')))) else '' }}
+  when: "'LOGIN_RESULT=ok' not in (oc_login_result.stdout | default(''))"
+
+# ----------------------------------------------------------------------------
+# 3. Prove the Session and Verify the Connected Cluster
+# ----------------------------------------------------------------------------
+- name: "login: Query session identity (API URL, user, clusterID)"
+  shell: |
+    set -eo pipefail
+    oc_bin={{ oc_binary | default('oc') | quote }}
+    kc={{ login_kubeconfig | quote }}
+    "$oc_bin" whoami --show-server --kubeconfig="$kc"
+    "$oc_bin" whoami --kubeconfig="$kc"
+    "$oc_bin" get clusterversion version -o jsonpath='{.spec.clusterID}' --kubeconfig="$kc"
+    echo
+  args:
+    executable: /bin/bash
+  register: login_identity_raw
+  changed_when: false
+  failed_when: login_identity_raw.rc != 0
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: login_identity_raw.rc == 0
+
+- name: "login: Parse session identity"
+  set_fact:
+    active_cluster_server: "{{ login_identity_raw.stdout_lines[0] | default('') | trim }}"
+    active_cluster_user: "{{ login_identity_raw.stdout_lines[1] | default('') | trim }}"
+    active_cluster_id: "{{ login_identity_raw.stdout_lines[2] | default('') | trim }}"
+
+- name: "login: Stop if the session is not connected to the configured cluster"
+  fail:
+    msg: >-
+      Cluster identity check failed for '{{ cluster_name }}': connected to '{{ active_cluster_server }}'
+      (clusterID '{{ active_cluster_id }}'), expected '{{ cluster_api_url }}'
+      {{ ("with clusterID '" ~ cluster_expected_id ~ "'") if (cluster_expected_id | length > 0) else '' }}.
+      Check api_url / cluster_id in vars/secrets.yml.
+  when: >-
+    ((active_cluster_server | lower | regex_replace('/+$', '')) != (cluster_api_url | lower | regex_replace('/+$', '')))
+    or ((cluster_expected_id | length > 0) and (active_cluster_id != cluster_expected_id))
+    or (not (active_cluster_server is match(desired_cluster_api_regex)))
+
+# ----------------------------------------------------------------------------
+# 4. Export Session Facts
+# ----------------------------------------------------------------------------
+- name: "login: Export session facts for subsequent tasks and roles"
+  set_fact:
+    cluster_kubeconfig: "{{ login_kubeconfig }}"
+    kubeconfig_path: "{{ login_kubeconfig }}"
+    cluster_session_active: true
+
+- name: "login: Confirm authenticated session"
+  debug:
+    msg: "Authenticated to {{ cluster_name }} as {{ active_cluster_user }} ({{ active_cluster_server }}, clusterID {{ active_cluster_id }})."

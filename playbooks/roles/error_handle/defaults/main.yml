@@ -1,0 +1,67 @@
+---
+# ============================================================================
+# Role Defaults: error_handle
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default parameters for unified rescue handling: failure record,
+#          RBAC parsing, run logs, the run status file, and the single failure alert.
+# Role / Playbook Dependencies: vars/smtp.yml, vars/paths.yml, tasks/notify.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by error_handle tasks
+# ============================================================================
+
+# Phase label of the failure, e.g. "Phase 03" (string)
+# Sourced from the calling rescue block
+current_step_no: ""
+
+# Human-readable name of the failed step (string)
+# Sourced from the calling rescue block; never from ansible_failed_task
+current_task_name: ""
+
+# Gate severity type: 'HARD' (immediate abort) or 'WARN' (advisory) (string)
+# Sourced from the calling rescue block
+current_gate_type: "HARD"
+
+# High-level failure reason (string)
+# Sourced from the calling rescue block
+failure_reason: "Upgrade gate failed"
+
+# Specific observed condition or failure description (string)
+# Sourced from the calling rescue block
+failure_observed: ""
+
+# Error text extracted by the caller (stderr -> stderr_lines -> msg) (string)
+# Sourced from the calling rescue block
+resolved_error: ""
+
+# CLI exit code class for this failure (integer): 5 Phase 01, 10 Phase 02,
+# 20 hop failure, 25 Phase 05, 30 hop timeout / no progress, 35 Phase 06, 99 other
+# Sourced from the calling rescue block
+phase_exit_code: 99
+
+# Report / log files to attach to the alert (list of strings)
+# Sourced from the calling rescue block (only files for the failed phase)
+failure_attachments: []
+
+# Flag indicating whether failure was caused by an RBAC/authorization denial (boolean)
+# Derived by error_handle
+is_rbac_error: false
+
+# Parsed from the Kubernetes denial message (strings), derived by error_handle
+rbac_missing_verb: ""
+rbac_missing_resource: ""
+rbac_missing_group: ""
+
+# Directory where run logs and the status file are written (string)
+# Sourced from vars/paths.yml
+log_dir: ""
+
+# Unique execution timestamp identifier for file naming (string)
+# Sourced from the CLI (run_timestamp extra var)
+run_timestamp: ""
+
+# Target ARO cluster name (string)
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: "cluster"

@@ -1,0 +1,22 @@
+---
+# ============================================================================
+# Role Defaults: operator_validate
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defaults for the Phase 06 operator health judgement. The HARD gate itself
+#          is enforced by 06_Operator_Upgrade.yaml.
+# Role / Playbook Dependencies: vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by operator_validate tasks
+# ============================================================================
+
+# Inputs normally produced by roles/operator_upgrade in the same run (lists)
+approved_installplans: []
+skipped_installplans: []
+operator_csv_baseline: []
+
+# Retries for oc queries (integer) and delay between them in seconds (integer)
+oc_command_retries: 3
+oc_command_retry_delay: 10

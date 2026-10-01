@@ -1,0 +1,30 @@
+---
+# ============================================================================
+# Role Defaults: etcd (etcd Database Health)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defines default input parameters for the etcd role, which validates
+#          etcd cluster quorum, control-plane pod health, and ClusterOperator
+#          etcd status before any cluster mutation or upgrade action.
+# Role / Playbook Dependencies: vars/paths.yml, vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by etcd tasks
+# ============================================================================
+
+# Target ARO cluster name (string, mandatory)
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: ""
+
+# OpenShift etcd control plane namespace (string, default: "openshift-etcd")
+# Sourced from role defaults
+etcd_namespace: "openshift-etcd"
+
+# Minimum expected healthy etcd members / control-plane pods for HA quorum (integer, default: 3)
+# Sourced from vars/upgrade.yml or role defaults
+etcd_expected_min_members: 3
+
+# Master toggle for enforcing HARD gate failure on validation error (boolean, default: true)
+# Sourced from role defaults or overridden by prevalidation scan during diagnostic sweeps
+etcd_enforce_gate: true

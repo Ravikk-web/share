@@ -1,0 +1,50 @@
+---
+# ============================================================================
+# Role Defaults: remediate
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default toggles, allow-lists, and thresholds for the auto-remediation
+#          engine. Phase 02 sets the trigger_* facts from failed check numbers
+#          (Check 14 cgroup, Check 03 paused MCPs, Check 01 degraded operators).
+# Role / Playbook Dependencies: vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by remediate tasks
+# ============================================================================
+
+# Master toggle for automatic remediation across all tiers (boolean, default: true)
+# Sourced from vars/upgrade.yml; --dry-run forces false
+auto_remediation_enabled: true
+
+# Tier 1: patch nodes.config/cluster spec.cgroupMode to v2 (boolean, default: true)
+# Sourced from vars/upgrade.yml. Reboots every node; Phase 02 waits for the rollout.
+auto_fix_cgroup_v2: true
+
+# Tier 1: unpause allow-listed MachineConfigPools (boolean, default: true)
+# Sourced from vars/upgrade.yml
+auto_unpause_mcp: true
+
+# Pools that may be unpaused automatically (list of strings)
+# Sourced from vars/upgrade.yml
+mcp_auto_unpause_list:
+  - "worker"
+  - "master"
+
+# Tier 2 (opt-in): restart degraded ClusterOperator pods (boolean, default: false)
+# Sourced from vars/upgrade.yml
+auto_restart_degraded_operators: false
+
+# Seconds to wait after restarting operator pods before the re-scan (integer, default: 180)
+# Sourced from vars/upgrade.yml or role defaults
+operator_restart_grace_seconds: 180
+
+# Requested remediations for this pass (booleans). Set by 02_Pre_upgrade_check.yaml
+trigger_cgroup_remediation: false
+trigger_unpause_mcp_remediation: false
+trigger_co_restart_remediation: false
+
+# Retries for oc queries (integer, default: 3) and delay between them (seconds, default: 10)
+# Sourced from vars/upgrade.yml
+oc_command_retries: 3
+oc_command_retry_delay: 10

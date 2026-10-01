@@ -1,0 +1,251 @@
+---
+# ============================================================================
+# Role Tasks: remediate - admin_acks (Administrator Acknowledgement Engine)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, include_role, fail).
+#
+# Purpose: Determines and (in apply mode) provides the OpenShift administrator
+#          acknowledgement required before a minor-version update, after verifying
+#          that no workload still calls an API the target release removes.
+# How OpenShift gates it: openshift-config-managed/admin-gates lists gate keys such
+#          as ack-4.15-kube-1.29-api-removals-in-4.16. A gate applies while the
+#          cluster is on the minor in its key (4.15 here); the CVO then reports
+#          Upgradeable=False (AdminAckRequired) until openshift-config/admin-acks has
+#          the key set to "true". Each minor hop therefore can need a new key.
+# Modes:   admin_ack_mode: evaluate — read-only (Phase 02 Check 07), whole path
+#          admin_ack_mode: apply    — before one hop (roles/upgrade); stops the hop if
+#                                     removed APIs are in use or Upgradeable stays False
+# Inputs:  admin_ack_versions (list of target versions: the path, or [hop target]),
+#          admin_ack_hop_label (string, apply mode), auto_apply_admin_acks,
+#          admin_ack_clear_timeout_seconds, api_usage_* settings
+# Role / Playbook Dependencies: roles/api_usage, tasks/log_event.yml, jq 1.5
+# Gate Type: HARD (apply mode stops the hop; evaluate mode feeds Check 07)
+# Outputs: admin_ack_required_keys, admin_ack_minor_hop, admin_ack_upgradeable,
+#          admin_ack_check_status / _observed (evaluate), admin_acks_applied (apply)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Read Cluster State (read-only)
+# ----------------------------------------------------------------------------
+# Why: one task returns three JSON lines: ClusterVersion summary, admin-gates keys,
+#      admin-acks data. Missing ConfigMaps yield [] / {}.
+- name: "admin-acks: Query ClusterVersion, admin-gates and admin-acks"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get clusterversion version -o json | jq -c '{
+      current_version: ((((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // .status.desired.version) // ""),
+      upgradeable: ((((.status.conditions // []) | map(select(.type == "Upgradeable")) | .[0]) // {})
+                    | {status: ((.status // "True") | tostring), reason: (.reason // ""), message: (.message // "")})
+    }'
+    (oc get configmap admin-gates -n openshift-config-managed -o json 2>/dev/null || echo '{}') | jq -c '(.data // {}) | keys'
+    (oc get configmap admin-acks -n openshift-config -o json 2>/dev/null || echo '{}') | jq -c '(.data // {})'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: admin_ack_state_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: admin_ack_state_raw.rc == 0
+
+- name: "admin-acks: Parse cluster state"
+  set_fact:
+    _aa_cv: "{{ admin_ack_state_raw.stdout_lines[0] | from_json }}"
+    _aa_gate_keys: "{{ admin_ack_state_raw.stdout_lines[1] | default('[]') | from_json }}"
+    _aa_acks: "{{ admin_ack_state_raw.stdout_lines[2] | default('{}') | from_json }}"
+
+# Why: versions are parsed with split('.') — regex backreferences ('\1') inside
+#      YAML-quoted Jinja are decoded as control characters and silently return 0.
+- name: "admin-acks: Determine the current minor and the minor-version hops ahead"
+  set_fact:
+    admin_ack_current_version: "{{ _aa_cv.current_version }}"
+    admin_ack_current_minor: "{{ (_aa_cv.current_version | string).split('.')[0:2] | join('.') }}"
+    admin_ack_upgradeable: "{{ _aa_cv.upgradeable }}"
+    _aa_bump_minors: >-
+      {%- set cur = (_aa_cv.current_version | string).split('.') -%}
+      {%- set out = [] -%}
+      {%- for v in admin_ack_versions | default([]) -%}
+        {%- set parts = (v | string).split('.') -%}
+        {%- if (parts | length) >= 2 and (cur | length) >= 2 and (parts[0] | int) == (cur[0] | int) and (parts[1] | int) > (cur[1] | int) and (parts[1] | int) not in out -%}
+          {%- set _ = out.append(parts[1] | int) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out | sort }}
+    _aa_first_hop_is_minor: >-
+      {%- set cur = (_aa_cv.current_version | string).split('.') -%}
+      {%- set ahead = [] -%}
+      {%- for v in admin_ack_versions | default([]) -%}
+        {%- set parts = (v | string).split('.') -%}
+        {%- if (parts | length) >= 3 and (cur | length) >= 3 and ((parts[0] | int, parts[1] | int, parts[2] | int) > (cur[0] | int, cur[1] | int, cur[2] | int)) -%}
+          {%- set _ = ahead.append((parts[1] | int) > (cur[1] | int)) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ (ahead | length > 0) and ahead[0] }}
+
+- name: "admin-acks: Resolve required acknowledgement keys and Kubernetes releases in scope"
+  set_fact:
+    admin_ack_minor_hop: "{{ _aa_bump_minors | length > 0 }}"
+    admin_ack_required_keys: >-
+      {%- set prefix = 'ack-' ~ admin_ack_current_minor ~ '-' -%}
+      {%- set out = [] -%}
+      {%- if _aa_bump_minors | length > 0 -%}
+        {%- for k in _aa_gate_keys -%}
+          {%- if (k | string).startswith(prefix) and ((_aa_acks[k] | default('') | string | lower) != 'true') -%}
+            {%- set _ = out.append(k) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {{ out }}
+    # Why: OpenShift 4.Y ships Kubernetes 1.(Y+13); removals are keyed by Kubernetes release.
+    api_usage_releases: >-
+      {%- set out = [] -%}
+      {%- for m in _aa_bump_minors -%}{%- set _ = out.append('1.' ~ (m + 13)) -%}{%- endfor -%}
+      {{ out }}
+
+# ----------------------------------------------------------------------------
+# 2. Removed-API Usage Gate (read-only)
+# ----------------------------------------------------------------------------
+- name: "admin-acks: Check for workloads still calling APIs removed on the way to the target"
+  include_role:
+    name: api_usage
+
+# ----------------------------------------------------------------------------
+# 3. Evaluate Mode (Phase 02 Check 07)
+# ----------------------------------------------------------------------------
+- name: "admin-acks: Build prevalidation verdict (evaluate mode)"
+  set_fact:
+    _aa_ack_only: >-
+      {{ (admin_ack_upgradeable.status | string | lower) != 'false'
+         or (admin_ack_upgradeable.reason == 'AdminAckRequired')
+         or ((admin_ack_required_keys | length > 0) and (admin_ack_upgradeable.reason == 'MultipleReasons')) }}
+  when: (admin_ack_mode | default('evaluate')) == 'evaluate'
+
+- name: "admin-acks: Record Check 07 status and observation (evaluate mode)"
+  set_fact:
+    admin_ack_check_status: >-
+      {{ 'FAIL' if (api_usage_blocking | bool)
+         else ('FAIL' if ((admin_ack_required_keys | length > 0) and not (auto_apply_admin_acks | default(true) | bool))
+         else ('PASS' if (_aa_ack_only | bool)
+         else ('FAIL' if (_aa_first_hop_is_minor | bool) else 'WARN'))) }}
+    admin_ack_check_observed: >-
+      {{ api_usage_summary }}.
+      {{ ('Admin-ack needed before the ' ~ admin_ack_current_minor ~ ' minor hop: ' ~ (admin_ack_required_keys | join(', '))
+          ~ (' — applied automatically before that hop.' if (auto_apply_admin_acks | default(true) | bool) else ' — auto_apply_admin_acks is false; acknowledge it manually.'))
+         if (admin_ack_required_keys | length > 0)
+         else ('No admin-ack pending for the current minor ' ~ admin_ack_current_minor ~ '.' if (admin_ack_minor_hop | bool)
+               else 'No minor-version hop in the path; admin-acks not required.') }}
+      {{ ('Upgradeable=False (' ~ admin_ack_upgradeable.reason ~ '): ' ~ (admin_ack_upgradeable.message | truncate(300))
+          ~ (' — must clear before the minor hop.' if not (_aa_first_hop_is_minor | bool) else ''))
+         if not (_aa_ack_only | bool) else '' }}
+  when: (admin_ack_mode | default('evaluate')) == 'evaluate'
+
+# ----------------------------------------------------------------------------
+# 4. Apply Mode (immediately before a minor hop)
+# ----------------------------------------------------------------------------
+- name: "admin-acks: Stop the hop — removed APIs are still in use (apply mode)"
+  fail:
+    msg: >-
+      [HARD GATE] {{ admin_ack_hop_label | default('Hop') }}: {{ api_usage_summary }}.
+      The admin acknowledgement for {{ admin_ack_current_minor }} was NOT applied. Migrate these clients
+      (or add verified system users to api_usage_ignore_users) and re-run with --resume.
+  when:
+    - (admin_ack_mode | default('evaluate')) == 'apply'
+    - admin_ack_minor_hop | bool
+    - api_usage_blocking | bool
+
+- name: "admin-acks: Stop the hop — acknowledgement required but auto-apply is disabled (apply mode)"
+  fail:
+    msg: >-
+      [HARD GATE] {{ admin_ack_hop_label | default('Hop') }} needs admin-ack key(s) {{ admin_ack_required_keys | join(', ') }}
+      and auto_apply_admin_acks is false. Apply them with
+      oc -n openshift-config patch cm admin-acks --type=merge -p '{"data":{"<key>":"true"}}' and re-run with --resume.
+  when:
+    - (admin_ack_mode | default('evaluate')) == 'apply'
+    - admin_ack_required_keys | length > 0
+    - not (auto_apply_admin_acks | default(true) | bool)
+
+- name: "admin-acks: Apply required acknowledgement key(s) to openshift-config/admin-acks (apply mode)"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc -n openshift-config get configmap admin-acks >/dev/null 2>&1 || oc -n openshift-config create configmap admin-acks
+    oc -n openshift-config patch configmap admin-acks --type=merge -p {{ _aa_patch | to_json | quote }}
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  vars:
+    _aa_patch: >-
+      {%- set data = {} -%}
+      {%- for k in admin_ack_required_keys -%}{%- set _ = data.update({k: 'true'}) -%}{%- endfor -%}
+      {{ {'data': data} }}
+  register: admin_ack_patch_result
+  changed_when: true
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: admin_ack_patch_result.rc == 0
+  when:
+    - (admin_ack_mode | default('evaluate')) == 'apply'
+    - admin_ack_required_keys | length > 0
+
+- name: "admin-acks: Record applied acknowledgements in the run facts"
+  set_fact:
+    admin_acks_applied: >-
+      {%- set out = (admin_acks_applied | default([])) -%}
+      {%- for k in admin_ack_required_keys -%}{%- set _ = out.append({'key': k, 'hop': admin_ack_hop_label | default('hop')}) -%}{%- endfor -%}
+      {{ out }}
+  when:
+    - (admin_ack_mode | default('evaluate')) == 'apply'
+    - admin_ack_required_keys | length > 0
+
+- name: "admin-acks: Log applied acknowledgement"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "AUTO-FIX"
+    event_gate: "HARD"
+    event_task: "Admin-ack before {{ admin_ack_hop_label | default('hop') }}"
+    event_reason: "Applied {{ admin_ack_required_keys | join(', ') }} to openshift-config/admin-acks"
+    event_observed: "{{ api_usage_summary }}"
+  when:
+    - (admin_ack_mode | default('evaluate')) == 'apply'
+    - admin_ack_required_keys | length > 0
+
+# Why: the CVO refuses a minor update while Upgradeable=False. Wait (bounded) for it to
+#      re-evaluate after the acknowledgement; any remaining reason stops the hop now
+#      instead of letting the update sit rejected until the hop timeout.
+- name: "admin-acks: Wait for ClusterVersion to report Upgradeable=True (apply mode)"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    deadline=$((SECONDS + {{ (admin_ack_clear_timeout_seconds | default(300) | int) if (admin_ack_required_keys | length > 0) else 0 }}))
+    while :; do
+      state="$(oc get clusterversion version -o json | jq -r '(((.status.conditions // []) | map(select(.type == "Upgradeable")) | .[0]) // {}) | "\((.status // "True") | tostring)|\(.reason // "")|\(.message // "")"')" || state="Unknown||query failed"
+      case "$state" in True*) break ;; esac
+      [ "$SECONDS" -ge "$deadline" ] && break
+      sleep 15
+    done
+    printf '%s\n' "$state"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: admin_ack_upgradeable_raw
+  changed_when: false
+  failed_when: false
+  when:
+    - (admin_ack_mode | default('evaluate')) == 'apply'
+    - admin_ack_minor_hop | bool
+
+- name: "admin-acks: Stop the hop — ClusterVersion is not Upgradeable (apply mode)"
+  fail:
+    msg: >-
+      [HARD GATE] {{ admin_ack_hop_label | default('Hop') }}: ClusterVersion reports Upgradeable=False
+      ({{ admin_ack_upgradeable_raw.stdout.split('|')[1] | default('') }}): {{ admin_ack_upgradeable_raw.stdout.split('|')[2:] | join('|') | truncate(500) }}.
+      A minor-version update cannot start until this clears.
+  when:
+    - (admin_ack_mode | default('evaluate')) == 'apply'
+    - admin_ack_minor_hop | bool
+    - not ((admin_ack_upgradeable_raw.stdout | default('True')).startswith('True'))

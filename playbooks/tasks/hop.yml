@@ -1,0 +1,202 @@
+---
+# ============================================================================
+# Task Workflow: hop.yml — One Upgrade Hop (Phase 03 + Phase 04)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses block/rescue, set_fact, shell, include_role, include_tasks.
+#
+# Purpose: Runs one hop of upgrade_path (looped by 03_Initiate_upgrade.yaml):
+#          1. Plans the hop from the live cluster (roles/upgrade): skip a version the
+#             cluster already completed, resume an update already running to this
+#             target, otherwise trigger it.
+#          2. Before triggering, waits up to prehop_settle_wait_minutes for a stable
+#             cluster (no update running, no pool updating/degraded, no operator
+#             degraded/unavailable outside co_allow_list).
+#          3. Starts the hop (roles/upgrade tasks/apply.yml: channel, offered-edge wait,
+#             conditional-risk policy, removed-API check + admin-ack, trigger, confirm).
+#          4. Watches it to the settle gate (04_Live_monitoring_upgrade.yaml ->
+#             roles/monitor: heartbeats and degradation alerts only).
+# Mails:   none on success (no hop-started / hop-complete mails); one alert on failure.
+# Role / Playbook Dependencies: roles/upgrade, roles/monitor, roles/error_handle,
+#               04_Live_monitoring_upgrade.yaml, tasks/log_event.yml
+# Gate Type: HARD (exit 20 hop failure, 30 timeout / no progress)
+# Outputs: hop_results entry {hop_label, target, status, duration}
+# ============================================================================
+
+- name: "Hop {{ (hop_index | int) + 1 }} of {{ upgrade_path | length }} -> {{ hop_item }}"
+  block:
+    - name: "Hop: Set hop context"
+      set_fact:
+        hop_number: "{{ (hop_index | int) + 1 }}"
+        hop_total: "{{ upgrade_path | length }}"
+        hop_label: "Hop {{ (hop_index | int) + 1 }} of {{ upgrade_path | length }}"
+        hop_target_version: "{{ hop_item | string }}"
+        target_version: "{{ hop_item | string }}"
+        hop_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+        # Why: cleared per hop so a failure reports this hop's exit class, not a stale one.
+        phase_exit_code: 0
+
+    - name: "Hop: Display hop banner"
+      debug:
+        msg:
+          - "============================================================================"
+          - "PHASE 03: {{ hop_label | upper }} -> {{ hop_item }}"
+          - "============================================================================"
+          - "Cluster              : {{ cluster_name }}"
+          - "Path                 : {{ upgrade_path | join(' -> ') }}"
+          - "Started              : {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}"
+          - "============================================================================"
+
+    # ------------------------------------------------------------------------
+    # 1. Plan (read-only)
+    # ------------------------------------------------------------------------
+    - name: "Hop: Plan this hop from the live cluster"
+      include_role:
+        name: upgrade
+
+    - name: "Hop: Record a hop the cluster already completed"
+      set_fact:
+        hop_results: >-
+          {{ (hop_results | default([])) + [{'hop_label': hop_label, 'target': (hop_item | string),
+               'status': 'ALREADY DONE', 'duration': ''}] }}
+      when: upgrade_hop_action == 'skip'
+
+    - name: "Hop: Log the skipped hop"
+      include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+      vars:
+        event_status: "SKIPPED"
+        event_gate: "HARD"
+        event_task: "{{ hop_label }} -> {{ hop_item }}"
+        event_reason: "Cluster already completed {{ upgrade_cv.completed }}; hop not needed"
+      when: upgrade_hop_action == 'skip'
+
+    # ------------------------------------------------------------------------
+    # 2. Stable cluster before a new hop starts
+    # ------------------------------------------------------------------------
+    - name: "Hop: Wait for a stable cluster before starting (up to {{ prehop_settle_wait_minutes | default(10) }} min)"
+      shell: |
+        # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+        set -o pipefail
+        deadline=$((SECONDS + {{ (prehop_settle_wait_minutes | default(10) | int) * 60 }}))
+        while :; do
+          state="$(oc get clusterversion,clusteroperators,machineconfigpools -o json --request-timeout=60s | jq -c --argjson allow {{ co_allow_list | default([]) | to_json | quote }} '
+            def cstat(t): ([(.status.conditions // [])[] | select(.type == t) | .status] | .[0]) // "Unknown";
+            (.items // []) as $all
+            | ([$all[] | select(.kind == "ClusterVersion")] | .[0] // {}) as $cv
+            | {
+                cv_progressing: ($cv | cstat("Progressing")),
+                pools_busy: [$all[] | select(.kind == "MachineConfigPool") | select((.spec.paused // false) | not)
+                             | select(cstat("Updating") == "True" or cstat("Degraded") == "True") | .metadata.name],
+                operators_unhealthy: [$all[] | select(.kind == "ClusterOperator")
+                             | select(.metadata.name as $n | ($allow | map(. == $n) | any) | not)
+                             | select(cstat("Degraded") == "True" or cstat("Available") != "True") | .metadata.name]
+              }
+            | . + {stable: (.cv_progressing != "True" and (.pools_busy | length) == 0 and (.operators_unhealthy | length) == 0)}')" \
+            || state='{"stable":false,"error":"cluster state query failed"}'
+          case "$state" in *'"stable":true'*) break ;; esac
+          [ "$SECONDS" -ge "$deadline" ] && break
+          sleep 30
+        done
+        printf '%s\n' "$state"
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: hop_prehop_raw
+      changed_when: false
+      failed_when: false
+      when: upgrade_hop_action == 'trigger'
+
+    - name: "Hop: Parse the pre-hop state"
+      set_fact:
+        hop_prehop_state: >-
+          {{ (hop_prehop_raw.stdout | from_json)
+             if ((hop_prehop_raw.stdout | default('') | trim).startswith('{'))
+             else {'stable': false, 'error': (hop_prehop_raw.stderr | default('no output') | truncate(300))} }}
+      when: upgrade_hop_action == 'trigger'
+
+    - name: "Hop: Stop — the cluster is not stable enough to start {{ hop_label }}"
+      fail:
+        msg: >-
+          [HARD GATE FAILURE] {{ hop_label }} -> {{ hop_item }} not started: the cluster was not stable after
+          {{ prehop_settle_wait_minutes | default(10) }} minutes
+          (update running: {{ hop_prehop_state.cv_progressing | default('unknown') }};
+          pools updating/degraded: {{ hop_prehop_state.pools_busy | default([]) | join(', ') or 'none' }};
+          operators degraded/unavailable: {{ hop_prehop_state.operators_unhealthy | default([]) | join(', ') or 'none' }}
+          {{ ('; ' ~ hop_prehop_state.error) if (hop_prehop_state.error is defined) else '' }}).
+      when:
+        - upgrade_hop_action == 'trigger'
+        - not (hop_prehop_state.stable | default(false) | bool)
+
+    # ------------------------------------------------------------------------
+    # 3. Start the hop
+    # ------------------------------------------------------------------------
+    - name: "Hop: Start {{ hop_label }} -> {{ hop_item }}"
+      include_role:
+        name: upgrade
+        tasks_from: apply
+      when: upgrade_hop_action == 'trigger'
+
+    # ------------------------------------------------------------------------
+    # 4. Watch it to the settle gate (Phase 04)
+    # ------------------------------------------------------------------------
+    - name: "Hop: Monitor {{ hop_label }} until the cluster settles"
+      include_tasks: "{{ playbook_dir }}/04_Live_monitoring_upgrade.yaml"
+      when: upgrade_hop_action in ['trigger', 'resume']
+
+    - name: "Hop: Record the completed hop"
+      set_fact:
+        hop_results: >-
+          {%- set s = (lookup('pipe', 'date +%s') | int) - (hop_start_epoch | int) -%}
+          {{ (hop_results | default([])) + [{'hop_label': hop_label, 'target': (hop_item | string),
+               'status': ('COMPLETE (resumed)' if upgrade_hop_action == 'resume' else 'COMPLETE'),
+               'duration': ('%02d:%02d:%02d' | format(s // 3600, (s % 3600) // 60, s % 60))}] }}
+      when: upgrade_hop_action in ['trigger', 'resume']
+
+    - name: "Hop: Log the completed hop"
+      include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+      vars:
+        event_status: "PASS"
+        event_gate: "HARD"
+        event_task: "{{ hop_label }} -> {{ hop_item }}"
+        event_reason: "Cluster settled at {{ hop_item }} in {{ hop_results[-1].duration }}"
+      when: upgrade_hop_action in ['trigger', 'resume']
+
+  # --------------------------------------------------------------------------
+  # Rescue: one alert for this hop (Phase 03's rescue does not send a second one)
+  # --------------------------------------------------------------------------
+  rescue:
+    - name: "Hop: Resolve the error for this failure"
+      set_fact:
+        resolved_error: >-
+          {{ (ansible_failed_result.stderr | default('') | string | trim)
+             or (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+             or (ansible_failed_result.msg | default('') | string | trim)
+             or 'Unknown error - inspect the run log' }}
+
+    - name: "Hop: Set failure context for the alert"
+      set_fact:
+        current_step_no: "Phase 03"
+        current_task_name: "{{ hop_label | default('Upgrade hop') }} -> {{ hop_item }}"
+        current_gate_type: "HARD"
+        failure_reason: >-
+          {{ (hop_label | default('Upgrade hop')) ~ ' -> ' ~ hop_item
+             ~ (' did not settle in time' if ((phase_exit_code | default(0) | int) == 30) else ' failed') }}
+        failure_observed: "{{ resolved_error }}"
+        # Why: the monitor sets 20 (hop failed) or 30 (timeout / no progress); anything
+        #      else that fails inside a hop is a hop failure (20).
+        phase_exit_code: "{{ (phase_exit_code | int) if ((phase_exit_code | default(0) | int) in [20, 30]) else 20 }}"
+        failure_attachments:
+          - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+          - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_prevalidation_{{ run_timestamp }}.html"
+        hop_results: >-
+          {{ (hop_results | default([])) + [{'hop_label': hop_label | default('Hop'), 'target': (hop_item | string),
+               'status': 'FAILED', 'duration': ''}] }}
+
+    - name: "Hop: Record the failure and send the alert"
+      include_role:
+        name: error_handle
+
+    - name: "Hop: Stop the hop loop"
+      fail:
+        msg: "{{ failure_reason }}: {{ resolved_error | truncate(1000) }}"

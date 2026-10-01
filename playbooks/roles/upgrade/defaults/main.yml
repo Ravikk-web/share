@@ -1,0 +1,38 @@
+---
+# ============================================================================
+# Role Defaults: upgrade
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defaults for the per-hop upgrade role (tasks/main.yml plans the hop,
+#          tasks/apply.yml starts it). Authoritative values live in vars/upgrade.yml.
+# Role / Playbook Dependencies: vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by upgrade tasks
+# ============================================================================
+
+# Hop target version in X.Y.Z form (string). Set by tasks/hop.yml.
+target_version: ""
+
+# Channel family: each hop uses <target_channel_prefix>-<major.minor> (string, default: stable)
+target_channel_prefix: "stable"
+
+# Fixed channel for every hop (string, default: ""). Leave empty unless one channel
+# (for example an EUS channel) really contains every version of the path.
+target_channel: ""
+
+# Seconds to wait for the cluster to offer the target after the channel is set (integer)
+upgrade_edge_wait_seconds: 300
+
+# Accept conditional updates whose risks apply to this cluster (boolean, default: false)
+allow_conditional_updates: false
+
+# Emergency force path — never automatic: needs all three values (boolean / string / token)
+allow_force_upgrade: false
+force_image_pullspec: ""
+force_upgrade_confirm_token: ""
+
+# Retries for oc queries (integer) and delay between them in seconds (integer)
+oc_command_retries: 3
+oc_command_retry_delay: 10

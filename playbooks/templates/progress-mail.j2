@@ -1,0 +1,181 @@
+{#
+==============================================================================
+Progress Notification Template: progress-mail.j2
+==============================================================================
+Targets: Jinja2 / Ansible 2.7.17 & 2.14.18
+
+Context: In-flight emails while a hop (or a remediation node rollout) runs:
+         notify_event 'heartbeat' (every heartbeat_minutes) or 'degradation'
+         (immediate alert after the grace period, once per condition).
+Dependencies (facts set by roles/monitor before tasks/notify.yml):
+  - cluster_name, run_timestamp, upgrade_path, notify_event
+  - progress_label (string), progress_target_version, progress_percent (int)
+  - progress_hop_elapsed (HH:MM:SS), progress_cv_version, progress_cv_message
+  - progress_mcp_list: [{name, ready_count, total_count, updated_count, updating, degraded}]
+  - progress_active_nodes: [{name, role, action}]
+  - progress_degraded_nodes: [{name, role, condition, message}]
+  - progress_open_issues: [{title, detail, minutes}]   (conditions currently open)
+  - degradation_new_items: [{title, detail, minutes}] (new in this alert)
+  - hop_results: [{hop_label, target, status, duration}]
+  - UI color tokens from vars/report_vars.yml
+Constraints:
+  - Max-width 580px, inline CSS, table layout, no JavaScript
+==============================================================================
+#}
+{%- set is_degradation = (notify_event | default('heartbeat')) == 'degradation' -%}
+{%- set accent = (color_warn | default('#9a6700')) if is_degradation else (color_autofix | default('#1d4ed8')) -%}
+{%- set pct = progress_percent | default(0) | int -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ cluster_name | default('Cluster') | e }} {{ progress_label | default('upgrade') | e }}</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: {{ color_page_bg | default('#f8f9fb') }}; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.5; color: {{ color_heading | default('#101828') }};">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: {{ color_page_bg | default('#f8f9fb') }}; padding: 20px 0;">
+    <tr>
+      <td align="center">
+        <table border="0" cellspacing="0" cellpadding="0" style="max-width: {{ email_max_width | default('580px') }}; width: 100%; margin: 0 auto; background-color: {{ color_surface | default('#ffffff') }}; border: 1px solid {{ color_border | default('#e4e7ec') }}; border-top: 4px solid {{ accent }}; border-radius: 6px; border-collapse: separate;">
+
+          <!-- Header -->
+          <tr>
+            <td style="padding: 24px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">
+              {% if is_degradation %}
+              <span style="display: inline-block; padding: 4px 10px; font-size: 12px; font-weight: 700; border-radius: 12px; background-color: {{ bg_warn | default('#fff8e1') }}; color: {{ color_warn | default('#9a6700') }}; border: 1px solid #fedf89;">DEGRADATION DETECTED &#9888;</span>
+              {% else %}
+              <span style="display: inline-block; padding: 4px 10px; font-size: 12px; font-weight: 700; border-radius: 12px; background-color: {{ bg_autofix | default('#eff6ff') }}; color: {{ color_autofix | default('#1d4ed8') }}; border: 1px solid #bfdbfe;">UPGRADE IN PROGRESS &#8505;</span>
+              {% endif %}
+              <h1 style="margin: 12px 0 4px 0; font-size: 20px; font-weight: 700;">{{ cluster_name | default('Cluster') | e }} &bull; {{ progress_label | default('Upgrade') | e }}</h1>
+              <p style="margin: 0; font-size: 13px; color: #667085;">
+                Target <strong>{{ progress_target_version | default('N/A') | e }}</strong>
+                &bull; Cluster at <strong>{{ progress_cv_version | default('N/A') | e }}</strong>
+                &bull; Elapsed {{ progress_hop_elapsed | default('00:00:00') | e }}
+              </p>
+              <div style="background-color: #e4e7ec; border-radius: 4px; height: 10px; width: 100%; margin: 14px 0 4px 0;">
+                <div style="background-color: {{ accent }}; height: 10px; border-radius: 4px; width: {{ [[pct, 0] | max, 100] | min }}%;"></div>
+              </div>
+              <div style="font-size: 12px; color: #475467; text-align: right;"><strong>{{ pct }}%</strong> of this step</div>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding: 20px 24px;">
+
+              {% if is_degradation and (degradation_new_items | default([]) | length > 0) %}
+              <div style="border-radius: 6px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; background-color: {{ bg_fail | default('#fdecea') }}; border: 1px solid #fecdca; color: {{ color_fail | default('#b42318') }};">
+                <div style="font-weight: 700; margin-bottom: 6px;">New problem(s) during the upgrade</div>
+                <ul style="margin: 0; padding-left: 18px;">
+                  {% for item in degradation_new_items %}
+                  <li style="margin-bottom: 4px;"><strong>{{ item.title | default('Condition') | e }}</strong> for {{ item.minutes | default(0) }} min &mdash; {{ item.detail | default('') | e }}</li>
+                  {% endfor %}
+                </ul>
+                <div style="margin-top: 6px; color: #475467;">The upgrade continues; monitoring fails the hop only if it stops progressing or its time limit is reached.</div>
+              </div>
+              {% endif %}
+
+              {% if (not is_degradation) and (progress_open_issues | default([]) | length > 0) %}
+              <div style="border-radius: 6px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; background-color: {{ bg_warn | default('#fff8e1') }}; border: 1px solid #fedf89; color: #7a4f01;">
+                <div style="font-weight: 700; margin-bottom: 6px;">Open issues</div>
+                <ul style="margin: 0; padding-left: 18px;">
+                  {% for item in progress_open_issues %}
+                  <li style="margin-bottom: 4px;"><strong>{{ item.title | default('Condition') | e }}</strong> for {{ item.minutes | default(0) }} min &mdash; {{ item.detail | default('') | e }}</li>
+                  {% endfor %}
+                </ul>
+              </div>
+              {% endif %}
+
+              {% if progress_cv_message | default('') | length > 0 %}
+              <div style="font-size: 12px; color: #475467; margin-bottom: 16px;"><strong>Cluster version status:</strong> {{ progress_cv_message | truncate(300) | e }}</div>
+              {% endif %}
+
+              <!-- Hop timeline -->
+              {% if upgrade_path | default([]) | length > 0 %}
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Upgrade path</div>
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; margin-bottom: 20px; border-collapse: collapse;">
+                {% for target in upgrade_path %}
+                {%- set done = hop_results | default([]) | selectattr('target', 'equalto', target) | list -%}
+                <tr>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; font-weight: 600;">Hop {{ loop.index }}/{{ loop.length }} &rarr; {{ target | e }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; text-align: right;">
+                    {% if done | length > 0 %}
+                    <span style="color: {{ color_pass | default('#1a7f37') }}; font-weight: 700;">{{ done[0].status | default('COMPLETE') | e }}</span>{% if done[0].duration | default('') | length > 0 %} ({{ done[0].duration | e }}){% endif %}
+                    {% elif target == (progress_target_version | default('')) %}
+                    <span style="color: {{ color_autofix | default('#1d4ed8') }}; font-weight: 700;">IN PROGRESS</span>
+                    {% else %}
+                    <span style="color: #667085;">PENDING</span>
+                    {% endif %}
+                  </td>
+                </tr>
+                {% endfor %}
+              </table>
+              {% endif %}
+
+              <!-- MachineConfigPools -->
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">MachineConfigPools</div>
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; margin-bottom: 20px; border-collapse: collapse;">
+                <tr style="background-color: #f9fafb;">
+                  <th style="padding: 6px 10px; text-align: left; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Pool</th>
+                  <th style="padding: 6px 10px; text-align: center; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Updated / Total</th>
+                  <th style="padding: 6px 10px; text-align: right; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">State</th>
+                </tr>
+                {% for mcp in progress_mcp_list | default([]) %}
+                <tr>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; font-weight: 600;">{{ mcp.name | default('unknown') | e }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; text-align: center;">{{ mcp.updated_count | default(0) }} / {{ mcp.total_count | default(0) }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; text-align: right;">
+                    {% if mcp.degraded | default('False') | string == 'True' %}
+                    <span style="color: {{ color_fail | default('#b42318') }}; font-weight: 700;">DEGRADED</span>
+                    {% elif mcp.updating | default('False') | string == 'True' %}
+                    <span style="color: {{ color_autofix | default('#1d4ed8') }}; font-weight: 700;">UPDATING</span>
+                    {% else %}
+                    <span style="color: {{ color_pass | default('#1a7f37') }}; font-weight: 700;">UPDATED</span>
+                    {% endif %}
+                  </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="3" style="padding: 8px; text-align: center; color: #667085;">No MachineConfigPool data in this poll.</td></tr>
+                {% endfor %}
+              </table>
+
+              {% if progress_active_nodes | default([]) | length > 0 %}
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Nodes updating now</div>
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; margin-bottom: 20px; border-collapse: collapse;">
+                {% for node in progress_active_nodes %}
+                <tr>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; font-family: 'SFMono-Regular', Consolas, monospace;">{{ node.name | default('N/A') | e }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ node.role | default('worker') | e }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; text-align: right;">{{ node.action | default('Updating') | e }}</td>
+                </tr>
+                {% endfor %}
+              </table>
+              {% endif %}
+
+              {% if progress_degraded_nodes | default([]) | length > 0 %}
+              <div style="border-radius: 6px; padding: 12px 16px; margin-bottom: 8px; font-size: 13px; background-color: {{ bg_fail | default('#fdecea') }}; border: 1px solid #fecdca; color: {{ color_fail | default('#b42318') }};">
+                <div style="font-weight: 700; margin-bottom: 6px;">Nodes not Ready or under pressure</div>
+                <ul style="margin: 0; padding-left: 18px;">
+                  {% for dnode in progress_degraded_nodes %}
+                  <li style="margin-bottom: 4px;"><strong>{{ dnode.name | default('node') | e }}</strong> ({{ dnode.role | default('unknown') | e }}): {{ dnode.condition | default('NotReady') | e }} &mdash; {{ dnode.message | default('') | truncate(160) | e }}</li>
+                  {% endfor %}
+                </ul>
+              </div>
+              {% endif %}
+
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 16px 24px; background-color: #f9fafb; border-top: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; color: #667085; line-height: 1.4;">
+              <div><strong>Run:</strong> {{ run_timestamp | default('N/A') | e }} &bull; Polling every {{ poll_interval_minutes | default(2) }} min &bull; Heartbeat every {{ heartbeat_minutes | default(20) }} min</div>
+              <div><strong>Generated:</strong> {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }} &bull; <strong>Host:</strong> {{ ansible_hostname | default('localhost') | e }}</div>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

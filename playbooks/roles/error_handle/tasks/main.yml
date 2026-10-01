@@ -1,0 +1,131 @@
+---
+# ============================================================================
+# Role Tasks: error_handle
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (set_fact, copy, include_tasks).
+#
+# Purpose: Standardized rescue block handler. Records the failure, parses RBAC
+#          denials, writes the structured run logs and the run status file that
+#          00_Run.sh maps to an exit code, and sends exactly ONE failure alert per run.
+# Why:     Nested rescues (hop.yml inside Phase 03) used to send two alerts for one
+#          failure. failure_alert_sent / run_status_written make the innermost
+#          handler (which has the most specific context) the only one that reports.
+# Inputs (set by the caller's rescue via set_fact before including this role):
+#          current_step_no, current_task_name, current_gate_type, failure_reason,
+#          failure_observed, resolved_error (fresh from ansible_failed_result),
+#          phase_exit_code (int), failure_attachments (list of report/log paths)
+# Role / Playbook Dependencies: tasks/log_event.yml, tasks/notify.yml, templates/error-report.j2
+# Gate Type: HARD / WARN (Captures and records failure context)
+# Outputs: failed_checks record, run log event, logs/<cluster>_<ts>.status, one alert email
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Resolve Error Text
+# ----------------------------------------------------------------------------
+# Why: callers extract resolved_error from their own ansible_failed_result
+#      (stderr -> stderr_lines -> msg); fall back to the observed/reason text.
+- name: "error_handle: Resolve error text for the failure record"
+  set_fact:
+    resolved_error: >-
+      {{ (resolved_error | string)
+         if (resolved_error | default('') | string | trim | length > 0)
+         else (failure_observed | default('', true) | string
+               if (failure_observed | default('') | string | trim | length > 0)
+               else (failure_reason | default('Unknown error — inspect the run log', true) | string)) }}
+    failure_reason: "{{ failure_reason | default('Upgrade gate failed', true) }}"
+    failed_task_name: "{{ current_task_name | default('Validation Failure', true) }}"
+    failed_gate_type: "{{ current_gate_type | default('HARD', true) }}"
+
+# ----------------------------------------------------------------------------
+# 2. RBAC / Authorization Failure Detection
+# ----------------------------------------------------------------------------
+# Why: surface the exact missing permission so the NPID's access can be fixed quickly.
+#      Kubernetes denials read: ... cannot <verb> resource "<resource>" in API group "<group>" ...
+- name: "error_handle: Detect RBAC or authorization failure"
+  set_fact:
+    is_rbac_error: >-
+      {{ ((resolved_error ~ ' ' ~ failure_reason) | lower is search('forbidden|unauthorized|cannot (get|list|watch|create|update|patch|delete) resource')) }}
+    rbac_missing_verb: >-
+      {{ (resolved_error | regex_search('cannot [a-z]+ resource') | default('', true)) | regex_replace('^cannot | resource$', '') }}
+    rbac_missing_resource: >-
+      {{ (resolved_error | regex_search('resource "[^"]+"') | default('', true)) | regex_replace('^resource "|"$', '') }}
+    rbac_missing_group: >-
+      {{ (resolved_error | regex_search('API group "[^"]*"') | default('', true)) | regex_replace('^API group "|"$', '') }}
+
+- name: "error_handle: Build RBAC check and remediation commands"
+  set_fact:
+    rbac_check_command: >-
+      oc auth can-i {{ rbac_missing_verb | default('', true) | trim or '*' }} {{ (rbac_missing_resource | default('', true) | trim or '*') ~ (('.' ~ rbac_missing_group) if (rbac_missing_group | default('') | length > 0) else '') }} --all-namespaces
+    rbac_remediation_cmd: "oc adm policy add-cluster-role-to-user cluster-admin {{ cluster_username | default('<npid>', true) }}"
+  when: is_rbac_error | bool
+
+# ----------------------------------------------------------------------------
+# 3. Structured Failure Record & Run Logs
+# ----------------------------------------------------------------------------
+- name: "error_handle: Record structured failure item"
+  set_fact:
+    failed_checks: >-
+      {{ (failed_checks | default([])) + [{
+           'name': failed_task_name,
+           'gate': failed_gate_type,
+           'status': 'FAIL',
+           'phase': (current_step_no | default('') | string),
+           'observed': resolved_error
+         }] }}
+
+- name: "error_handle: Append failure entry to run logs"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "FAIL"
+    event_gate: "{{ failed_gate_type }}"
+    event_task: "{{ failed_task_name }}"
+    event_reason: "{{ failure_reason }}"
+    event_observed: "{{ resolved_error }}"
+
+# ----------------------------------------------------------------------------
+# 4. Run Status File (read by 00_Run.sh to choose the exit code)
+# ----------------------------------------------------------------------------
+- name: "error_handle: Write run status file for the CLI exit code"
+  copy:
+    content: >-
+      {{ {'exit_code': (phase_exit_code | default(99) | int),
+          'phase': (current_step_no | default('unknown') | string),
+          'task': failed_task_name,
+          'reason': ((failure_reason ~ ': ' ~ resolved_error) | regex_replace('[\r\n]+', ' ') | truncate(600)),
+          'run_mode': (run_mode | default('unknown')),
+          'time': lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S')} | to_nice_json }}
+    dest: "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name | default('cluster') }}_{{ run_timestamp | default('current') }}.status"
+    mode: "0640"
+  failed_when: false
+  when: not (run_status_written | default(false) | bool)
+
+- name: "error_handle: Mark run status as written"
+  set_fact:
+    run_status_written: true
+
+# ----------------------------------------------------------------------------
+# 5. Single Failure Alert
+# ----------------------------------------------------------------------------
+- name: "error_handle: Prepare failure alert"
+  set_fact:
+    notify_event: "alert"
+    notify_headline: "{{ (failed_task_name ~ ' failed') | truncate(110) }}"
+    notify_attachments_requested: >-
+      {{ (failure_attachments | default([]))
+         + [(log_dir | default(playbook_dir ~ '/logs')) ~ '/' ~ (cluster_name | default('cluster')) ~ '_' ~ (run_timestamp | default('current')) ~ '.txt'] }}
+  when: not (failure_alert_sent | default(false) | bool)
+
+- name: "error_handle: Dispatch failure alert (once per run)"
+  include_tasks: "{{ playbook_dir }}/tasks/notify.yml"
+  when: not (failure_alert_sent | default(false) | bool)
+
+- name: "error_handle: Note that the alert for this failure was already sent"
+  debug:
+    msg: "Failure alert already sent for this run by the innermost handler; not sending a duplicate."
+  when: failure_alert_sent | default(false) | bool
+
+- name: "error_handle: Mark failure alert as sent"
+  set_fact:
+    failure_alert_sent: true
+    failure_attachments: []

@@ -1,0 +1,403 @@
+---
+# ============================================================================
+# Phase 02 Playbook: Prevalidation & Auto-Remediation
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses play-level vars_files, include_role / include_tasks and
+#                 block/rescue/always; compatible across Ansible 2.7 and 2.14.
+#
+# Purpose: Runs the 15-check prevalidation contract, applies the enabled
+#          auto-remediations for failed checks, waits for any node rollout they
+#          start, re-runs the full scan, and stops the run if any HARD check still
+#          fails. Writes the prevalidation report and, when the run continues to the
+#          upgrade, sends the prevalidation mail.
+# Flow:    login (if needed) -> scan -> remediate (Check 14 cgroup v2, Check 03 paused
+#          MCPs, Check 01 degraded operators — each behind its own toggle) -> wait for
+#          the node rollout (roles/monitor, rollout mode: heartbeats and degradation
+#          alerts) -> full re-scan -> AUTO-FIXED / FIX-FAILED merge -> report -> gate.
+# Why:     A remediated check is re-run in full and is AUTO-FIXED only if the whole
+#          check passes afterwards (FIX-FAILED otherwise); remediation never edits
+#          check results directly. Admin-acks are applied per hop in Phase 03.
+# Mails:   full run continuing to Phase 03 -> prevalidation mail; standalone run ->
+#          closing prevalidation mail; dry-run / pre-check / stop after Phase 02 ->
+#          no mail here (main.yml sends the single closing summary); failure -> one
+#          alert via roles/error_handle.
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               roles/login, roles/logout, roles/prevalidation, roles/remediate,
+#               roles/monitor, roles/report, roles/error_handle,
+#               tasks/log_event.yml, tasks/send_run_summary.yml
+# Gate Type: HARD (residual FAIL / FIX-FAILED HARD checks stop the run; exit code 10)
+# Outputs: output/<cluster>_prevalidation_<ts>.html, health_summary, preval_autofix_items,
+#          run_phase_results entry, prevalidation mail (see Mails)
+# ============================================================================
+
+- name: "Phase 02 — Prevalidation & Auto-Remediation"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+
+  tasks:
+    - name: "Phase 02: Prevalidation, auto-remediation and HARD gate"
+      when:
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 2
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 2
+      block:
+        # --------------------------------------------------------------------
+        # 1. Phase context and session
+        # --------------------------------------------------------------------
+        - name: "Phase 02: Initialize phase context"
+          set_fact:
+            phase02_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"
+            phase_02_failed: false
+            phase02_report_written: false
+            preval_autofix_items: []
+            remediation_attempted_nums: []
+            remediation_rollout_needed: false
+            preval_residual_hard_failures: []
+            preval_report_file: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_prevalidation_{{ run_timestamp }}.html"
+            # Why: the prevalidation mail is only useful when the upgrade follows it;
+            #      otherwise the run's single closing summary carries the same report.
+            p02_continues_to_upgrade: >-
+              {{ not (dry_run | default(false) | bool)
+                 and not (standalone_phase | default(false) | bool)
+                 and (stop_after_phase is not defined or (stop_after_phase | int) >= 3) }}
+
+        - name: "Phase 02: Log in (standalone run or no active session)"
+          include_role:
+            name: login
+          when: not (cluster_session_active | default(false) | bool)
+
+        - name: "Phase 02: Display initiation banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 02: PREVALIDATION & AUTO-REMEDIATION"
+              - "============================================================================"
+              - "Target Cluster       : {{ cluster_name }}"
+              - "Upgrade Path         : {{ upgrade_path | default([]) | join(' -> ') }}"
+              - "Auto-Remediation     : {{ 'enabled' if (auto_remediation_enabled | default(true) | bool) else 'disabled for this run' }}"
+              - "Mode                 : {{ run_mode | default('full-upgrade') }}"
+              - "============================================================================"
+
+        - name: "Phase 02: Log phase start"
+          include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+          vars:
+            event_status: "START"
+            event_gate: "HARD"
+            event_task: "Phase 02 Prevalidation"
+            event_reason: "15-check scan for {{ upgrade_path | default([]) | join(' -> ') }} (auto-remediation {{ 'on' if (auto_remediation_enabled | default(true) | bool) else 'off' }})"
+
+        # --------------------------------------------------------------------
+        # 2. Initial scan
+        # --------------------------------------------------------------------
+        - name: "Phase 02: Run the 15-check prevalidation scan"
+          include_role:
+            name: prevalidation
+
+        # --------------------------------------------------------------------
+        # 3. Auto-remediation requests (by check number)
+        # --------------------------------------------------------------------
+        - name: "Phase 02: Collect failed check numbers"
+          set_fact:
+            _p02_failed_nums: >-
+              {{ health_summary | selectattr('status', 'equalto', 'FAIL') | map(attribute='num') | map('int') | list }}
+
+        # Why: each request also needs something the engine can act on — a paused pool
+        #      on the allow-list (Check 03) or a Degraded operator (Check 01) — so an
+        #      unfixable failure is left as FAIL instead of becoming FIX-FAILED.
+        - name: "Phase 02: Decide which remediations to request"
+          set_fact:
+            trigger_cgroup_remediation: >-
+              {{ (14 in _p02_failed_nums) and not (skip_cgroup_check | default(false) | bool) }}
+            trigger_unpause_mcp_remediation: >-
+              {{ (3 in _p02_failed_nums)
+                 and ((mcp_paused_pools | default([])) | intersect(mcp_auto_unpause_list | default(['worker', 'master'])) | length > 0) }}
+            trigger_co_restart_remediation: >-
+              {{ (1 in _p02_failed_nums) and (co_degraded | default([]) | length > 0) }}
+
+        - name: "Phase 02: Run the requested auto-remediations"
+          include_role:
+            name: remediate
+          when:
+            - auto_remediation_enabled | default(true) | bool
+            - (trigger_cgroup_remediation | bool) or (trigger_unpause_mcp_remediation | bool) or (trigger_co_restart_remediation | bool)
+
+        # Why: a cgroup change or an unpaused pool makes the Machine Config Operator
+        #      drain and reboot nodes. The re-scan (and the first hop) must not start
+        #      until that rollout has finished.
+        - name: "Phase 02: Wait for the remediation node rollout"
+          include_role:
+            name: monitor
+          vars:
+            monitor_mode: "rollout"
+            hop_target_version: "{{ run_start_version | default('current', true) }}"
+          when: remediation_rollout_needed | default(false) | bool
+
+        # --------------------------------------------------------------------
+        # 4. Re-scan and merge
+        # --------------------------------------------------------------------
+        - name: "Phase 02: Re-run the full scan after remediation"
+          include_role:
+            name: prevalidation
+          when: remediation_attempted_nums | default([]) | length > 0
+
+        - name: "Phase 02: Mark remediated checks AUTO-FIXED or FIX-FAILED"
+          set_fact:
+            health_summary: >-
+              {%- set out = [] -%}
+              {%- for c in health_summary -%}
+              {%- if (c.num | int) in remediation_attempted_nums -%}
+              {%- set fixed = c.status in ['PASS', 'WARN'] -%}
+              {%- set _ = out.append(c | combine({
+                    'status': ('AUTO-FIXED' if fixed else 'FIX-FAILED'),
+                    'observed': (('Auto-remediated and re-checked: ' if fixed else 'Auto-remediation attempted; re-check still fails: ') ~ c.observed)
+                  })) -%}
+              {%- else -%}
+              {%- set _ = out.append(c) -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ out }}
+          when: remediation_attempted_nums | default([]) | length > 0
+
+        - name: "Phase 02: Collect residual HARD failures"
+          set_fact:
+            preval_residual_hard_failures: >-
+              {{ health_summary | selectattr('gate', 'equalto', 'HARD')
+                 | selectattr('status', 'match', '^(FAIL|FIX-FAILED)$') | list }}
+            # Why: shown in the gate message when remediation was off for this run.
+            _p02_fixable_nums: >-
+              {{ ([14] if ((auto_fix_cgroup_v2 | default(true) | bool) and not (skip_cgroup_check | default(false) | bool)) else [])
+                 + ([3] if (auto_unpause_mcp | default(true) | bool) else [])
+                 + ([1] if (auto_restart_degraded_operators | default(false) | bool) else []) }}
+
+        # --------------------------------------------------------------------
+        # 5. Report (written before the gate so a failure alert can attach it)
+        # --------------------------------------------------------------------
+        - name: "Phase 02: Configure the prevalidation report"
+          set_fact:
+            report_type: "prevalidation"
+            report_title: "Pre-Upgrade Validation Report"
+            report_template: "phase02-prevalidation.j2"
+            checks: "{{ health_summary }}"
+            autofix_items: "{{ preval_autofix_items }}"
+            output_file: "{{ preval_report_file }}"
+            phase02_duration_seconds: "{{ (lookup('pipe', 'date +%s') | int) - (phase02_start_epoch | int) }}"
+
+        - name: "Phase 02: Write the prevalidation report"
+          include_role:
+            name: report
+
+        - name: "Phase 02: Record the report location"
+          set_fact:
+            preval_report_file: "{{ report_file_path }}"
+            phase02_report_written: true
+
+        # --------------------------------------------------------------------
+        # 6. HARD gate
+        # --------------------------------------------------------------------
+        - name: "Phase 02: HARD gate — stop before any upgrade hop"
+          fail:
+            msg: >-
+              [HARD GATE FAILURE] Prevalidation failed on '{{ cluster_name }}' with
+              {{ preval_residual_hard_failures | length }} blocking check(s):
+              {% for item in preval_residual_hard_failures %}Check {{ '%02d' | format(item.num | int) }} {{ item.name }} [{{ item.status }}]: {{ item.observed | truncate(300) }}{% if not (auto_remediation_enabled | default(true) | bool) and ((item.num | int) in _p02_fixable_nums) %} (auto-fix available: a live run or --pre-check would attempt it){% endif %}{% if not loop.last %} | {% endif %}{% endfor %}.
+              No upgrade was started.
+          when: preval_residual_hard_failures | length > 0
+
+        # --------------------------------------------------------------------
+        # 7. Result, logs and mail
+        # --------------------------------------------------------------------
+        - name: "Phase 02: Summarize the result"
+          set_fact:
+            _p02_counts:
+              total: "{{ health_summary | length }}"
+              pass: "{{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}"
+              warn: "{{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}"
+              autofixed: "{{ health_summary | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length }}"
+              skipped: "{{ health_summary | selectattr('status', 'equalto', 'SKIPPED') | list | length }}"
+
+        - name: "Phase 02: Record the phase result"
+          set_fact:
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{
+                   'phase': '02',
+                   'name': 'Prevalidation',
+                   'status': ('AUTO-FIXED' if ((_p02_counts.autofixed | int) > 0)
+                              else ('WARN' if ((_p02_counts.warn | int) > 0) else 'PASS')),
+                   'detail': (_p02_counts.total ~ ' checks: ' ~ _p02_counts.pass ~ ' pass, ' ~ _p02_counts.warn ~ ' warn, '
+                              ~ _p02_counts.autofixed ~ ' auto-fixed' ~ ((', ' ~ _p02_counts.skipped ~ ' skipped') if ((_p02_counts.skipped | int) > 0) else ''))
+                 }] }}
+
+        - name: "Phase 02: Log gate pass"
+          include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+          vars:
+            event_status: "PASS"
+            event_gate: "HARD"
+            event_task: "Phase 02 Prevalidation"
+            event_reason: "{{ run_phase_results[-1].detail }}"
+            event_observed: "Report: {{ preval_report_file }}"
+
+        - name: "Phase 02: Prepare the prevalidation mail"
+          set_fact:
+            run_summary_event: "prevalidation"
+            run_summary_tag: "PREVALIDATION"
+            run_summary_title: >-
+              {{ 'Prevalidation Report' if (standalone_phase | default(false) | bool) else 'Prevalidation Passed - Upgrade Starting' }}
+            run_summary_intro: >-
+              {{ ('All blocking checks passed' ~ (' after auto-remediation' if ((_p02_counts.autofixed | int) > 0) else '') ~ '. ')
+                 ~ (('The upgrade to ' ~ (upgrade_path | default(['?']) | last) ~ ' starts now (' ~ (upgrade_path | default([]) | length) ~ ' hop(s)). '
+                     ~ 'Progress heartbeats follow every ' ~ (heartbeat_minutes | default(20)) ~ ' minutes, then one final summary.')
+                    if (p02_continues_to_upgrade | bool) else 'No upgrade was started by this run.') }}
+            run_summary_checks: "{{ health_summary }}"
+          when: (p02_continues_to_upgrade | bool) or (standalone_phase | default(false) | bool)
+
+        - name: "Phase 02: Send the prevalidation mail"
+          include_tasks: "{{ playbook_dir }}/tasks/send_run_summary.yml"
+          when: (p02_continues_to_upgrade | bool) or (standalone_phase | default(false) | bool)
+
+        - name: "Phase 02: Display completion banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 02 COMPLETE: PREVALIDATION PASSED"
+              - "============================================================================"
+              - "Result               : {{ run_phase_results[-1].detail }}"
+              - "Auto-remediations    : {{ preval_autofix_items | map(attribute='name') | join('; ') or 'none' }}"
+              - "Report               : {{ preval_report_file }}"
+              - "Mail                 : {{ 'prevalidation mail sent' if ((p02_continues_to_upgrade | bool) or (standalone_phase | default(false) | bool)) else 'included in the closing summary' }}"
+              - "============================================================================"
+
+        - name: "Phase 02: End the session (standalone run)"
+          include_role:
+            name: logout
+          when: standalone_phase | default(false) | bool
+
+      # ----------------------------------------------------------------------
+      # Rescue: one alert, a complete report, clean logout
+      # ----------------------------------------------------------------------
+      # 1. Error extraction: this failure's ansible_failed_result (stderr -> stderr_lines -> msg).
+      # 2. Report: if the scan stopped before the report was written, all 15 checks are
+      #    listed (the first check that did not report is the one that stopped).
+      # 3. Alert: roles/error_handle writes the status file (exit 10) and sends the alert.
+      # ----------------------------------------------------------------------
+      rescue:
+        - name: "Phase 02: Resolve the error for this failure"
+          set_fact:
+            phase_02_failed: true
+            resolved_error: >-
+              {{ (ansible_failed_result.stderr | default('') | string | trim)
+                 or (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 or (ansible_failed_result.msg | default('') | string | trim)
+                 or 'Unknown error - inspect the run log' }}
+
+        - name: "Phase 02: List all 15 checks for the failure report"
+          set_fact:
+            _p02_failure_checks: >-
+              {%- set canon = [
+                {'num': 1, 'name': 'ClusterOperators Health', 'gate': 'HARD'},
+                {'num': 2, 'name': 'Node Health and Conditions', 'gate': 'HARD'},
+                {'num': 3, 'name': 'MachineConfigPools Synchronization', 'gate': 'HARD'},
+                {'num': 4, 'name': 'API Context Verification', 'gate': 'HARD'},
+                {'num': 5, 'name': 'API Server Readiness Probe', 'gate': 'HARD'},
+                {'num': 6, 'name': 'etcd Quorum and Member Health', 'gate': 'HARD'},
+                {'num': 7, 'name': 'Administrator Acknowledgement (Admin-Acks)', 'gate': 'HARD'},
+                {'num': 8, 'name': 'Node Request Capacity Headroom', 'gate': 'HARD'},
+                {'num': 9, 'name': 'Pending Node Certificate Signing Requests (CSRs)', 'gate': 'WARN'},
+                {'num': 10, 'name': 'PersistentVolumes Health', 'gate': 'WARN'},
+                {'num': 11, 'name': 'PersistentVolumeClaims Health', 'gate': 'WARN'},
+                {'num': 12, 'name': 'PodDisruptionBudgets Headroom', 'gate': 'WARN'},
+                {'num': 13, 'name': 'Critical Namespace Pod Health', 'gate': 'WARN'},
+                {'num': 14, 'name': 'CGroup Mode Compatibility', 'gate': 'HARD'},
+                {'num': 15, 'name': 'OLM Operator Upgrade Compatibility', 'gate': 'HARD'}
+              ] -%}
+              {%- set res = [] -%}
+              {%- set missing = [] -%}
+              {%- for c in canon -%}
+              {%- set found = health_summary | default([]) | selectattr('num', 'defined') | list -%}
+              {%- set matched = [] -%}
+              {%- for h in found -%}
+              {%- if (h.num | int) == c.num -%}{%- set _ = matched.append(h) -%}{%- endif -%}
+              {%- endfor -%}
+              {%- if matched | length > 0 -%}
+              {%- set _ = res.append(matched[-1]) -%}
+              {%- else -%}
+              {%- set _ = res.append({'num': c.num, 'name': c.name, 'gate': c.gate,
+                    'status': ('FAIL' if (missing | length == 0) else 'SKIPPED'),
+                    'observed': (('Stopped with error: ' ~ (resolved_error | truncate(400))) if (missing | length == 0)
+                                 else 'Not evaluated: the scan stopped at an earlier check')}) -%}
+              {%- set _ = missing.append(c.num) -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ res }}
+          when: not (phase02_report_written | default(false) | bool)
+
+        - name: "Phase 02: Write the prevalidation failure report"
+          when: not (phase02_report_written | default(false) | bool)
+          block:
+            - name: "Phase 02: Configure the failure report"
+              set_fact:
+                report_type: "prevalidation"
+                report_title: "Pre-Upgrade Validation Report"
+                report_template: "phase02-prevalidation.j2"
+                checks: "{{ _p02_failure_checks }}"
+                autofix_items: "{{ preval_autofix_items | default([]) }}"
+                phase02_duration_seconds: "{{ (lookup('pipe', 'date +%s') | int) - (phase02_start_epoch | default(lookup('pipe', 'date +%s')) | int) }}"
+                output_file: "{{ preval_report_file | default(output_dir | default(playbook_dir ~ '/output') ~ '/' ~ cluster_name ~ '_prevalidation_' ~ run_timestamp ~ '.html') }}"
+
+            - name: "Phase 02: Render the failure report"
+              include_role:
+                name: report
+          rescue:
+            - name: "Phase 02: Report rendering failed (alert is still sent)"
+              debug:
+                msg: "[WARN] The prevalidation report could not be rendered: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: "Phase 02: Set failure context for the alert"
+          set_fact:
+            current_step_no: "Phase 02"
+            current_task_name: "Phase 02 Prevalidation"
+            current_gate_type: "HARD"
+            failure_reason: >-
+              {{ ('Prevalidation HARD gate: ' ~ (preval_residual_hard_failures | map(attribute='name') | join(', ')))
+                 if (preval_residual_hard_failures | default([]) | length > 0)
+                 else 'Phase 02 stopped on an error' }}
+            failure_observed: "{{ resolved_error }}"
+            phase_exit_code: 10
+            failure_attachments:
+              - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+              - "{{ preval_report_file | default('') }}"
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{'phase': '02', 'name': 'Prevalidation', 'status': 'FAIL',
+                   'detail': (resolved_error | regex_replace('[\r\n]+', ' ') | truncate(200))}] }}
+
+        - name: "Phase 02: Record the failure and send the alert"
+          include_role:
+            name: error_handle
+
+        - name: "Phase 02: End the session after the failure"
+          include_role:
+            name: logout
+
+        - name: "Phase 02: Stop the run"
+          fail:
+            msg: "Phase 02 Prevalidation failed: {{ resolved_error | truncate(1000) }}"
+
+      # ----------------------------------------------------------------------
+      # Always: the session is closed even if the rescue itself failed midway
+      # ----------------------------------------------------------------------
+      always:
+        - name: "Phase 02: Guarantee logout after a failure"
+          include_role:
+            name: logout
+          when:
+            - phase_02_failed | default(false) | bool
+            - cluster_session_active | default(false) | bool

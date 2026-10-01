@@ -1,0 +1,22 @@
+---
+# ============================================================================
+# Role Defaults: mcp (MachineConfigPools)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defines default input parameters for the mcp role, which validates
+#          that all MachineConfigPools report Updated=True, Updating=False,
+#          Degraded=False, and spec.paused=false prior to upgrading.
+# Role / Playbook Dependencies: vars/paths.yml, vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by mcp tasks
+# ============================================================================
+
+# Target ARO cluster name (string, mandatory)
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: ""
+
+# Master toggle for enforcing HARD gate failure on validation error (boolean, default: true)
+# Sourced from role defaults or overridden by prevalidation scan during diagnostic sweeps
+mcp_enforce_gate: true

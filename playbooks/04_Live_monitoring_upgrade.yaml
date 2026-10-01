@@ -1,0 +1,33 @@
+---
+# ============================================================================
+# Phase 04: Live Monitoring & Settle-Gate (task file, included per hop)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses include_role and debug; compatible across 2.7 and 2.14.
+#
+# Purpose: Hands one hop to roles/monitor, which polls ClusterVersion,
+#          ClusterOperators, MachineConfigPools and Nodes every poll_interval_minutes
+#          until the cluster is settled at the hop target, sending the heartbeat every
+#          heartbeat_minutes and one degradation alert per condition after its grace
+#          period. Included by tasks/hop.yml; not runnable on its own (the CLI rejects
+#          --phase 04).
+# Role / Playbook Dependencies: roles/monitor, vars/upgrade.yml, vars/smtp.yml
+# Gate Type: HARD (the monitor fails the hop: exit 20 failed, 30 timeout / no progress)
+# Outputs: hop_settled, hop_elapsed_duration (from roles/monitor)
+# ============================================================================
+
+- name: "Phase 04: Display monitoring hand-off"
+  debug:
+    msg: >-
+      Phase 04: watching {{ hop_label | default('the hop') }} -> {{ hop_target_version | default(hop_item | default('unknown')) }}
+      (poll every {{ poll_interval_minutes | default(2) }} min, heartbeat every {{ heartbeat_minutes | default(20) }} min,
+      no-progress timeout {{ hop_timeout_minutes | default(90) }} min, hard limit {{ hop_max_minutes | default(480) }} min).
+
+# Why: hop_target_version / hop_number / hop_total are facts set by tasks/hop.yml.
+#      Re-declaring them here as task vars that reference themselves would be a
+#      recursive template loop, so only the mode is passed.
+- name: "Phase 04: Monitor the hop until the cluster settles"
+  include_role:
+    name: monitor
+  vars:
+    monitor_mode: "hop"

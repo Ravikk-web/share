@@ -1,0 +1,98 @@
+---
+# ============================================================================
+# Task Include: notify.yml — Notification Composer (single entry point)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Purpose: Builds the envelope for one notification (recipients, subject,
+#          template, existing attachments) and hands it to roles/sendmail.
+#          Every email in the automation goes through this file.
+# Usage:   set_fact notify_event, notify_headline and (optionally)
+#          notify_attachments_requested, then include this file.
+#            notify_event: prevalidation | heartbeat | degradation | alert |
+#                          postvalidation | summary
+#            notify_event_tag (optional): subject tag override (e.g. PHASE-01)
+# Routing: informational mails -> the list for that mail type, or --mail-to;
+#          alert / degradation  -> alert_mail_to + (--mail-to or mail_to).
+# Why:     Composing every envelope here, from explicit inputs, prevents the
+#          stale-subject / stale-recipient bugs of the previous design.
+# Role / Playbook Dependencies: vars/smtp.yml, roles/sendmail, templates/*.j2
+# Gate Type: N/A (never fails the run)
+# Outputs: Email via roles/sendmail, notification_ledger entry
+# ============================================================================
+
+- name: "notify: Resolve routing, subject tag and enablement for '{{ notify_event | default('') }}'"
+  set_fact:
+    _notify_event: "{{ notify_event | default('summary', true) }}"
+    _notify_cli: "{{ mail_to_cli | default([]) }}"
+    _notify_tag: >-
+      {{ notify_event_tag
+         if (notify_event_tag | default('') | length > 0)
+         else ({'prevalidation': 'PREVALIDATION', 'heartbeat': 'HEARTBEAT', 'degradation': 'DEGRADED',
+                'alert': 'ALERT', 'postvalidation': 'POSTVALIDATION', 'summary': 'SUMMARY'}[notify_event | default('summary', true)]
+               | default('NOTICE')) }}
+
+- name: "notify: Resolve recipients and whether this notification type is enabled"
+  set_fact:
+    _notify_informational: >-
+      {{ (preval_mail_to if (_notify_event == 'prevalidation' and (preval_mail_to | default([]) | length > 0))
+          else (postval_mail_to if (_notify_event == 'postvalidation' and (postval_mail_to | default([]) | length > 0))
+          else (dry_run_mail_to if (_notify_event == 'summary' and (run_mode | default('') is search('dry-run|pre-check')) and (dry_run_mail_to | default([]) | length > 0))
+          else (mail_to | default([]))))) }}
+    _notify_enabled: >-
+      {{ true if _notify_event == 'alert'
+         else ((send_prevalidation_email | default(true) | bool) if _notify_event == 'prevalidation'
+         else ((send_postvalidation_email | default(true) | bool) if _notify_event == 'postvalidation'
+         else ((send_heartbeat_email | default(true) | bool) if _notify_event == 'heartbeat'
+         else ((send_degradation_alerts | default(true) | bool) if _notify_event == 'degradation'
+         else (send_summary_email | default(true) | bool))))) }}
+
+- name: "notify: Compute final recipient list"
+  set_fact:
+    _notify_recipients: >-
+      {{ (((alert_mail_to | default([])) + (_notify_cli if (_notify_cli | length > 0) else (mail_to | default([])))) | unique | list)
+         if (_notify_event in ['alert', 'degradation'])
+         else ((_notify_cli if (_notify_cli | length > 0) else _notify_informational) | unique | list) }}
+
+- name: "notify: Check which requested attachments exist on disk"
+  stat:
+    path: "{{ item }}"
+  loop: "{{ notify_attachments_requested | default([]) | select('string') | select() | unique | list }}"
+  register: _notify_attachment_stats
+  when: _notify_enabled | bool
+
+- name: "notify: Prepare email envelope"
+  set_fact:
+    notify_to: "{{ _notify_recipients }}"
+    notify_subject: "{{ mail_subject_prefix | default('[ARO Upgrade]') }}[{{ cluster_name | default('cluster') }}][{{ _notify_tag }}] {{ notify_headline | default('') }} (run {{ run_timestamp | default('n/a') }})"
+    notify_template: >-
+      {{ 'error-report.j2' if _notify_event == 'alert'
+         else ('progress-mail.j2' if _notify_event in ['heartbeat', 'degradation'] else 'email-summary.j2') }}
+    notify_attachments: >-
+      {{ _notify_attachment_stats.results | default([])
+         | selectattr('stat', 'defined')
+         | selectattr('stat.exists', 'defined')
+         | selectattr('stat.exists')
+         | map(attribute='item') | list }}
+  when: _notify_enabled | bool
+
+- name: "notify: Dispatch via sendmail role"
+  include_role:
+    name: sendmail
+  when: _notify_enabled | bool
+
+- name: "notify: Skip notification type disabled in vars/smtp.yml"
+  debug:
+    msg: "Notification type '{{ _notify_event }}' is disabled in vars/smtp.yml; not sent."
+  when: not (_notify_enabled | bool)
+
+# Why: sendmail resets these after a dispatch; do the same when nothing was sent
+#      so a disabled notification cannot leak its inputs into the next one.
+- name: "notify: Reset notification inputs for a disabled notification type"
+  set_fact:
+    notify_event: ""
+    notify_event_tag: ""
+    notify_headline: ""
+    notify_attachments_requested: []
+  when: not (_notify_enabled | bool)

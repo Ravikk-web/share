@@ -1,0 +1,77 @@
+---
+# ============================================================================
+# Task Include: send_run_summary.yml — Single Closing Summary Mail
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Purpose: Sends the one closing summary mail of a successful run (full upgrade,
+#          dry-run, pre-check, partial run or isolated phase) with every report and
+#          log produced by this run attached. Failed runs end with the failure
+#          alert from roles/error_handle instead.
+# Inputs (optional facts):
+#          run_summary_title, run_summary_intro, run_summary_tag (subject tag),
+#          run_summary_event (default 'summary'; 'prevalidation' / 'postvalidation'
+#          for standalone Phase 02 / 05 runs), run_summary_checks (list)
+# Role / Playbook Dependencies: tasks/notify.yml, templates/email-summary.j2
+# Gate Type: N/A (notification; never fails the run)
+# Outputs: One summary email, notification_ledger entry
+# ============================================================================
+
+- name: "Run summary: Resolve report and log files produced by this run"
+  set_fact:
+    _summary_files:
+      - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+      - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_prevalidation_{{ run_timestamp }}.html"
+      - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_postvalidation_{{ run_timestamp }}.html"
+      - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_operators_{{ run_timestamp }}.html"
+      - "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+      - "{{ log_dir | default(playbook_dir ~ '/logs') }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+
+- name: "Run summary: Derive verdict, title and subject tag"
+  set_fact:
+    _summary_verdict: >-
+      {{ 'FAIL' if (run_phase_results | default([]) | selectattr('status', 'equalto', 'FAIL') | list | length > 0)
+         else ('WARN' if (run_phase_results | default([]) | selectattr('status', 'equalto', 'WARN') | list | length > 0)
+         else ('AUTO-FIXED' if (run_phase_results | default([]) | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length > 0)
+         else 'PASS')) }}
+    _summary_tag: >-
+      {{ run_summary_tag
+         if (run_summary_tag | default('') | length > 0)
+         else ({'full-upgrade': 'COMPLETE', 'dry-run': 'DRY-RUN', 'pre-check': 'PRE-CHECK', 'post-check': 'POSTVALIDATION'}[run_mode | default('full-upgrade')]
+               | default((run_mode | default('run') | upper | regex_replace('^PARTIAL.*$', 'PARTIAL-RUN')), true)) }}
+    _summary_title: >-
+      {{ run_summary_title
+         if (run_summary_title | default('') | length > 0)
+         else ({'full-upgrade': 'Upgrade Complete', 'dry-run': 'Dry Run Summary', 'pre-check': 'Pre-check Summary', 'post-check': 'Post-check Summary'}[run_mode | default('full-upgrade')]
+               | default('Run Summary (' ~ (run_mode | default('run')) ~ ')', true)) }}
+
+- name: "Run summary: Prepare summary mail"
+  set_fact:
+    summary_title: "{{ _summary_title }}"
+    summary_verdict: "{{ _summary_verdict }}"
+    summary_intro: >-
+      {{ run_summary_intro
+         if (run_summary_intro | default('') | length > 0)
+         else ('Run finished ' ~ ('with warnings.' if _summary_verdict == 'WARN' else 'successfully.')
+               ~ (' No cluster changes were made.' if (run_mode | default('') is search('dry-run')) else '')) }}
+    summary_checks: "{{ run_summary_checks | default([]) }}"
+    notify_event: "{{ run_summary_event | default('summary', true) }}"
+    notify_event_tag: "{{ _summary_tag }}"
+    # Why: ASCII only in subjects; some relays mangle unencoded UTF-8 headers.
+    notify_headline: "{{ _summary_title }} - {{ _summary_verdict }}"
+    notify_attachments_requested: "{{ _summary_files }}"
+
+- name: "Run summary: Dispatch closing summary mail"
+  include_tasks: "{{ playbook_dir }}/tasks/notify.yml"
+
+# Why: these inputs are facts; clear them so a later summary in the same run
+#      (e.g. an intercept after a standalone phase) never reuses them.
+- name: "Run summary: Reset summary inputs"
+  set_fact:
+    run_summary_title: ""
+    run_summary_intro: ""
+    run_summary_tag: ""
+    run_summary_event: ""
+    run_summary_checks: []
+    summary_checks: []

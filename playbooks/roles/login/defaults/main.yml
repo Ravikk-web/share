@@ -1,0 +1,47 @@
+---
+# ============================================================================
+# Role Defaults: login
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default configuration parameters for the login role, which authenticates
+#          the automation account (NPID) into a dedicated kubeconfig and verifies
+#          the session reached the configured cluster.
+# Role / Playbook Dependencies: vars/api_regex.yml, vars/secrets.yml, vars/paths.yml, vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by login tasks
+# ============================================================================
+
+# Target ARO cluster name (string, mandatory)
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: ""
+
+# Scoped kubeconfig path for the session (string, default: path under playbook_dir)
+# Sourced from vars/paths.yml; never ~/.kube/config
+kubeconfig_path: "{{ playbook_dir }}/.kubeconfig-{{ cluster_name | default('default') }}"
+cluster_kubeconfig: "{{ playbook_dir }}/.kubeconfig-{{ cluster_name | default('default') }}"
+
+# Regular expression pattern the connected API URL must also match (string)
+# Sourced from vars/api_regex.yml or role defaults
+desired_cluster_api_regex: '^https://api\.[a-zA-Z0-9.-]+:6443/?$'
+
+# Bypass TLS certificate verification when connecting to the API (boolean, default: true)
+# Sourced from vars/upgrade.yml
+insecure_skip_tls_verify: true
+
+# Feed the password to `oc login` on stdin instead of --password (boolean, default: true)
+# Sourced from vars/upgrade.yml; false only if the identity provider does not accept it
+login_password_via_stdin: true
+
+# OpenShift CLI binary executable command or path (string, default: "oc")
+# Sourced from vars/paths.yml
+oc_binary: "oc"
+
+# Retries for connection errors during login (integer, default: 3); a rejected
+# password is never retried. Sourced from vars/upgrade.yml
+oc_command_retries: 3
+
+# Delay in seconds between login retries (integer, default: 10)
+# Sourced from vars/upgrade.yml
+oc_command_retry_delay: 10

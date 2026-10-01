@@ -1,0 +1,21 @@
+# Temporary Office lock files
+~$*
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Session kubeconfigs contain live bearer tokens — never commit them
+playbooks/.kubeconfig-*
+
+# Generated run artifacts (logs, status files, HTML reports, baseline snapshots)
+playbooks/logs/*
+!playbooks/logs/.gitkeep
+playbooks/output/*
+!playbooks/output/.gitkeep
+playbooks/snapshots/*
+!playbooks/snapshots/.gitkeep
+
+# Ansible retry files
+*.retry

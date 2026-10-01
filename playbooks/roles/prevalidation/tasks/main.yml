@@ -1,0 +1,368 @@
+---
+# ============================================================================
+# Role Tasks: prevalidation (15-Check Prevalidation Aggregator)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses include_role / include_tasks and short module names.
+#                 Never uses bare include:. Compatible across 2.7 and 2.14.
+#
+# Purpose: Runs the 15-check prevalidation contract (read-only) and fills
+#          health_summary with one record per check {num, name, gate, status,
+#          observed}. Individual role gates are suppressed during the scan so all 15
+#          checks always run; 02_Pre_upgrade_check.yaml evaluates the HARD gate,
+#          runs auto-remediation, and re-runs this scan to confirm any fix.
+# Why (changes): Check 07 evaluates admin-acks and removed-API usage for every
+#          minor hop in the path; Check 14 evaluates the HIGHEST hop and parses
+#          versions with split('.') (regex backreferences inside YAML-quoted Jinja
+#          are decoded as control characters and returned minor 0, so the old check
+#          never required cgroup v2); Check 15 uses each operator's declared
+#          olm.maxOpenShiftVersion and OLM's own Upgradeable condition.
+# Role / Playbook Dependencies: roles/co, node, mcp, api_check, api_readiness, etcd,
+#               utilization, pv, pvc, pdb, operator_compat, api_usage,
+#               roles/remediate/tasks/admin_acks.yml (evaluate mode)
+# Gate Type: HARD / WARN (aggregated health contract scan)
+# Outputs: health_summary (Checks 01-15), preval_max_target_version
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 0. Initialize Scan Context & Suppress Individual Role Gates
+# ----------------------------------------------------------------------------
+- name: "Initialize prevalidation health summary and suppress per-role gates for the scan"
+  set_fact:
+    health_summary: []
+    co_enforce_gate: false
+    node_enforce_gate: false
+    mcp_enforce_gate: false
+    api_check_enforce_gate: false
+    api_readiness_enforce_gate: false
+    etcd_enforce_gate: false
+    utilization_enforce_gate: false
+    pdb_enforce_gate: false
+    pv_enforce_gate: false
+    pvc_enforce_gate: false
+    # Why: the highest hop decides requirements that apply anywhere on the path
+    #      (cgroup v2 for 4.19+, operator compatibility, API removals).
+    preval_max_target_version: >-
+      {%- set best = [] -%}
+      {%- for v in upgrade_path | default([]) -%}
+        {%- if (v | string) is match('^[0-9]+[.][0-9]+[.][0-9]+$') and ((best | length == 0) or ((v | string) is version(best[-1], '>'))) -%}
+          {%- set _ = best.append(v | string) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ best[-1] if (best | length > 0) else '' }}
+
+- name: "Display 15-Check Prevalidation Contract initiation banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "PREVALIDATION CONTRACT: EXECUTING 15-CHECK SYSTEM SCAN"
+      - "============================================================================"
+      - "Target Cluster   : {{ cluster_name }}"
+      - "Upgrade Path     : {{ upgrade_path | default([]) | join(' -> ') }}"
+      - "Highest Target   : {{ preval_max_target_version | default('n/a', true) }}"
+      - "Scan Mode        : Comprehensive (all 15 checks run before the gate)"
+      - "============================================================================"
+
+# ----------------------------------------------------------------------------
+# Check 01: ClusterOperators Health (co role)             Gate: HARD
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 01/15: Execute ClusterOperators health evaluation"
+  include_role:
+    name: co
+
+# ----------------------------------------------------------------------------
+# Check 02: Node Readiness & Pressures (node role)        Gate: HARD
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 02/15: Execute Node readiness and condition evaluation"
+  include_role:
+    name: node
+
+# ----------------------------------------------------------------------------
+# Check 03: MachineConfigPool Sync & Pause (mcp role)     Gate: HARD (auto-fixable: paused pools)
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 03/15: Execute MachineConfigPool synchronization evaluation"
+  include_role:
+    name: mcp
+
+# ----------------------------------------------------------------------------
+# Check 04: API Server Context (api_check role)            Gate: HARD
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 04/15: Execute API server context evaluation"
+  include_role:
+    name: api_check
+
+# ----------------------------------------------------------------------------
+# Check 05: API Server Readiness (api_readiness role)      Gate: HARD
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 05/15: Execute API server readiness (/readyz) evaluation"
+  include_role:
+    name: api_readiness
+
+# ----------------------------------------------------------------------------
+# Check 06: etcd Quorum & Health (etcd role)               Gate: HARD
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 06/15: Execute etcd control-plane quorum evaluation"
+  include_role:
+    name: etcd
+
+# ----------------------------------------------------------------------------
+# Check 07: Admin-Acks & Removed API Usage                 Gate: HARD
+# Rule: no workload calls an API removed by any minor hop in the path; pending
+#       admin-acks for the next minor are listed and applied automatically before
+#       that hop (roles/upgrade); Upgradeable=False for other reasons blocks a
+#       minor first hop.
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 07/15: Configure admin-ack evaluation for the whole path"
+  set_fact:
+    admin_ack_mode: "evaluate"
+    admin_ack_versions: "{{ upgrade_path | default([]) }}"
+
+- name: "Prevalidation Check 07/15: Evaluate admin-acks and removed-API usage"
+  include_tasks: "{{ playbook_dir }}/roles/remediate/tasks/admin_acks.yml"
+
+- name: "Prevalidation Check 07/15: Record Check 07 result to health_summary"
+  set_fact:
+    health_summary: >-
+      {{ (health_summary | default([])) + [{
+           'num': 7,
+           'name': 'Administrator Acknowledgement (Admin-Acks)',
+           'gate': 'HARD',
+           'status': admin_ack_check_status,
+           'observed': (admin_ack_check_observed | regex_replace('[ \t\r\n]+', ' ') | trim)
+         }] }}
+
+# ----------------------------------------------------------------------------
+# Check 08: Node Request Capacity Headroom (utilization)   Gate: HARD
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 08/15: Execute Node capacity headroom evaluation"
+  include_role:
+    name: utilization
+
+# ----------------------------------------------------------------------------
+# Check 09: Pending Node CSRs                              Gate: WARN
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 09/15: Query live CertificateSigningRequests via jq v1.5"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get csr -o json | jq -c '
+      [ (.items // [])[] | select((((.status.conditions // []) | length) == 0)) | .metadata.name ]
+    '
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: preval_pending_csrs_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: preval_pending_csrs_raw.rc == 0
+
+- name: "Prevalidation Check 09/15: Record CSR result to health_summary"
+  set_fact:
+    preval_pending_csr_list: "{{ preval_pending_csrs_raw.stdout | from_json }}"
+    health_summary: >-
+      {{ (health_summary | default([])) + [{
+           'num': 9,
+           'name': 'Pending Node Certificate Signing Requests (CSRs)',
+           'gate': 'WARN',
+           'status': ('PASS' if ((preval_pending_csrs_raw.stdout | from_json | length) == 0) else 'WARN'),
+           'observed': ('No pending certificate signing requests (0 pending)'
+                        if ((preval_pending_csrs_raw.stdout | from_json | length) == 0)
+                        else ('Pending CSRs waiting for approval (' ~ (preval_pending_csrs_raw.stdout | from_json | length) ~ '): '
+                              ~ (preval_pending_csrs_raw.stdout | from_json | join(', '))))
+         }] }}
+
+# ----------------------------------------------------------------------------
+# Check 10: PersistentVolume Health (pv role)              Gate: WARN
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 10/15: Execute PersistentVolumes status evaluation"
+  include_role:
+    name: pv
+
+# ----------------------------------------------------------------------------
+# Check 11: PersistentVolumeClaim Health (pvc role)        Gate: WARN
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 11/15: Execute PersistentVolumeClaims status evaluation"
+  include_role:
+    name: pvc
+
+# ----------------------------------------------------------------------------
+# Check 12: PodDisruptionBudgets Headroom (pdb role)        Gate: WARN (configurable)
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 12/15: Execute PodDisruptionBudgets deadlock evaluation"
+  include_role:
+    name: pdb
+
+# ----------------------------------------------------------------------------
+# Check 13: Critical Namespace Pod Health                  Gate: WARN
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 13/15: Query critical platform pods in core namespaces via jq v1.5"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get pods -A -o json | jq -c '
+      [ (.items // [])[]
+        | select((.metadata.namespace // "") | startswith("openshift-"))
+        | select(
+            ((.status.containerStatuses // []) | any(
+              ((.state.waiting.reason // "") == "CrashLoopBackOff") or
+              ((.state.waiting.reason // "") == "ImagePullBackOff") or
+              ((.state.waiting.reason // "") == "ErrImagePull") or
+              ((.state.waiting.reason // "") == "CreateContainerConfigError") or
+              ((.state.waiting.reason // "") == "Error")
+            )) or
+            ((.status.phase // "") == "Failed")
+          )
+        | "\(.metadata.namespace)/\(.metadata.name)"
+      ]
+    '
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: preval_unhealthy_pods_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: preval_unhealthy_pods_raw.rc == 0
+
+- name: "Prevalidation Check 13/15: Record critical pods result to health_summary"
+  set_fact:
+    preval_unhealthy_pod_list: "{{ preval_unhealthy_pods_raw.stdout | from_json }}"
+    health_summary: >-
+      {{ (health_summary | default([])) + [{
+           'num': 13,
+           'name': 'Critical Namespace Pod Health',
+           'gate': 'WARN',
+           'status': ('PASS' if ((preval_unhealthy_pods_raw.stdout | from_json | length) == 0) else 'WARN'),
+           'observed': ('All critical namespace pods running healthy (0 CrashLoopBackOff/Error)'
+                        if ((preval_unhealthy_pods_raw.stdout | from_json | length) == 0)
+                        else ('Unhealthy pods detected in core namespaces (' ~ (preval_unhealthy_pods_raw.stdout | from_json | length) ~ '): '
+                              ~ (preval_unhealthy_pods_raw.stdout | from_json | join(', '))))
+         }] }}
+
+# ----------------------------------------------------------------------------
+# Check 14: CGroup Mode Compatibility                      Gate: HARD (auto-fixable)
+# Rule: when any hop is OpenShift 4.19 or later, nodes.config/cluster must be v2.
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 14/15: Query live nodes.config/cluster for cgroupMode"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "") | tostring'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: preval_cgroup_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: preval_cgroup_raw.rc == 0
+  when: not (skip_cgroup_check | default(false) | bool)
+
+# Why: split('.') parsing (see header). An empty cgroupMode means the cluster uses its
+#      historical default, which is v1 on clusters upgraded from before 4.14.
+- name: "Prevalidation Check 14/15: Evaluate cgroup v2 requirement for the highest hop"
+  set_fact:
+    preval_target_requires_cgroup_v2: >-
+      {%- set p = (preval_max_target_version | default('') | string).split('.') -%}
+      {{ (p | length >= 2) and (((p[0] | int) > 4) or (((p[0] | int) == 4) and ((p[1] | int) >= 19))) }}
+    preval_detected_cgroup_mode: >-
+      {{ (preval_cgroup_raw.stdout | default('') | trim)
+         if (preval_cgroup_raw.stdout | default('') | trim | length > 0) else 'v1' }}
+    preval_cgroup_mode_explicit: "{{ preval_cgroup_raw.stdout | default('') | trim | length > 0 }}"
+
+- name: "Prevalidation Check 14/15: Derive cgroup verdict"
+  set_fact:
+    _cg_skip: "{{ skip_cgroup_check | default(false) | bool }}"
+    _cg_status: >-
+      {%- if (skip_cgroup_check | default(false) | bool) -%}
+        {{ 'WARN' if (preval_target_requires_cgroup_v2 | bool) else 'PASS' }}
+      {%- elif not (preval_target_requires_cgroup_v2 | bool) or (preval_detected_cgroup_mode == 'v2') -%}
+        PASS
+      {%- else -%}
+        FAIL
+      {%- endif -%}
+    _cg_observed: >-
+      {%- if (skip_cgroup_check | default(false) | bool) -%}
+        CGroup check skipped via skip_cgroup_check{{ (' although the path reaches ' ~ preval_max_target_version ~ ' (4.19+ requires cgroup v2)') if (preval_target_requires_cgroup_v2 | bool) else '' }}
+      {%- else -%}
+        Cluster cgroupMode is {{ preval_detected_cgroup_mode }}{{ '' if (preval_cgroup_mode_explicit | bool) else ' (not set; historical default)' }}
+        {%- if not (preval_target_requires_cgroup_v2 | bool) -%}
+          ; v2 is not required for the highest target {{ preval_max_target_version }}
+        {%- elif preval_detected_cgroup_mode == 'v2' -%}
+          ; highest target {{ preval_max_target_version }} requires v2 (satisfied)
+        {%- elif (auto_fix_cgroup_v2 | default(true) | bool) and (auto_remediation_enabled | default(true) | bool) -%}
+          ; highest target {{ preval_max_target_version }} requires v2 (auto-fixable: nodes reboot before the first hop)
+        {%- else -%}
+          ; highest target {{ preval_max_target_version }} requires v2 (auto-fix disabled; migrate to cgroup v2 before upgrading)
+        {%- endif -%}
+      {%- endif -%}
+
+- name: "Prevalidation Check 14/15: Record cgroup result to health_summary"
+  set_fact:
+    health_summary: >-
+      {{ (health_summary | default([])) + [{
+           'num': 14,
+           'name': 'CGroup Mode Compatibility',
+           'gate': 'HARD',
+           'status': (_cg_status | trim),
+           'observed': (_cg_observed | trim)
+         }] }}
+
+# ----------------------------------------------------------------------------
+# Check 15: OLM Operator Upgrade Compatibility (operator_compat)   Gate: HARD
+# Rule: no installed operator declares an olm.maxOpenShiftVersion below the
+#       highest target, and OLM does not report Upgradeable=False.
+# ----------------------------------------------------------------------------
+- name: "Prevalidation Check 15/15: Configure operator compatibility target"
+  set_fact:
+    operator_compat_target_version: "{{ preval_max_target_version }}"
+
+- name: "Prevalidation Check 15/15: Execute OLM operator compatibility evaluation"
+  include_role:
+    name: operator_compat
+
+- name: "Prevalidation Check 15/15: Record operator compatibility result to health_summary"
+  set_fact:
+    health_summary: >-
+      {{ (health_summary | default([])) + [{
+           'num': 15,
+           'name': 'OLM Operator Upgrade Compatibility',
+           'gate': 'HARD',
+           'status': operator_compat_status | default('PASS'),
+           'observed': operator_compat_observed | default('No OLM subscriptions installed on cluster')
+         }] }}
+
+# ----------------------------------------------------------------------------
+# 16. Scan Summary & Gate Restoration
+# ----------------------------------------------------------------------------
+# Why: the gate overrides above are host facts that persist for the rest of the
+#      run; restore the defaults so any later standalone use of these roles gates normally.
+- name: "Restore individual role gate settings after the scan"
+  set_fact:
+    co_enforce_gate: true
+    node_enforce_gate: true
+    mcp_enforce_gate: true
+    api_check_enforce_gate: true
+    api_readiness_enforce_gate: true
+    etcd_enforce_gate: true
+    utilization_enforce_gate: true
+    pdb_enforce_gate: true
+    pv_enforce_gate: false
+    pvc_enforce_gate: false
+
+- name: "Display Prevalidation 15-Check Contract completion summary"
+  debug:
+    msg:
+      - "============================================================================"
+      - "PREVALIDATION SCAN COMPLETE: {{ health_summary | length }} CHECKS EVALUATED"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name }}"
+      - "Highest Target       : {{ preval_max_target_version | default('n/a', true) }}"
+      - "Passed               : {{ health_summary | selectattr('status', 'equalto', 'PASS') | list | length }}"
+      - "Warnings             : {{ health_summary | selectattr('status', 'equalto', 'WARN') | list | length }}"
+      - "Failed               : {{ health_summary | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+      - "============================================================================"

@@ -1,0 +1,84 @@
+---
+# ============================================================================
+# Task File: scan_subscription.yml (roles/operator_compat)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names and set_fact; fully compatible.
+#
+# Purpose: Evaluates one OLM subscription: the installed CSV's declared
+#          olm.maxOpenShiftVersion against the target minor (FAIL when lower), and
+#          whether a channel matching the target minor is available (WARN hint).
+# Role / Playbook Dependencies: roles/operator_compat/tasks/main.yml facts
+#          (installed_csvs, target_ocp_minor)
+# Gate Type: Advisory record (verdict aggregated by main.yml)
+# Outputs: operator_compat_plan entry
+# ============================================================================
+
+# Why: PackageManifest lists the channels the catalog offers for this package.
+- name: "operator_compat: Query PackageManifest channels for {{ sub_item.name }}"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    (oc get packagemanifest {{ sub_item.package | quote }} -n {{ sub_item.source_namespace | default('openshift-marketplace') | quote }} -o json 2>/dev/null \
+      || oc get packagemanifest {{ sub_item.package | quote }} -o json 2>/dev/null \
+      || echo '{}') | jq -c '{ default_channel: (.status.defaultChannel // ""), channels: [ .status.channels[]?.name // empty ] }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: sub_pkg_channels_parsed_raw
+  changed_when: false
+  failed_when: false
+
+- name: "operator_compat: Evaluate compatibility of {{ sub_item.name }}"
+  set_fact:
+    _sub_pkg: >-
+      {{ (sub_pkg_channels_parsed_raw.stdout | from_json)
+         if (sub_pkg_channels_parsed_raw.rc | default(1) == 0 and (sub_pkg_channels_parsed_raw.stdout | default('') | trim | length > 0))
+         else {'default_channel': '', 'channels': []} }}
+    _sub_csv: >-
+      {{ (installed_csvs | default([])
+          | selectattr('namespace', 'equalto', sub_item.namespace)
+          | selectattr('name', 'equalto', sub_item.installed_csv) | list | first) | default({}, true) }}
+
+- name: "operator_compat: Determine target channel and verdict for {{ sub_item.name }}"
+  set_fact:
+    _sub_max_ocp: "{{ _sub_csv.max_ocp | default('') }}"
+    _sub_target_channel: >-
+      {%- set channels = _sub_pkg.channels | default([]) -%}
+      {%- set found = [] -%}
+      {%- if target_ocp_minor | default('') | length > 0 -%}
+        {%- for prefix in ['stable-', 'fast-', ''] -%}
+          {%- for c in channels -%}
+            {%- if (found | length == 0) and (c == prefix ~ target_ocp_minor) -%}{%- set _ = found.append(c) -%}{%- endif -%}
+          {%- endfor -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {{ found[0] if (found | length > 0) else (sub_item.channel | default('')) }}
+
+- name: "operator_compat: Append evaluation record for {{ sub_item.name }}"
+  set_fact:
+    operator_compat_plan: >-
+      {%- set incompatible = (_sub_max_ocp | length > 0) and (target_ocp_minor | default('') | length > 0) and ((_sub_max_ocp | string) is version(target_ocp_minor, '<')) -%}
+      {%- set switch = (_sub_target_channel | length > 0) and (_sub_target_channel != (sub_item.channel | default(''))) and (_sub_target_channel in (_sub_pkg.channels | default([]))) -%}
+      {{ operator_compat_plan | default([]) + [{
+           'subscription': sub_item.name,
+           'namespace': sub_item.namespace,
+           'package': sub_item.package,
+           'current_channel': sub_item.channel,
+           'target_channel': _sub_target_channel,
+           'channel_switch_recommended': switch,
+           'installed_csv': sub_item.installed_csv,
+           'csv_phase': _sub_csv.phase | default('Missing'),
+           'max_ocp': (_sub_max_ocp if (_sub_max_ocp | length > 0) else 'not declared'),
+           'installplan_approval': sub_item.approval,
+           'status': ('FAIL' if incompatible else ('WARN' if switch else 'PASS')),
+           'details': (('Declares olm.maxOpenShiftVersion ' ~ _sub_max_ocp ~ ', below target ' ~ target_ocp_minor ~ ': upgrade or remove this operator before the cluster upgrade')
+                       if incompatible
+                       else (('Channel ' ~ _sub_target_channel ~ ' matches target ' ~ target_ocp_minor ~ ' (current: ' ~ (sub_item.channel | default('none')) ~ ')')
+                             if switch else ('Channel ' ~ (sub_item.channel | default('default')) ~ ' is active; no maximum OpenShift version conflict')))
+         }] }}
+
+- name: "operator_compat: Log subscription compatibility finding"
+  debug:
+    msg: "{{ sub_item.namespace }}/{{ sub_item.name }}: channel {{ sub_item.channel }}, max OpenShift {{ _sub_max_ocp | default('', true) or 'not declared' }} -> {{ (operator_compat_plan | last).status }}"

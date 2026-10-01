@@ -1,0 +1,261 @@
+---
+# ============================================================================
+# Phase 06 Playbook: Operator Upgrades, Developer Perspective & Closeout
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses play-level vars_files, include_role / include_tasks and
+#                 block/rescue/always; compatible across Ansible 2.7 and 2.14.
+#
+# Purpose: After the cluster upgrade:
+#          1. Operator compatibility with the version the cluster is now on (report).
+#          2. Approves the current InstallPlan of each subscription with a pending
+#             upgrade (status.installPlanRef) and waits for those CSVs (roles/operator_upgrade).
+#          3. Judges operator health: approved upgrades and regressions are HARD,
+#             pre-existing problems and unapproved plans are WARN (roles/operator_validate).
+#          4. Enables the web console Developer perspective when it is Disabled
+#             (roles/console; WARN on failure, never fails the finished upgrade).
+#          5. Writes the operators report.
+# Modes:   live run  — as above; the run's closing summary is sent by main.yml.
+#          dry run   — only when this phase is run on its own (--phase 06 --dry-run or
+#                      --skip-to-phase 06): read-only, nothing is approved or changed.
+#          standalone — sends its own closing mail.
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               roles/login, roles/logout, roles/operator_compat, roles/operator_upgrade,
+#               roles/operator_validate, roles/console, roles/report, roles/error_handle,
+#               tasks/log_event.yml, tasks/send_run_summary.yml
+# Gate Type: HARD (approved operator not Succeeded, or a regression; exit code 35)
+# Outputs: output/<cluster>_operators_<ts>.html, operator_summary_text,
+#          developer_perspective_status, run_phase_results entry
+# ============================================================================
+
+- name: "Phase 06 — Operator Upgrades & Closeout"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+
+  tasks:
+    - name: "Phase 06: Operator upgrades, Developer perspective and closeout"
+      when:
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 6
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 6
+        # Why: a full dry run never reaches Phase 06; it is read-only when run on its own.
+        - (not (dry_run | default(false) | bool)) or (standalone_phase | default(false) | bool) or ((skip_to_phase | default(0) | int) == 6)
+      block:
+        - name: "Phase 06: Initialize phase context"
+          set_fact:
+            phase06_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"
+            phase_06_failed: false
+            p06_report_file: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_operators_{{ run_timestamp }}.html"
+            approved_installplans: []
+            skipped_installplans: []
+            operator_csv_baseline: []
+
+        - name: "Phase 06: Log in (standalone run or no active session)"
+          include_role:
+            name: login
+          when: not (cluster_session_active | default(false) | bool)
+
+        - name: "Phase 06: Display initiation banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 06: OPERATOR UPGRADES & CLOSEOUT {{ '(DRY RUN - READ-ONLY)' if (dry_run | default(false) | bool) else '' }}"
+              - "============================================================================"
+              - "Cluster              : {{ cluster_name }}"
+              - "Cluster Version      : {{ run_final_version | default('current') }}"
+              - "InstallPlan Approval : {{ 'skipped (skip_operator_upgrade)' if (skip_operator_upgrade | default(false) | bool) else ('plan only' if (dry_run | default(false) | bool) else 'current plan per pending subscription') }}"
+              - "Developer Perspective: {{ 'report only' if (dry_run | default(false) | bool) else ('enable if Disabled' if (enable_developer_perspective | default(true) | bool) else 'report only (disabled in config)') }}"
+              - "============================================================================"
+
+        # --------------------------------------------------------------------
+        # 1. Compatibility with the version the cluster is on (report only)
+        # --------------------------------------------------------------------
+        # Why: set_fact, not include vars — Prevalidation Check 15 already set these as
+        #      facts, and facts take precedence over task vars.
+        - name: "Phase 06: Target the compatibility scan at the version the cluster is on"
+          set_fact:
+            operator_compat_target_version: "{{ run_final_version | default('current', true) }}"
+            operator_compat_enforce_gate: false
+
+        - name: "Phase 06: Scan operator compatibility with the current version"
+          include_role:
+            name: operator_compat
+
+        # --------------------------------------------------------------------
+        # 2. Approvals and rollout
+        # --------------------------------------------------------------------
+        - name: "Phase 06: Approve pending operator upgrades"
+          include_role:
+            name: operator_upgrade
+          when: not (skip_operator_upgrade | default(false) | bool)
+
+        # --------------------------------------------------------------------
+        # 3. Operator health
+        # --------------------------------------------------------------------
+        - name: "Phase 06: Validate operator health"
+          include_role:
+            name: operator_validate
+
+        # --------------------------------------------------------------------
+        # 4. Web console Developer perspective (never fails the phase)
+        # --------------------------------------------------------------------
+        - name: "Phase 06: Developer perspective"
+          block:
+            - name: "Phase 06: Ensure the Developer perspective is enabled"
+              include_role:
+                name: console
+          rescue:
+            - name: "Phase 06: Record that the Developer perspective step could not run"
+              set_fact:
+                developer_perspective_state: "WARN"
+                developer_perspective_changed: false
+                developer_perspective_status: "Not checked: {{ ansible_failed_result.msg | default('console query failed') | truncate(200) }}"
+
+        # --------------------------------------------------------------------
+        # 5. Report and gate
+        # --------------------------------------------------------------------
+        - name: "Phase 06: Assemble the report checks"
+          set_fact:
+            p06_checks: >-
+              {{ operator_health_checks
+                 + [{'num': 5, 'name': 'Operator compatibility with ' ~ (run_final_version | default('the current version', true)),
+                     'gate': 'WARN', 'status': ('WARN' if operator_compat_status == 'FAIL' else operator_compat_status),
+                     'observed': operator_compat_observed},
+                    {'num': 6, 'name': 'Web console Developer perspective', 'gate': 'WARN',
+                     'status': developer_perspective_state, 'observed': developer_perspective_status}] }}
+
+        - name: "Phase 06: Configure the operators report"
+          set_fact:
+            report_type: "operators"
+            report_title: "OLM Operator Validation Report{{ ' (dry run)' if (dry_run | default(false) | bool) else '' }}"
+            report_template: "health-overview.j2"
+            checks: "{{ p06_checks }}"
+            autofix_items: >-
+              {{ ([{'name': 'Developer perspective', 'action': developer_perspective_status,
+                    'reference': 'https://docs.openshift.com/container-platform/latest/web_console/customizing-the-web-console.html'}]
+                  if (developer_perspective_changed | default(false) | bool) else [])
+                 + ([{'name': 'Operator restart', 'action': 'Restarted the operator Deployments of ' ~ (recovered_csvs | join(', ')),
+                      'reference': 'https://docs.openshift.com/container-platform/latest/operators/admin/olm-status.html'}]
+                    if (recovered_csvs | default([]) | length > 0) else []) }}
+            output_file: "{{ p06_report_file }}"
+
+        - name: "Phase 06: Write the operators report"
+          include_role:
+            name: report
+
+        - name: "Phase 06: HARD gate — approved operators must be healthy, no regressions"
+          fail:
+            msg: >-
+              [HARD GATE FAILURE] Phase 06 on '{{ cluster_name }}':
+              {% for c in operator_health_checks | selectattr('status', 'equalto', 'FAIL') | list %}{{ c.name }}: {{ c.observed }}{% if not loop.last %} | {% endif %}{% endfor %}.
+              The cluster upgrade itself is complete; only the operator step needs attention.
+          when:
+            - not (dry_run | default(false) | bool)
+            - operator_validate_status == 'FAIL'
+
+        - name: "Phase 06: Record the phase result"
+          set_fact:
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{
+                   'phase': '06',
+                   'name': 'Operators and closeout' ~ (' (dry run)' if (dry_run | default(false) | bool) else ''),
+                   'status': ('WARN' if (p06_checks | selectattr('status', 'equalto', 'WARN') | list | length > 0)
+                              else ('AUTO-FIXED' if (developer_perspective_changed | default(false) | bool) else 'PASS')),
+                   'detail': operator_summary_text ~ '; Developer perspective: ' ~ developer_perspective_status
+                 }] }}
+
+        - name: "Phase 06: Log the phase result"
+          include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+          vars:
+            event_status: "{{ run_phase_results[-1].status }}"
+            event_gate: "HARD"
+            event_task: "Phase 06 Operators and closeout"
+            event_reason: "{{ run_phase_results[-1].detail }}"
+            event_observed: "Report: {{ p06_report_file }}"
+
+        - name: "Phase 06: Display completion banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 06 COMPLETE: {{ run_phase_results[-1].status }}"
+              - "============================================================================"
+              - "Operators            : {{ operator_summary_text }}"
+              - "Developer Perspective: {{ developer_perspective_status }}"
+              - "Report               : {{ p06_report_file }}"
+              - "============================================================================"
+
+        - name: "Phase 06: Prepare the closing mail (standalone run)"
+          set_fact:
+            run_summary_title: "{{ 'Operator Closeout Plan (dry run)' if (dry_run | default(false) | bool) else 'Operator Closeout Report' }}"
+            run_summary_tag: "PHASE-06"
+            run_summary_intro: "{{ operator_summary_text }}. Developer perspective: {{ developer_perspective_status }}."
+            run_summary_checks: "{{ p06_checks }}"
+          when: standalone_phase | default(false) | bool
+
+        - name: "Phase 06: Send the closing mail (standalone run)"
+          include_tasks: "{{ playbook_dir }}/tasks/send_run_summary.yml"
+          when: standalone_phase | default(false) | bool
+
+        - name: "Phase 06: End the session (standalone run)"
+          include_role:
+            name: logout
+          when: standalone_phase | default(false) | bool
+
+      # ----------------------------------------------------------------------
+      # Rescue: report, one alert (exit 35), clean logout
+      # ----------------------------------------------------------------------
+      rescue:
+        - name: "Phase 06: Resolve the error for this failure"
+          set_fact:
+            phase_06_failed: true
+            resolved_error: >-
+              {{ (ansible_failed_result.stderr | default('') | string | trim)
+                 or (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 or (ansible_failed_result.msg | default('') | string | trim)
+                 or 'Unknown error - inspect the run log' }}
+
+        - name: "Phase 06: Set failure context for the alert"
+          set_fact:
+            current_step_no: "Phase 06"
+            current_task_name: "Phase 06 Operators and closeout"
+            current_gate_type: "HARD"
+            failure_reason: >-
+              {{ 'Operator validation failed after the cluster upgrade'
+                 if (operator_validate_status | default('') == 'FAIL') else 'Phase 06 stopped on an error' }}
+            failure_observed: "{{ resolved_error }}"
+            phase_exit_code: 35
+            failure_attachments:
+              - "{{ p06_report_file | default('') }}"
+              - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_postvalidation_{{ run_timestamp }}.html"
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{'phase': '06', 'name': 'Operators and closeout', 'status': 'FAIL',
+                   'detail': (resolved_error | regex_replace('[\r\n]+', ' ') | truncate(200))}] }}
+
+        - name: "Phase 06: Record the failure and send the alert"
+          include_role:
+            name: error_handle
+
+        - name: "Phase 06: End the session after the failure"
+          include_role:
+            name: logout
+
+        - name: "Phase 06: Stop the run"
+          fail:
+            msg: "Phase 06 failed: {{ resolved_error | truncate(1000) }}"
+
+      always:
+        - name: "Phase 06: Guarantee logout after a failure"
+          include_role:
+            name: logout
+          when:
+            - phase_06_failed | default(false) | bool
+            - cluster_session_active | default(false) | bool

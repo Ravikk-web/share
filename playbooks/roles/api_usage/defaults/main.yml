@@ -1,0 +1,28 @@
+---
+# ============================================================================
+# Role Defaults: api_usage
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default parameters for the read-only removed-API usage check.
+# Role / Playbook Dependencies: vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by api_usage tasks
+# ============================================================================
+
+# Kubernetes minor releases whose API removals are checked (list of strings, e.g. ["1.29"])
+# Set by the caller: Phase 02 (every minor hop in the path) or the upgrade role (one hop)
+api_usage_releases: []
+
+# Master switch for the check (boolean, default: true)
+# Sourced from vars/upgrade.yml
+api_usage_check_enabled: true
+
+# Users whose calls are ignored (list of strings). Red Hat documents these as safe
+# to ignore because they walk every registered API. Sourced from vars/upgrade.yml
+api_usage_ignore_users:
+  - "system:serviceaccount:kube-system:generic-garbage-collector"
+  - "system:serviceaccount:kube-system:namespace-controller"
+  - "system:kube-controller-manager"
+  - "system:cluster-policy-controller"

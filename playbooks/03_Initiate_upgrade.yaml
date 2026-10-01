@@ -1,0 +1,226 @@
+---
+# ============================================================================
+# Phase 03 Playbook: Sequential Upgrade Hops (with Phase 04 monitoring per hop)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses play-level vars_files, include_tasks with loop / index_var,
+#                 include_role and block/rescue/always; compatible with 2.7 and 2.14.
+#
+# Purpose: Runs every hop of upgrade_path in order through tasks/hop.yml (plan from
+#          the live cluster -> stable-cluster wait -> channel, offered edge, admin-ack,
+#          trigger -> monitor to the settle gate). Hops the cluster already completed
+#          are skipped and an update already running to the next hop is resumed, so a
+#          re-run with --resume continues where the last run stopped.
+#          In a dry run nothing is changed: the plan for each hop is printed instead.
+# Mails:   none on success (heartbeats / degradation alerts come from the monitor);
+#          one alert on failure; a standalone Phase 03 run ends with one summary.
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               tasks/hop.yml, tasks/validate_upgrade_path.yml, roles/login,
+#               roles/logout, roles/error_handle, tasks/log_event.yml,
+#               tasks/send_run_summary.yml
+# Gate Type: HARD (exit 20 hop failure, 30 timeout / no progress)
+# Outputs: hop_results, run_final_version, run_phase_results entry
+# ============================================================================
+
+- name: "Phase 03 — Sequential Upgrade Hops"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+
+  tasks:
+    - name: "Phase 03: Upgrade hops"
+      when:
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 3
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 3
+      block:
+        - name: "Phase 03: Initialize phase context"
+          set_fact:
+            phase03_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"
+            phase_03_failed: false
+            hop_results: "{{ hop_results | default([]) }}"
+
+        - name: "Phase 03: Log in (standalone run or no active session)"
+          include_role:
+            name: login
+          when: not (cluster_session_active | default(false) | bool)
+
+        # Why: when Phase 01 did not run in this invocation (--skip-to-phase 03,
+        #      --phase 03) the path is validated here, read-only, before any hop.
+        - name: "Phase 03: Validate the upgrade path (Phase 01 did not run)"
+          include_tasks: "{{ playbook_dir }}/tasks/validate_upgrade_path.yml"
+          when: path_validation_status is not defined
+
+        - name: "Phase 03: Stop — the upgrade path is not valid"
+          fail:
+            msg: >-
+              [HARD GATE FAILURE] Upgrade path {{ path_current_version }} -> {{ upgrade_path | join(' -> ') }} is not valid:
+              {{ (path_validation_problems | default([])) | join('; ') }}
+              {%- for r in path_validation | selectattr('status', 'equalto', 'FAIL') | list %} {{ r['from'] }} -> {{ r.to }}: {{ r.detail }}{% if not loop.last %};{% endif %}{% endfor %}.
+              No hop was started.
+          when: path_validation_status == 'FAIL'
+
+        - name: "Phase 03: Record the version the run starts from"
+          set_fact:
+            run_start_version: "{{ run_start_version | default(path_current_version, true) }}"
+
+        - name: "Phase 03: Display initiation banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 03: UPGRADE {{ '(DRY RUN - PLAN ONLY)' if (dry_run | default(false) | bool) else 'HOPS' }}"
+              - "============================================================================"
+              - "Cluster              : {{ cluster_name }}"
+              - "Current Version      : {{ path_current_version | default(run_start_version) }}"
+              - "Path                 : {{ upgrade_path | join(' -> ') }}"
+              - "Hops To Run          : {{ path_remaining_hops | default(upgrade_path) | join(' -> ') or 'none' }}"
+              - "Resuming             : {{ path_in_progress_hop | default('') or 'no' }}"
+              - "============================================================================"
+
+        # --------------------------------------------------------------------
+        # Dry run: print the plan, change nothing
+        # --------------------------------------------------------------------
+        - name: "Phase 03 (dry run): Show what each hop would do"
+          debug:
+            msg: >-
+              {% for r in path_validation | default([]) %}[{{ r.status }}] {{ ((r['from'] ~ ' -> ') if (r['from'] | length > 0) else '') ~ r.to }}{{ (' via ' ~ r.channel) if (r.channel | length > 0) else '' }}: {{ r.detail }}{% if not loop.last %} | {% endif %}{% endfor %}.
+              A live run sets each hop's channel, applies the admin-ack before minor hops (after the removed-API check),
+              starts the update and monitors it to the settle gate. No change was made.
+          when: dry_run | default(false) | bool
+
+        - name: "Phase 03 (dry run): Record the plan result"
+          set_fact:
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{'phase': '03', 'name': 'Upgrade (dry run, plan only)',
+                   'status': path_validation_status | default('PASS'),
+                   'detail': ((path_remaining_hops | default([]) | length) ~ ' hop(s) planned: ' ~ (path_remaining_hops | default([]) | join(' -> ') or 'none') ~ '; no change made')}] }}
+          when: dry_run | default(false) | bool
+
+        # --------------------------------------------------------------------
+        # Live run: hops in order
+        # --------------------------------------------------------------------
+        - name: "Phase 03: Run the upgrade hops in order"
+          include_tasks: "{{ playbook_dir }}/tasks/hop.yml"
+          loop: "{{ upgrade_path | map('string') | list }}"
+          loop_control:
+            loop_var: hop_item
+            index_var: hop_index
+          when: not (dry_run | default(false) | bool)
+
+        - name: "Phase 03: Read the final cluster version"
+          shell: |
+            # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+            set -o pipefail
+            oc get clusterversion version -o json | jq -r '(((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // "unknown")'
+          args:
+            executable: /bin/bash
+          environment:
+            KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+          register: p03_final_version_raw
+          changed_when: false
+          retries: "{{ oc_command_retries | default(3) }}"
+          delay: "{{ oc_command_retry_delay | default(10) }}"
+          until: p03_final_version_raw.rc == 0
+          when: not (dry_run | default(false) | bool)
+
+        - name: "Phase 03: Record the phase result"
+          set_fact:
+            run_final_version: "{{ p03_final_version_raw.stdout | trim }}"
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{'phase': '03', 'name': 'Upgrade hops', 'status': 'PASS',
+                   'detail': ((hop_results | selectattr('status', 'match', '^COMPLETE') | list | length) ~ ' hop(s) completed'
+                              ~ (((', ' ~ (hop_results | selectattr('status', 'equalto', 'ALREADY DONE') | list | length) ~ ' already done'))
+                                 if (hop_results | selectattr('status', 'equalto', 'ALREADY DONE') | list | length > 0) else '')
+                              ~ '; cluster now at ' ~ (p03_final_version_raw.stdout | trim))}] }}
+          when: not (dry_run | default(false) | bool)
+
+        - name: "Phase 03: Log the phase result"
+          include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+          vars:
+            event_status: "PASS"
+            event_gate: "HARD"
+            event_task: "Phase 03 Upgrade"
+            event_reason: "{{ run_phase_results[-1].detail }}"
+          when: not (dry_run | default(false) | bool)
+
+        - name: "Phase 03: Display completion banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 03 COMPLETE"
+              - "============================================================================"
+              - "Result               : {{ run_phase_results[-1].detail }}"
+              - "Hops                 : {{ hop_results | map(attribute='target') | join(', ') or 'none' }}"
+              - "============================================================================"
+
+        - name: "Phase 03: Prepare the closing mail (standalone run)"
+          set_fact:
+            run_summary_title: "{{ 'Upgrade Plan (dry run)' if (dry_run | default(false) | bool) else 'Upgrade Hops Complete' }}"
+            run_summary_tag: "PHASE-03"
+          when: standalone_phase | default(false) | bool
+
+        - name: "Phase 03: Send the closing mail (standalone run)"
+          include_tasks: "{{ playbook_dir }}/tasks/send_run_summary.yml"
+          when: standalone_phase | default(false) | bool
+
+        - name: "Phase 03: End the session (standalone run or stop after Phase 03)"
+          include_role:
+            name: logout
+          when: (standalone_phase | default(false) | bool) or (stop_after_phase is defined and (stop_after_phase | int) == 3)
+
+      # ----------------------------------------------------------------------
+      # Rescue: the hop's own rescue already sent the alert (failure_alert_sent);
+      # error_handle here only covers failures outside a hop (login, path check).
+      # ----------------------------------------------------------------------
+      rescue:
+        - name: "Phase 03: Resolve the error for this failure"
+          set_fact:
+            phase_03_failed: true
+            resolved_error: >-
+              {{ (ansible_failed_result.stderr | default('') | string | trim)
+                 or (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 or (ansible_failed_result.msg | default('') | string | trim)
+                 or 'Unknown error - inspect the run log' }}
+
+        - name: "Phase 03: Set failure context for the alert"
+          set_fact:
+            current_step_no: "Phase 03"
+            current_task_name: "{{ current_task_name if (failure_alert_sent | default(false) | bool) else 'Phase 03 Upgrade' }}"
+            current_gate_type: "HARD"
+            failure_reason: "{{ failure_reason if (failure_alert_sent | default(false) | bool) else 'Phase 03 stopped before a hop could run' }}"
+            failure_observed: "{{ resolved_error }}"
+            phase_exit_code: "{{ (phase_exit_code | int) if ((phase_exit_code | default(0) | int) in [20, 30]) else 20 }}"
+            failure_attachments:
+              - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+              - "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_prevalidation_{{ run_timestamp }}.html"
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{'phase': '03', 'name': 'Upgrade hops', 'status': 'FAIL',
+                   'detail': (resolved_error | regex_replace('[\r\n]+', ' ') | truncate(200))}] }}
+
+        - name: "Phase 03: Record the failure (alert only if no hop sent one)"
+          include_role:
+            name: error_handle
+
+        - name: "Phase 03: End the session after the failure"
+          include_role:
+            name: logout
+
+        - name: "Phase 03: Stop the run"
+          fail:
+            msg: "Phase 03 failed: {{ resolved_error | truncate(1000) }}"
+
+      always:
+        - name: "Phase 03: Guarantee logout after a failure"
+          include_role:
+            name: logout
+          when:
+            - phase_03_failed | default(false) | bool
+            - cluster_session_active | default(false) | bool

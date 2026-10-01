@@ -1,0 +1,22 @@
+---
+# ============================================================================
+# Role Tasks: monitor / poll_iteration.yml — Iteration Wrapper
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Purpose: One loop iteration of roles/monitor. Runs poll_body.yml only while the
+#          cluster is not settled and monitoring has not aborted.
+# Why:     This condition is evaluated at run time for each iteration (unlike a
+#          `when` on the looped include itself, which Ansible evaluates for all
+#          items before any iteration runs), so finished iterations are cheap.
+# Role / Playbook Dependencies: roles/monitor/tasks/poll_body.yml
+# Gate Type: N/A
+# Outputs: None (see poll_body.yml)
+# ============================================================================
+
+- name: "Monitor: Poll {{ poll_iteration_idx }} of {{ monitor_max_iterations }} ({{ monitor_label }})"
+  include_tasks: poll_body.yml
+  when:
+    - not (hop_settled | default(false) | bool)
+    - not (monitor_abort | default(false) | bool)

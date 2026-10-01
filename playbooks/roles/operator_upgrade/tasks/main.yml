@@ -1,0 +1,227 @@
+---
+# ============================================================================
+# Role Tasks: operator_upgrade
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses shell, set_fact, include_tasks, debug.
+#
+# Purpose: Approves the pending operator upgrades after the cluster upgrade:
+#          1. Records every operator CSV phase before any approval (baseline used by
+#             operator_validate to detect regressions).
+#          2. For each Subscription in state UpgradePending, approves ONLY the
+#             InstallPlan it points to (status.installPlanRef) when that plan is
+#             unapproved. Other unapproved InstallPlans (stale plans of earlier
+#             resolutions, plans no subscription references) are listed, never approved.
+#          3. Waits (bounded) for the approved plans' CSVs to reach Succeeded. With
+#             operator_upgrade_auto_recover, a CSV that reports Failed gets one restart
+#             of its operator Deployments (olm.owner=<csv>) before the wait continues.
+# Why:     Approving every unapproved plan cluster-wide could install stale or
+#          unintended versions, and deleting Failed CSVs (the previous recovery)
+#          uninstalls the operator until someone approves a fresh plan.
+# Cluster writes: InstallPlan spec.approved=true; optional Deployment rollout restart.
+# Inputs:  dry_run, operator_upgrade_timeout_seconds, operator_upgrade_poll_interval_seconds,
+#          operator_upgrade_auto_recover
+# Role / Playbook Dependencies: vars/upgrade.yml, tasks/log_event.yml, jq 1.5
+# Gate Type: HARD (operator_validate fails Phase 06 when an approved operator is not Succeeded)
+# Outputs: operator_csv_baseline, approved_installplans, skipped_installplans,
+#          operator_rollout_state, recovered_csvs
+# ============================================================================
+
+- name: "operator_upgrade: Initialize state"
+  set_fact:
+    approved_installplans: []
+    skipped_installplans: []
+    operator_rollout_state: []
+    recovered_csvs: []
+
+# ----------------------------------------------------------------------------
+# 1. Read subscriptions, InstallPlans and CSVs (read-only)
+# ----------------------------------------------------------------------------
+# Why: copied CSVs (label olm.copiedFrom) are the same operator mirrored into every
+#      namespace; they are excluded everywhere.
+- name: "operator_upgrade: Read subscriptions, InstallPlans and operator CSVs"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get subscriptions.operators.coreos.com -A -o json | jq -c '[.items[]? | {
+      name: .metadata.name, namespace: .metadata.namespace,
+      package: (.spec.name // .metadata.name), channel: (.spec.channel // ""),
+      approval: (.spec.installPlanApproval // "Automatic"), state: (.status.state // ""),
+      installed_csv: (.status.installedCSV // ""), current_csv: (.status.currentCSV // ""),
+      plan_name: (.status.installPlanRef.name // ""), plan_namespace: (.status.installPlanRef.namespace // .metadata.namespace)}]'
+    oc get installplans.operators.coreos.com -A -o json | jq -c '[.items[]? | {
+      name: .metadata.name, namespace: .metadata.namespace, approved: (.spec.approved // false),
+      approval: (.spec.approval // ""), phase: (.status.phase // ""),
+      csv_names: [(.spec.clusterServiceVersionNames // [])[]]}]'
+    oc get clusterserviceversions.operators.coreos.com -A -l '!olm.copiedFrom' -o json | jq -c '[.items[]? | {
+      name: .metadata.name, namespace: .metadata.namespace, phase: (.status.phase // "Unknown"),
+      reason: (.status.reason // "")}]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: opu_state_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: opu_state_raw.rc == 0
+
+- name: "operator_upgrade: Parse state and record the pre-approval CSV baseline"
+  set_fact:
+    opu_subscriptions: "{{ opu_state_raw.stdout_lines[0] | from_json }}"
+    opu_installplans: "{{ opu_state_raw.stdout_lines[1] | from_json }}"
+    operator_csv_baseline: "{{ opu_state_raw.stdout_lines[2] | from_json }}"
+
+# ----------------------------------------------------------------------------
+# 2. Decide which InstallPlans to approve
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Select the current unapproved InstallPlan of each pending subscription"
+  set_fact:
+    opu_to_approve: >-
+      {%- set out = [] -%}
+      {%- set seen = [] -%}
+      {%- for s in opu_subscriptions -%}
+      {%- if s.state == 'UpgradePending' and (s.plan_name | length > 0) -%}
+      {%- set plans = opu_installplans | selectattr('namespace', 'equalto', s.plan_namespace) | selectattr('name', 'equalto', s.plan_name) | list -%}
+      {%- if (plans | length > 0) and not (plans[0].approved | bool) and (s.plan_namespace ~ '/' ~ s.plan_name) not in seen -%}
+      {%- set _ = seen.append(s.plan_namespace ~ '/' ~ s.plan_name) -%}
+      {%- set _ = out.append({'name': s.plan_name, 'namespace': s.plan_namespace, 'subscription': s.name,
+            'package': s.package, 'channel': s.channel, 'from_csv': s.installed_csv,
+            'csv_names': plans[0].csv_names}) -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "operator_upgrade: List unapproved InstallPlans that are left alone"
+  set_fact:
+    skipped_installplans: >-
+      {%- set chosen = [] -%}
+      {%- for p in opu_to_approve -%}{%- set _ = chosen.append(p.namespace ~ '/' ~ p.name) -%}{%- endfor -%}
+      {%- set out = [] -%}
+      {%- for p in opu_installplans -%}
+      {%- if not (p.approved | bool) and (p.namespace ~ '/' ~ p.name) not in chosen -%}
+      {%- set _ = out.append({'name': p.name, 'namespace': p.namespace, 'csv_names': p.csv_names,
+            'reason': 'not the current InstallPlan of an UpgradePending subscription'}) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "operator_upgrade: Display the approval plan"
+  debug:
+    msg: >-
+      {{ opu_to_approve | length }} operator upgrade(s) to approve{{ ' (dry run: not approved)' if (dry_run | default(false) | bool) else '' }}:
+      {{ opu_to_approve | map(attribute='package') | join(', ') or 'none' }}.
+      {{ skipped_installplans | length }} other unapproved InstallPlan(s) left untouched{{ (': ' ~ (skipped_installplans | map(attribute='name') | join(', '))) if (skipped_installplans | length > 0) else '' }}.
+
+# ----------------------------------------------------------------------------
+# 3. Approve (live runs only)
+# ----------------------------------------------------------------------------
+- name: "operator_upgrade: Approve the selected InstallPlans"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc patch installplans.operators.coreos.com {{ item.name | quote }} -n {{ item.namespace | quote }} --type merge -p '{"spec":{"approved":true}}'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  loop: "{{ opu_to_approve }}"
+  register: opu_approve_results
+  changed_when: true
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: opu_approve_results.rc == 0
+  when: not (dry_run | default(false) | bool)
+
+- name: "operator_upgrade: Record approved InstallPlans"
+  set_fact:
+    approved_installplans: "{{ opu_to_approve }}"
+  when:
+    - not (dry_run | default(false) | bool)
+    - opu_to_approve | length > 0
+
+- name: "operator_upgrade: Log approvals"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "INFO"
+    event_gate: "HARD"
+    event_task: "Phase 06 InstallPlan approval"
+    event_reason: "Approved: {% for p in opu_to_approve %}{{ p.namespace }}/{{ p.name }} ({{ p.package }} -> {{ p.csv_names | join(', ') }}){% if not loop.last %}; {% endif %}{% endfor %}"
+    event_observed: "Left untouched: {{ skipped_installplans | map(attribute='name') | join(', ') or 'none' }}"
+  when:
+    - not (dry_run | default(false) | bool)
+    - opu_to_approve | length > 0
+
+# ----------------------------------------------------------------------------
+# 4. Wait for the approved operators' CSVs
+# ----------------------------------------------------------------------------
+# Why: one bounded in-shell loop. It prints the final state of every target CSV as
+#      JSON; a target with no CSV yet is "Pending". Restarts are applied at most once
+#      per CSV and reported in the "restarted" list.
+- name: "operator_upgrade: Wait for approved operators to reach Succeeded"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    targets={{ _opu_targets | to_json | quote }}
+    deadline=$((SECONDS + {{ operator_upgrade_timeout_seconds | default(600) | int }}))
+    restarted='[]'
+    while :; do
+      csvs="$(oc get clusterserviceversions.operators.coreos.com -A -l '!olm.copiedFrom' -o json --request-timeout=60s \
+              | jq -c '[.items[]? | {namespace: .metadata.namespace, name: .metadata.name, phase: (.status.phase // "Unknown"),
+                                     reason: (.status.reason // ""), message: ((.status.message // "") | .[0:200])}]')" || csvs='[]'
+      state="$(jq -cn --argjson t "$targets" --argjson c "$csvs" '[ $t[] | . as $x
+                | ((($c | map(select(.namespace == $x.namespace and .name == $x.name))) | .[0])
+                   // {namespace: $x.namespace, name: $x.name, phase: "Pending", reason: "CSV not created yet", message: ""}) ]')"
+      if printf '%s' "$state" | jq -e 'all(.[]; .phase == "Succeeded")' >/dev/null; then break; fi
+      {% if operator_upgrade_auto_recover | default(true) | bool %}
+      for f in $(printf '%s' "$state" | jq -r '.[] | select(.phase == "Failed") | "\(.namespace)/\(.name)"'); do
+        if ! printf '%s' "$restarted" | jq -e --arg f "$f" 'index([$f]) != null' >/dev/null; then
+          ns="${f%%/*}"; name="${f#*/}"
+          oc rollout restart deployment -n "$ns" -l "olm.owner=${name}" >/dev/null 2>&1 || true
+          restarted="$(printf '%s' "$restarted" | jq -c --arg f "$f" '. + [$f]')"
+        fi
+      done
+      {% endif %}
+      [ "$SECONDS" -ge "$deadline" ] && break
+      sleep {{ operator_upgrade_poll_interval_seconds | default(15) | int }}
+    done
+    jq -cn --argjson s "$state" --argjson r "$restarted" '{state: $s, restarted: $r}'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  vars:
+    _opu_targets: >-
+      {%- set out = [] -%}
+      {%- for p in approved_installplans -%}{%- for c in p.csv_names -%}
+      {%- set _ = out.append({'namespace': p.namespace, 'name': c}) -%}
+      {%- endfor -%}{%- endfor -%}
+      {{ out }}
+  register: opu_wait_raw
+  changed_when: false
+  failed_when: false
+  when: approved_installplans | length > 0
+
+- name: "operator_upgrade: Record the rollout result"
+  set_fact:
+    operator_rollout_state: "{{ (opu_wait_raw.stdout | from_json).state }}"
+    recovered_csvs: "{{ (opu_wait_raw.stdout | from_json).restarted }}"
+  when:
+    - approved_installplans | length > 0
+    - (opu_wait_raw.stdout | default('') | trim).startswith('{')
+
+- name: "operator_upgrade: Log the one-time operator restarts"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "AUTO-FIX"
+    event_gate: "HARD"
+    event_task: "Phase 06 operator recovery"
+    event_reason: "Restarted the operator Deployments of Failed CSV(s): {{ recovered_csvs | join(', ') }}"
+  when: recovered_csvs | length > 0
+
+- name: "operator_upgrade: Display the rollout result"
+  debug:
+    msg: >-
+      {% if approved_installplans | length == 0 %}No operator upgrade was approved in this run.
+      {%- else %}{% for c in operator_rollout_state %}{{ c.namespace }}/{{ c.name }}: {{ c.phase }}{{ (' (' ~ c.reason ~ ')') if (c.reason | length > 0 and c.phase != 'Succeeded') else '' }}{% if not loop.last %}; {% endif %}{% endfor %}{% endif %}

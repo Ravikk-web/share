@@ -1,0 +1,52 @@
+---
+# ============================================================================
+# Tasks: logout
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses stat, command, file, set_fact, debug; compatible across 2.7 and 2.14.
+#
+# Purpose: Revokes the session token, removes the temporary kubeconfig, and marks
+#          the session inactive. Safe to call repeatedly and when login never ran.
+# Why:     The kubeconfig path facts are intentionally kept (only the file is
+#          removed). Blanking them made any later login in the same run pass an
+#          empty --kubeconfig, which would have written to ~/.kube/config.
+# Role / Playbook Dependencies: None (designed to be safe even if login failed or was skipped)
+# Gate Type: N/A (must never fail)
+# Outputs: Revoked token, removed kubeconfig, cluster_session_active: false
+# ============================================================================
+
+- name: "logout: Resolve target kubeconfig path"
+  set_fact:
+    logout_kubeconfig: >-
+      {{ cluster_kubeconfig
+         if (cluster_kubeconfig | default('') | length > 0)
+         else (kubeconfig_path if (kubeconfig_path | default('') | length > 0)
+               else (playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default')))) }}
+
+- name: "logout: Check whether a session kubeconfig exists"
+  stat:
+    path: "{{ logout_kubeconfig }}"
+  register: logout_kubeconfig_stat
+
+# Why: failed_when: false — teardown must never mask the original failure.
+- name: "logout: Revoke active OpenShift session token"
+  command: "{{ oc_binary | default('oc') }} logout --kubeconfig={{ logout_kubeconfig }}"
+  register: oc_logout_result
+  failed_when: false
+  changed_when: oc_logout_result.rc == 0
+  no_log: true
+  when: logout_kubeconfig_stat.stat.exists | default(false)
+
+- name: "logout: Remove temporary kubeconfig file from disk"
+  file:
+    path: "{{ logout_kubeconfig }}"
+    state: absent
+  failed_when: false
+
+- name: "logout: Mark cluster session inactive"
+  set_fact:
+    cluster_session_active: false
+
+- name: "logout: Confirm session termination"
+  debug:
+    msg: "Session closed and kubeconfig removed for cluster {{ cluster_name | default('default') }}."

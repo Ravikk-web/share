@@ -1,0 +1,109 @@
+---
+# ============================================================================
+# Master Orchestrator — ARO Cluster Upgrade Automation
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses import_playbook; compatible across Ansible 2.7 and 2.14.
+#
+# Purpose: Chains Phases 01, 02, 03 (with Phase 04 per hop), 05 and 06. Each phase
+#          play guards itself with skip_to_phase / stop_after_phase (and its own
+#          dry-run rules), so a run that stops early simply skips the later plays.
+# Mails:   exactly one closing summary per successful run, sent by the last play
+#          below (full upgrade, dry run, pre-check or partial run). A failed run
+#          never reaches it: Ansible drops a failed host from later plays, and the
+#          failing phase already sent the single failure alert. Isolated phases
+#          (--phase NN) run their own playbook and send their own closing mail.
+# Role / Playbook Dependencies: vars/*.yml, 01_Policy_Check.yaml, 02_Pre_upgrade_check.yaml,
+#               03_Initiate_upgrade.yaml, 05_post_Upgrade_Checks.yaml,
+#               06_Operator_Upgrade.yaml, tasks/send_run_summary.yml, roles/logout
+# Gate Type: N/A (Master Orchestrator)
+# Outputs: End-to-end run, one closing summary mail
+# ============================================================================
+
+- name: "ARO Upgrade Automation — Initialization"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+  tasks:
+    - name: "Validate mandatory execution variables"
+      assert:
+        that:
+          - cluster_name is defined
+          - cluster_name | length > 0
+          - upgrade_path is defined
+          - upgrade_path | length > 0
+        fail_msg: "Mandatory parameters 'cluster_name' and 'upgrade_path' must be defined and non-empty."
+
+    - name: "Establish the run timestamp shared by logs, snapshots and reports"
+      set_fact:
+        run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"
+
+    - name: "Display run banner"
+      debug:
+        msg:
+          - "========================================================"
+          - "  ARO Cluster Upgrade Automation"
+          - "========================================================"
+          - "Cluster        : {{ cluster_name }}"
+          - "Upgrade Path   : {{ upgrade_path | join(' -> ') }}"
+          - "Run Mode       : {{ run_mode | default('full-upgrade') }}"
+          - "Dry Run        : {{ dry_run | default(false) | bool }}"
+          - "Auto-Remediate : {{ auto_remediation_enabled | default(true) | bool }}"
+          - "Phases         : {{ skip_to_phase | default('01') }} to {{ stop_after_phase | default('06') }}"
+          - "========================================================"
+
+# --- Phase 01: Policy check, baseline snapshot, whole-path validation ---
+- import_playbook: 01_Policy_Check.yaml
+
+# --- Phase 02: 15-check prevalidation, auto-remediation, HARD gate ---
+- import_playbook: 02_Pre_upgrade_check.yaml
+
+# --- Phase 03 (+ Phase 04 per hop): upgrade hops and live monitoring ---
+- import_playbook: 03_Initiate_upgrade.yaml
+
+# --- Phase 05: postvalidation and baseline diff ---
+- import_playbook: 05_post_Upgrade_Checks.yaml
+
+# --- Phase 06: operator upgrades, Developer perspective, closeout ---
+- import_playbook: 06_Operator_Upgrade.yaml
+
+# --- Close-out: the run's single summary mail and logout ---
+- name: "Run close-out — summary mail and logout"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+  tasks:
+    - name: "Close-out: Describe the outcome"
+      set_fact:
+        run_summary_intro: >-
+          {% if (run_mode | default('full-upgrade')) == 'full-upgrade' %}Cluster {{ cluster_name }} was upgraded from {{ run_start_version | default('?') }} to {{ run_final_version | default('?') }}{{ (' in ' ~ (hop_results | default([]) | selectattr('status', 'match', '^COMPLETE') | list | length) ~ ' hop(s)') }}. Postvalidation and the operator closeout finished.
+          {%- elif (run_mode | default('')) == 'dry-run' %}Dry run of {{ run_start_version | default('?') }} -> {{ upgrade_path | join(' -> ') }}: all read-only checks ran; no change was made to the cluster.
+          {%- elif (run_mode | default('')) == 'pre-check' %}Prevalidation {{ 'passed after auto-remediation' if (preval_autofix_items | default([]) | length > 0) else 'passed' }}; no upgrade was started.
+          {%- else %}Phases {{ skip_to_phase | default('01') }} to {{ stop_after_phase | default('06') }} completed{{ (' (cluster now at ' ~ run_final_version ~ ')') if (run_final_version | default('') | length > 0) else '' }}.
+          {%- endif %}
+        run_summary_checks: "{{ health_summary | default([]) }}"
+
+    - name: "Close-out: Send the run summary"
+      include_tasks: "{{ playbook_dir }}/tasks/send_run_summary.yml"
+
+    - name: "Close-out: End the cluster session"
+      include_role:
+        name: logout
+
+    - name: "Close-out: Display run completion"
+      debug:
+        msg: "Run {{ run_timestamp }} ({{ run_mode | default('full-upgrade') }}) finished: {{ run_phase_results | default([]) | map(attribute='phase') | join(', ') }} ran; summary mail {{ 'sent' if (send_summary_email | default(true) | bool) else 'disabled' }}."

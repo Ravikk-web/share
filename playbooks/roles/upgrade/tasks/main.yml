@@ -1,0 +1,90 @@
+---
+# ============================================================================
+# Role Tasks: upgrade — Plan (read-only)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses shell, set_fact, assert, fail, debug.
+#
+# Purpose: Decides what one hop needs, without changing the cluster:
+#            skip    — the cluster already completed this version (or a later one)
+#            resume  — an update to exactly this version is already running
+#            trigger — the hop must be started (roles/upgrade/tasks/apply.yml)
+#          An update running to any other version stops the hop.
+# Why:     Re-running a hop that is done, or re-triggering one that is running, is
+#          what made --resume unsafe; the decision now comes from the live cluster.
+# Inputs:  target_version (hop target), hop_label
+# Role / Playbook Dependencies: vars/upgrade.yml, jq 1.5
+# Gate Type: HARD
+# Outputs: upgrade_hop_action, upgrade_target_channel, upgrade_cv (live state),
+#          upgrade_is_minor_hop
+# ============================================================================
+
+- name: "Upgrade: Validate the hop target"
+  assert:
+    that:
+      - target_version is defined
+      - (target_version | string) is match('^[0-9]+[.][0-9]+[.][0-9]+$')
+    fail_msg: "[HARD GATE FAILURE] The upgrade role needs a target_version in X.Y.Z form (got '{{ target_version | default('') }}')."
+
+# Why: split('.') instead of regex backreferences (decoded as control characters
+#      inside YAML-quoted Jinja).
+- name: "Upgrade: Resolve the channel for this hop"
+  set_fact:
+    upgrade_target_channel: >-
+      {{ target_channel
+         if (target_channel | default('') | length > 0)
+         else ((target_channel_prefix | default('stable')) ~ '-' ~ ((target_version | string).split('.')[0:2] | join('.'))) }}
+
+- name: "Upgrade: Query ClusterVersion state"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get clusterversion version -o json | jq -c '
+      def cond(t): (((.status.conditions // []) | map(select(.type == t)) | .[0]) // {});
+      {
+        completed: ((((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // "")),
+        desired: (.status.desired.version // ""),
+        progressing: ((cond("Progressing").status // "False") | tostring),
+        channel: (.spec.channel // "")
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: upgrade_cv_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: upgrade_cv_raw.rc == 0
+
+- name: "Upgrade: Decide the action for this hop"
+  set_fact:
+    upgrade_cv: "{{ upgrade_cv_raw.stdout | from_json }}"
+    upgrade_hop_action: >-
+      {%- set cv = upgrade_cv_raw.stdout | from_json -%}
+      {%- set running = cv.progressing == 'True' and cv.desired != cv.completed -%}
+      {%- if running and cv.desired == (target_version | string) -%}resume
+      {%- elif running -%}blocked
+      {%- elif (cv.completed | length > 0) and ((target_version | string) is version(cv.completed, '<=')) -%}skip
+      {%- else -%}trigger
+      {%- endif -%}
+    upgrade_is_minor_hop: >-
+      {%- set cv = upgrade_cv_raw.stdout | from_json -%}
+      {%- set cur = (cv.completed | string).split('.') -%}
+      {%- set tgt = (target_version | string).split('.') -%}
+      {{ (cur | length >= 2) and ((tgt[0] | int, tgt[1] | int) > (cur[0] | int, cur[1] | int)) }}
+
+- name: "Upgrade: Stop — another update is in progress"
+  fail:
+    msg: >-
+      [HARD GATE FAILURE] {{ hop_label | default('Hop') }}: the cluster is updating to {{ upgrade_cv.desired }}
+      (from {{ upgrade_cv.completed }}), not to {{ target_version }}. Let it finish (or investigate) and re-run with --resume.
+  when: upgrade_hop_action == 'blocked'
+
+- name: "Upgrade: Display the hop plan"
+  debug:
+    msg: >-
+      {{ hop_label | default('Hop') }} -> {{ target_version }} (channel {{ upgrade_target_channel }}):
+      {{ {'skip': 'already completed (cluster at ' ~ upgrade_cv.completed ~ '); nothing to do',
+          'resume': 'update to ' ~ target_version ~ ' already running; monitoring it',
+          'trigger': 'will be started from ' ~ upgrade_cv.completed ~ ('; minor-version hop' if (upgrade_is_minor_hop | bool) else '; z-stream hop')}[upgrade_hop_action] }}

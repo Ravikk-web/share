@@ -1,0 +1,95 @@
+# ============================================================================
+# SMTP Notification & Email Configuration
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: The mail module ships in the community.general collection on
+#                 ansible-core 2.14 (00_Run.sh warns if it is missing; emails are
+#                 then skipped and never stop the run).
+#
+# Purpose: Defines direct SMTP host, port, authentication parameters, sender,
+#          recipient lists, the subject prefix, and which notification types are sent.
+# Role / Playbook Dependencies: None (consumed by tasks/notify.yml and roles/sendmail)
+# Gate Type: N/A
+# Outputs: SMTP server parameters, recipient routing lists, notification toggles
+# ============================================================================
+
+# SMTP server hostname or IP address reachable from the jump server
+smtp_host: "smtp.example.com"
+
+# SMTP service port (25 for unauthenticated internal relays, 587 for STARTTLS)
+smtp_port: 25
+
+# Sender email address appearing in the 'From' header
+mail_from: "aro-upgrades@example.com"
+
+# ----------------------------------------------------------------------------
+# Recipient Lists
+# ----------------------------------------------------------------------------
+# Routing rules (tasks/notify.yml):
+#   - Informational mails (prevalidation, heartbeat, run summary) go to the list
+#     for that mail type; `--mail-to` on the CLI replaces those lists for the run.
+#   - Failure alerts and degradation alerts ALWAYS go to alert_mail_to plus
+#     mail_to (or the `--mail-to` recipients when given).
+
+# Default distribution list for heartbeats and run summaries
+mail_to:
+  - "platform-team@example.com"
+
+# On-call distribution list for failure alerts and degradation alerts
+alert_mail_to:
+  - "platform-team@example.com"
+  - "oncall-platform@example.com"
+
+# Prevalidation report mail (falls back to mail_to when empty)
+preval_mail_to:
+  - "platform-team@example.com"
+
+# Standalone post-check report mail (falls back to mail_to when empty)
+postval_mail_to:
+  - "platform-team@example.com"
+
+# Dry-run / pre-check summary mail (falls back to mail_to when empty)
+dry_run_mail_to:
+  - "platform-team@example.com"
+
+# ----------------------------------------------------------------------------
+# Subject Format
+# ----------------------------------------------------------------------------
+# Every subject is: <prefix>[<cluster>][<EVENT>] <headline> (run <run_timestamp>)
+# EVENT is one of PREVALIDATION, HEARTBEAT, DEGRADED, ALERT, POSTVALIDATION,
+# COMPLETE, DRY-RUN, PRE-CHECK or PHASE-NN, so mail rules can filter on it and all
+# mails from one run share the same run id.
+mail_subject_prefix: "[ARO Upgrade]"
+
+# ----------------------------------------------------------------------------
+# Notification Types (one mail per event; failures never send duplicates)
+# ----------------------------------------------------------------------------
+# Prevalidation report after Phase 02, sent only in runs that continue to the
+# upgrade (dry-run / pre-check runs include it in their single summary mail).
+send_prevalidation_email: true
+
+# Postvalidation report for standalone --post-check / isolated Phase 05 runs.
+# Full upgrade runs include it in the final summary instead.
+send_postvalidation_email: true
+
+# Progress heartbeat every heartbeat_minutes while hops (or a remediation node
+# rollout) are running.
+send_heartbeat_email: true
+
+# Immediate alert when the cluster degrades during a hop (after grace periods,
+# once per condition; see vars/upgrade.yml degradation_* settings).
+send_degradation_alerts: true
+
+# Closing summary with all reports attached — every run ends with exactly one
+# (full upgrade, dry-run, pre-check, post-check or isolated phase).
+send_summary_email: true
+
+# SMTP connection timeout in seconds
+mail_timeout_seconds: 30
+
+# Optional SMTP authentication credentials (empty by default for internal relay)
+smtp_username: "{{ vault_smtp_username | default('') }}"
+smtp_password: "{{ vault_smtp_password | default('') }}"
+
+# SMTP security mode ('never', 'starttls', or 'ssl')
+smtp_secure: "never"

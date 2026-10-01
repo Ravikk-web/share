@@ -1,0 +1,59 @@
+---
+# ============================================================================
+# Role Defaults: sendmail
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Default parameters for the sendmail transport role. The per-email
+#          envelope (notify_*) is prepared by tasks/notify.yml; SMTP settings come
+#          from vars/smtp.yml.
+# Role / Playbook Dependencies: vars/smtp.yml, tasks/notify.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by sendmail tasks
+# ============================================================================
+
+# SMTP server hostname or IP reachable from jump server (string)
+# Sourced from vars/smtp.yml
+smtp_host: "smtp.example.com"
+
+# SMTP service port: 25 for internal unauthenticated relay, 587 for STARTTLS (integer)
+# Sourced from vars/smtp.yml
+smtp_port: 25
+
+# Sender email address appearing in 'From' header (string)
+# Sourced from vars/smtp.yml
+mail_from: "aro-upgrades@example.com"
+
+# SMTP connection timeout in seconds (integer)
+# Sourced from vars/smtp.yml
+mail_timeout_seconds: 30
+
+# Optional SMTP authentication username for authenticated relays (string, default: "")
+# Sourced from vars/smtp.yml or vault credentials
+smtp_username: ""
+
+# Optional SMTP authentication password for authenticated relays (string, default: "")
+# Sourced from vars/smtp.yml or vault credentials
+smtp_password: ""
+
+# SMTP transport security mode: 'never', 'starttls', or 'ssl' (string)
+# Sourced from vars/smtp.yml
+smtp_secure: "never"
+
+# Notification type label (string: prevalidation, heartbeat, degradation, alert,
+# postvalidation, summary). Set by tasks/notify.yml; reset after every dispatch.
+notify_event: ""
+
+# Resolved recipients for this email (list of strings). Set by tasks/notify.yml.
+notify_to: []
+
+# Full subject line for this email (string). Set by tasks/notify.yml.
+notify_subject: ""
+
+# Template file name under playbooks/templates/ or an absolute path (string).
+# Set by tasks/notify.yml.
+notify_template: ""
+
+# Existing attachment file paths for this email (list of strings). Set by tasks/notify.yml.
+notify_attachments: []

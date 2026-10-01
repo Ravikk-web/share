@@ -1,0 +1,27 @@
+---
+# ============================================================================
+# Role Defaults: console
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defaults for the web console Developer perspective step (Phase 06).
+#          Authoritative values live in vars/upgrade.yml.
+# Role / Playbook Dependencies: vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by console tasks
+# ============================================================================
+
+# Enable the Developer perspective when it is Disabled (boolean, default: true)
+enable_developer_perspective: true
+
+# Only report the current state, never change it (boolean, default: false).
+# Set by Phase 05 for dry runs and post-checks.
+console_report_only: false
+
+# Minutes to wait for the console ClusterOperator to settle after the change (integer)
+console_settle_timeout_minutes: 10
+
+# Retries for oc queries (integer) and delay between them in seconds (integer)
+oc_command_retries: 3
+oc_command_retry_delay: 10

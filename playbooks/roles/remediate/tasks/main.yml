@@ -1,0 +1,66 @@
+---
+# ============================================================================
+# Role Tasks: remediate - Main Dispatcher
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses include_tasks (dynamic) for sub-task routing.
+#                 Never uses bare include:. Compatible across 2.7 and 2.14.
+#
+# Purpose: Runs only the remediations Phase 02 requested (trigger_* facts), each
+#          gated by the master switch and its own toggle.
+# Why:     Remediation tasks never rewrite health_summary. They perform the fix and
+#          record what they attempted (remediation_attempted_nums). Phase 02 then
+#          re-runs the full 15-check scan: a check becomes AUTO-FIXED only if the
+#          WHOLE check passes afterwards, otherwise FIX-FAILED. (Previously a fix for
+#          one cause marked the entire check fixed and masked other failures.)
+#          Admin-acks are not handled here: roles/upgrade applies them per hop.
+# Role / Playbook Dependencies: vars/upgrade.yml, tasks/log_event.yml
+# Gate Type: N/A (dispatcher)
+# Outputs: remediation_attempted_nums, remediation_rollout_needed, preval_autofix_items
+# ============================================================================
+
+- name: "remediate: Initialize remediation tracking facts"
+  set_fact:
+    remediation_attempted_nums: []
+    remediation_rollout_needed: false
+    preval_autofix_items: "{{ preval_autofix_items | default([]) }}"
+
+- name: "remediate: Display dispatcher banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "AUTO-REMEDIATION ENGINE"
+      - "============================================================================"
+      - "Master Toggle          : {{ auto_remediation_enabled | default(true) | bool }}"
+      - "CGroup v2 (Check 14)   : toggle {{ auto_fix_cgroup_v2 | default(true) | bool }}, requested {{ trigger_cgroup_remediation | default(false) | bool }}"
+      - "Unpause MCP (Check 03) : toggle {{ auto_unpause_mcp | default(true) | bool }}, requested {{ trigger_unpause_mcp_remediation | default(false) | bool }}"
+      - "Restart CO (Check 01)  : toggle {{ auto_restart_degraded_operators | default(false) | bool }}, requested {{ trigger_co_restart_remediation | default(false) | bool }}"
+      - "============================================================================"
+
+- name: "remediate: Tier 1 — CGroup v1 to v2 migration"
+  include_tasks: cgroup_v2.yml
+  when:
+    - auto_remediation_enabled | default(true) | bool
+    - auto_fix_cgroup_v2 | default(true) | bool
+    - trigger_cgroup_remediation | default(false) | bool
+
+- name: "remediate: Tier 1 — Unpause allow-listed MachineConfigPools"
+  include_tasks: unpause_mcp.yml
+  when:
+    - auto_remediation_enabled | default(true) | bool
+    - auto_unpause_mcp | default(true) | bool
+    - trigger_unpause_mcp_remediation | default(false) | bool
+
+- name: "remediate: Tier 2 — Restart degraded ClusterOperator pods (opt-in)"
+  include_tasks: restart_operator.yml
+  when:
+    - auto_remediation_enabled | default(true) | bool
+    - auto_restart_degraded_operators | default(false) | bool
+    - trigger_co_restart_remediation | default(false) | bool
+
+- name: "remediate: Display remediation pass summary"
+  debug:
+    msg:
+      - "Checks with a remediation attempt : {{ remediation_attempted_nums | join(', ') or 'none' }}"
+      - "Node rollout to wait for          : {{ remediation_rollout_needed | bool }}"
+      - "Actions                           : {{ preval_autofix_items | map(attribute='name') | list }}"

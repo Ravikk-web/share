@@ -1,0 +1,30 @@
+---
+# ============================================================================
+# Role Defaults: pvc (PersistentVolumeClaims)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No syntax changes needed. Standard variable declarations.
+#
+# Purpose: Defines default parameters for the pvc role, which audits cluster
+#          PersistentVolumeClaims across all namespaces to verify that all claims
+#          are in Bound phase, alerting on Pending or Lost claims prior to upgrading.
+# Role / Playbook Dependencies: vars/paths.yml, vars/upgrade.yml
+# Gate Type: N/A (Role Defaults)
+# Outputs: Default variables consumed by pvc tasks
+# ============================================================================
+
+# Target ARO cluster name (string, mandatory)
+# Sourced from vars/upgrade.yml or overridden via CLI --cluster
+cluster_name: ""
+
+# Master toggle for enforcing gate failure on validation error (boolean, default: false)
+# Sourced from vars/upgrade.yml (default: false — non-blocking WARN advisory)
+pvc_enforce_gate: false
+
+# Maximum command retry attempts for transient API communication blips (integer, default: 3)
+# Sourced from vars/upgrade.yml or role defaults
+oc_command_retries: 3
+
+# Delay in seconds between command retry attempts (integer, default: 10)
+# Sourced from vars/upgrade.yml or role defaults
+oc_command_retry_delay: 10

@@ -1,0 +1,230 @@
+---
+# ============================================================================
+# Role Tasks: upgrade — Apply (starts one hop)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses shell, command, set_fact, include_tasks, fail, debug.
+#
+# Purpose: Starts the hop planned by tasks/main.yml (action "trigger"):
+#          1. Sets the hop's channel on ClusterVersion when it differs.
+#          2. Waits (bounded) until the cluster offers the target as an update, and
+#             refuses a conditional update whose risks apply to this cluster unless
+#             allow_conditional_updates is true (then --allow-not-recommended is used
+#             and the accepted risks are recorded).
+#          3. Minor hops: checks removed-API usage, applies the admin-ack for the
+#             current minor and waits for Upgradeable=True (remediate/admin_acks.yml).
+#          4. Runs `oc adm upgrade --to=<target>` and confirms ClusterVersion accepted it.
+# Cluster writes: spec.channel (merge patch), admin-acks ConfigMap (minor hops),
+#          the update request itself.
+# Why:     The channel is patched directly (no client-side channel list check in
+#          `oc adm upgrade channel`), the offer is polled instead of a fixed 60 s
+#          retry, and the trigger is verified instead of assumed.
+# Inputs:  target_version, hop_label, upgrade_target_channel, upgrade_cv, upgrade_is_minor_hop
+# Role / Playbook Dependencies: vars/upgrade.yml, roles/remediate/tasks/admin_acks.yml,
+#               tasks/log_event.yml, jq 1.5
+# Gate Type: HARD
+# Outputs: upgrade_edge_state, upgrade_accepted_risks, upgrade_trigger_result
+# ============================================================================
+
+- name: "Upgrade: Refuse to run in dry-run mode"
+  fail:
+    msg: "[HARD GATE FAILURE] roles/upgrade apply was called in dry-run mode; no hop may be started in a dry run."
+  when: dry_run | default(false) | bool
+
+# ----------------------------------------------------------------------------
+# 1. Channel
+# ----------------------------------------------------------------------------
+- name: "Upgrade: Set the channel to {{ upgrade_target_channel }}"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc patch clusterversion version --type merge -p {{ {'spec': {'channel': upgrade_target_channel}} | to_json | quote }}
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: upgrade_channel_result
+  changed_when: true
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: upgrade_channel_result.rc == 0
+  when: upgrade_cv.channel != upgrade_target_channel
+
+- name: "Upgrade: Log the channel change"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "INFO"
+    event_gate: "HARD"
+    event_task: "{{ hop_label | default('Hop') }} channel"
+    event_reason: "Channel changed from {{ upgrade_cv.channel or 'none' }} to {{ upgrade_target_channel }}"
+  when: upgrade_cv.channel != upgrade_target_channel
+
+# ----------------------------------------------------------------------------
+# 2. Wait for the cluster to offer the target
+# ----------------------------------------------------------------------------
+# Why: after a channel change the CVO needs to fetch the new graph (usually under a
+#      minute). The loop prints one line: RECOMMENDED | CONDITIONAL | NOT_OFFERED,
+#      followed by the risk / RetrievedUpdates details as JSON.
+- name: "Upgrade: Wait until the cluster offers {{ target_version }}"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    deadline=$((SECONDS + {{ upgrade_edge_wait_seconds | default(300) | int }}))
+    while :; do
+      state="$(oc get clusterversion version -o json | jq -c --arg t {{ target_version | string | quote }} '
+        def cond(t): (((.status.conditions // []) | map(select(.type == t)) | .[0]) // {});
+        ([(.status.conditionalUpdates // [])[] | select((.release.version // "") == $t)] | .[0]) as $c
+        | if ([(.status.availableUpdates // [])[] | (.version // "")] | map(. == $t) | any) then {edge: "RECOMMENDED"}
+          elif $c != null then {edge: "CONDITIONAL",
+                                recommended: ((((($c.conditions // []) | map(select(.type == "Recommended")) | .[0].status) // "Unknown")) | tostring),
+                                risks: [($c.risks // [])[] | {name: (.name // ""), message: ((.message // "") | .[0:300]), url: (.url // "")}]}
+          else {edge: "NOT_OFFERED", retrieved: ((cond("RetrievedUpdates").status // "Unknown") | tostring),
+                message: ((cond("RetrievedUpdates").message // "") | .[0:300])} end')" \
+        || state='{"edge":"QUERY_FAILED"}'
+      case "$state" in *'"RECOMMENDED"'*|*'"CONDITIONAL"'*) break ;; esac
+      [ "$SECONDS" -ge "$deadline" ] && break
+      sleep 15
+    done
+    printf '%s\n' "$state"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: upgrade_edge_raw
+  changed_when: false
+  failed_when: false
+
+- name: "Upgrade: Parse the offer"
+  set_fact:
+    upgrade_edge_state: >-
+      {{ (upgrade_edge_raw.stdout | from_json)
+         if ((upgrade_edge_raw.stdout | default('') | trim).startswith('{'))
+         else {'edge': 'QUERY_FAILED', 'message': (upgrade_edge_raw.stderr | default('') | truncate(300))} }}
+
+- name: "Upgrade: Stop — the cluster does not offer the target"
+  fail:
+    msg: >-
+      [HARD GATE FAILURE] {{ hop_label | default('Hop') }}: the cluster does not offer {{ target_version }} in channel
+      {{ upgrade_target_channel }} after {{ upgrade_edge_wait_seconds | default(300) }} s
+      (from {{ upgrade_cv.completed }}; RetrievedUpdates={{ upgrade_edge_state.retrieved | default('unknown') }}
+      {{ upgrade_edge_state.message | default('') }}). Check the version, the channel and the cluster's
+      access to the update service.
+  when: upgrade_edge_state.edge not in ['RECOMMENDED', 'CONDITIONAL']
+
+- name: "Upgrade: Stop — conditional update risks apply to this cluster"
+  fail:
+    msg: >-
+      [HARD GATE FAILURE] {{ hop_label | default('Hop') }}: {{ target_version }} is a conditional update for this cluster
+      (Recommended={{ upgrade_edge_state.recommended }}). Known risks:
+      {% for r in upgrade_edge_state.risks %}{{ r.name }}: {{ r.message }} ({{ r.url }}){% if not loop.last %}; {% endif %}{% endfor %}.
+      Review them; to accept, set allow_conditional_updates: true and re-run with --resume.
+  when:
+    - upgrade_edge_state.edge == 'CONDITIONAL'
+    - upgrade_edge_state.recommended != 'True'
+    - not (allow_conditional_updates | default(false) | bool)
+
+- name: "Upgrade: Record accepted conditional-update risks"
+  set_fact:
+    upgrade_accepted_risks: >-
+      {{ upgrade_edge_state.risks | default([])
+         if (upgrade_edge_state.edge == 'CONDITIONAL' and upgrade_edge_state.recommended != 'True') else [] }}
+
+- name: "Upgrade: Log accepted conditional-update risks"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "WARN"
+    event_gate: "HARD"
+    event_task: "{{ hop_label | default('Hop') }} conditional update"
+    event_reason: "allow_conditional_updates is true; accepting risks: {{ upgrade_accepted_risks | map(attribute='name') | join(', ') }}"
+    event_observed: "{{ upgrade_accepted_risks | map(attribute='url') | join(' ') }}"
+  when: upgrade_accepted_risks | length > 0
+
+# ----------------------------------------------------------------------------
+# 3. Admin-ack for minor hops (removed-API check first)
+# ----------------------------------------------------------------------------
+- name: "Upgrade: Configure the admin-ack step for this hop"
+  set_fact:
+    admin_ack_mode: "apply"
+    admin_ack_versions: ["{{ target_version | string }}"]
+    admin_ack_hop_label: "{{ hop_label | default('Hop') }}"
+  when: upgrade_is_minor_hop | bool
+
+- name: "Upgrade: Check removed-API usage and apply the admin-ack"
+  include_tasks: "{{ playbook_dir }}/roles/remediate/tasks/admin_acks.yml"
+  when: upgrade_is_minor_hop | bool
+
+# ----------------------------------------------------------------------------
+# 4. Emergency force path (explicit opt-in only)
+# ----------------------------------------------------------------------------
+- name: "Upgrade: Verify the emergency force confirmation"
+  assert:
+    that:
+      - force_image_pullspec | default('') | length > 0
+      - force_upgrade_confirm_token | default('') == 'CONFIRM_FORCE_UPGRADE'
+    fail_msg: >-
+      [HARD GATE FAILURE] allow_force_upgrade is true but force_image_pullspec is empty or
+      force_upgrade_confirm_token is not CONFIRM_FORCE_UPGRADE. A forced update is never automatic.
+  when: allow_force_upgrade | default(false) | bool
+
+# ----------------------------------------------------------------------------
+# 5. Trigger and confirm
+# ----------------------------------------------------------------------------
+- name: "Upgrade: Start the update to {{ target_version }}"
+  command: >-
+    oc adm upgrade --to={{ target_version | string | quote }}
+    {{ '--allow-not-recommended' if (upgrade_accepted_risks | length > 0) else '' }}
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: upgrade_trigger_result
+  changed_when: true
+  when: not (allow_force_upgrade | default(false) | bool)
+
+- name: "Upgrade: Start the update to the forced image (emergency path)"
+  command: "oc adm upgrade --to-image={{ force_image_pullspec | quote }} --allow-explicit-upgrade --allow-not-recommended --force"
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: upgrade_force_result
+  changed_when: true
+  when: allow_force_upgrade | default(false) | bool
+
+# Why: the command returning 0 only means the request was written; the hop really
+#      starts when ClusterVersion's desired version becomes the target.
+- name: "Upgrade: Confirm ClusterVersion accepted the update"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    deadline=$((SECONDS + 180))
+    while :; do
+      desired="$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || true)"
+      [ "$desired" = {{ target_version | string | quote }} ] && { echo "ACCEPTED"; exit 0; }
+      [ "$SECONDS" -ge "$deadline" ] && break
+      sleep 10
+    done
+    msg="$(oc get clusterversion version -o json 2>/dev/null | jq -r '[(.status.conditions // [])[] | select(.type == "ReleaseAccepted" or .type == "Failing") | "\(.type)=\(.status): \(.message // "")"] | join(" | ")' || true)"
+    echo "NOT_ACCEPTED desired=${desired:-unknown} ${msg}"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: upgrade_accept_raw
+  changed_when: false
+  failed_when: false
+  when: not (allow_force_upgrade | default(false) | bool)
+
+- name: "Upgrade: Stop — the update request was not accepted"
+  fail:
+    msg: >-
+      [HARD GATE FAILURE] {{ hop_label | default('Hop') }}: ClusterVersion did not accept the update to {{ target_version }}
+      within 3 minutes: {{ upgrade_accept_raw.stdout | default('') | truncate(600) }}
+  when:
+    - not (allow_force_upgrade | default(false) | bool)
+    - not ((upgrade_accept_raw.stdout | default('')).startswith('ACCEPTED'))
+
+- name: "Upgrade: Log the hop start"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "START"
+    event_gate: "HARD"
+    event_task: "{{ hop_label | default('Hop') }} update"
+    event_reason: "Update to {{ target_version }} started from {{ upgrade_cv.completed }} (channel {{ upgrade_target_channel }}{{ ', conditional risks accepted' if (upgrade_accepted_risks | length > 0) else '' }})"
+    event_observed: "{{ (upgrade_trigger_result.stdout | default(upgrade_force_result.stdout | default(''))) | truncate(300) }}"

@@ -1,0 +1,546 @@
+---
+# ============================================================================
+# Role Tasks: monitor / poll_body.yml — One Poll of the Live Cluster
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses shell, set_fact, include_tasks, include_role, debug, wait_for.
+#
+# Purpose: Reads ClusterVersion, ClusterOperators, MachineConfigPools and Nodes in one
+#          API call, then:
+#          1. tolerates API outages up to monitor_api_outage_minutes (re-login on 401),
+#          2. tracks progress (no-progress timeout) and fails fast when the release is
+#             not accepted or ClusterVersion reports Failing for too long,
+#          3. raises one degradation alert per condition once its grace period passes,
+#          4. sends the heartbeat every heartbeat_minutes,
+#          5. evaluates the settle gate (settle_consecutive_polls in a row),
+#          6. waits poll_interval_minutes before the next poll.
+# Why:     Every time value comes from `date +%s` read in this poll (ansible_date_time
+#          is frozen at fact gathering). A failed query is not fatal on its own.
+# Role / Playbook Dependencies: tasks/notify.yml, tasks/log_event.yml, roles/login
+# Gate Type: HARD (sets hop_settled / monitor_abort; main.yml enforces)
+# Outputs: poll_data, poll_cv, hop_settled, monitor_abort*, progress_* facts
+# ============================================================================
+
+- name: "Poll: Read the clock"
+  set_fact:
+    monitor_iterations_completed: "{{ poll_iteration_idx }}"
+    poll_now_epoch: "{{ lookup('pipe', 'date +%s') | int }}"
+
+- name: "Poll: Format elapsed time"
+  set_fact:
+    _poll_elapsed: >-
+      {%- set s = (poll_now_epoch | int) - (monitor_start_epoch | int) -%}
+      {{ '%02d:%02d:%02d' | format(s // 3600, (s % 3600) // 60, s % 60) }}
+
+# ----------------------------------------------------------------------------
+# 1. Query the cluster (one call; never fails the task)
+# ----------------------------------------------------------------------------
+# Why: the query always prints one JSON object. {"ok": false, "error": ...} means the
+#      API could not be read in this poll; the outage timer below decides when that
+#      becomes fatal.
+- name: "Poll: Query ClusterVersion, ClusterOperators, MachineConfigPools and Nodes"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    tmpd="$(mktemp -d)"
+    trap 'rm -rf "$tmpd"' EXIT
+    emit_error() { jq -cn --arg e "$1" '{ok: false, error: $e}'; exit 0; }
+    oc get clusterversion,clusteroperators,machineconfigpools,nodes -o json --request-timeout=60s \
+      >"$tmpd/state.json" 2>"$tmpd/err" || emit_error "$(head -c 600 "$tmpd/err")"
+    jq -c --argjson allow {{ co_allow_list | default([]) | to_json | quote }} '
+      def cstat(t): ([(.status.conditions // [])[] | select(.type == t) | .status] | .[0]) // "Unknown";
+      def cmsg(t): ([(.status.conditions // [])[] | select(.type == t) | (.message // "")] | .[0]) // "";
+      def ann(k): ((.metadata.annotations // {})[k] // "");
+      def role: ((.metadata.labels // {}) | keys
+                 | map(select(startswith("node-role.kubernetes.io/")) | ltrimstr("node-role.kubernetes.io/"))) as $r
+        | if ($r | map(. == "master" or . == "control-plane") | any) then "master"
+          elif ($r | map(. == "infra") | any) then "infra"
+          else "worker" end;
+      def updating: (ann("machineconfiguration.openshift.io/state") == "Working")
+        or (ann("machineconfiguration.openshift.io/currentConfig") != ann("machineconfiguration.openshift.io/desiredConfig"));
+      def unsettled: (cstat("Ready") != "True") or updating
+        or (ann("machineconfiguration.openshift.io/state") == "Degraded");
+      (.items // []) as $all
+      | ([$all[] | select(.kind == "ClusterVersion")] | .[0] // {}) as $cv
+      | ($cv.status.desired.version // "") as $desired
+      | [$all[] | select(.kind == "ClusterOperator")] as $allcos
+      | [$allcos[] | select(.metadata.name as $n | ($allow | map(. == $n) | any) | not)] as $cos
+      | [$all[] | select(.kind == "MachineConfigPool")] as $mcps
+      | [$all[] | select(.kind == "Node")] as $nodes
+      | {
+          ok: true,
+          cv: {
+            desired: $desired,
+            latest: ((($cv.status.history // []) | .[0].version) // ""),
+            latest_state: ((($cv.status.history // []) | .[0].state) // ""),
+            completed: ((($cv.status.history // []) | map(select(.state == "Completed")) | .[0].version) // ""),
+            available: ($cv | cstat("Available")),
+            progressing: ($cv | cstat("Progressing")),
+            failing: ($cv | cstat("Failing")),
+            failing_msg: ($cv | cmsg("Failing") | .[0:300]),
+            release_accepted: ($cv | cstat("ReleaseAccepted")),
+            release_msg: ($cv | cmsg("ReleaseAccepted") | .[0:300]),
+            message: ($cv | cmsg("Progressing") | .[0:300])
+          },
+          co: {
+            total: ($allcos | length),
+            at_desired: ([$allcos[] | select((((.status.versions // []) | map(select(.name == "operator")) | .[0].version) // "") == $desired)] | length),
+            degraded: [$cos[] | select(cstat("Degraded") == "True") | .metadata.name],
+            progressing: [$cos[] | select(cstat("Progressing") == "True") | .metadata.name],
+            unavailable: [$cos[] | select(cstat("Available") != "True") | .metadata.name]
+          },
+          mcp: [$mcps[] | {
+            name: .metadata.name,
+            total_count: (.status.machineCount // 0),
+            ready_count: (.status.readyMachineCount // 0),
+            updated_count: (.status.updatedMachineCount // 0),
+            degraded_count: (.status.degradedMachineCount // 0),
+            updated: cstat("Updated"),
+            updating: cstat("Updating"),
+            degraded: cstat("Degraded"),
+            paused: (.spec.paused // false)
+          }],
+          nodes_total: ($nodes | length),
+          unsettled_nodes: [$nodes[] | select(unsettled) | .metadata.name],
+          active_nodes: [$nodes[] | select(unsettled or (.spec.unschedulable // false)) | {
+            name: .metadata.name,
+            role: role,
+            action: (if cstat("Ready") != "True" then "Rebooting / NotReady"
+                     elif ann("machineconfiguration.openshift.io/state") == "Degraded" then "Machine-config daemon Degraded"
+                     elif updating and (.spec.unschedulable // false) then "Draining / updating"
+                     elif updating then "Applying configuration"
+                     else "Cordoned" end)
+          }],
+          problem_nodes: [$nodes[] | . as $n
+            | ([ (if ($n | cstat("Ready")) != "True" then {c: "NotReady", m: ($n | cmsg("Ready"))} else empty end),
+                 ((.status.conditions // [])[]
+                   | select((.type == "DiskPressure" or .type == "MemoryPressure" or .type == "PIDPressure") and .status == "True")
+                   | {c: .type, m: (.message // "")}),
+                 (if ($n | ann("machineconfiguration.openshift.io/state")) == "Degraded"
+                  then {c: "MachineConfigDaemonDegraded", m: ($n | ann("machineconfiguration.openshift.io/reason"))} else empty end) ]) as $p
+            | select(($p | length) > 0)
+            | {name: .metadata.name, role: role, condition: ($p | map(.c) | join(", ")), message: (($p[0].m // "") | .[0:200])}],
+          conditions: (
+            [ $nodes[] | select(cstat("Ready") != "True")
+              | {key: ("node-notready:" + .metadata.name),
+                 title: ("Node " + .metadata.name + " not Ready"),
+                 detail: ((if (.spec.unschedulable // false) then "cordoned by the update; " else "NOT cordoned; " end) + (cmsg("Ready") | .[0:200])),
+                 grace: (if (.spec.unschedulable // false) then "node_notready" else "uncordoned_notready" end)} ]
+            + [ $nodes[] | .metadata.name as $nn | (.status.conditions // [])[]
+              | select((.type == "DiskPressure" or .type == "MemoryPressure" or .type == "PIDPressure") and .status == "True")
+              | {key: ("node-pressure:" + $nn + ":" + .type), title: ("Node " + $nn + " " + .type),
+                 detail: ((.message // "") | .[0:200]), grace: "pressure"} ]
+            + [ $nodes[] | select(updating and (cstat("Ready") == "True"))
+              | {key: ("node-stalled:" + .metadata.name), title: ("Node " + .metadata.name + " still updating"),
+                 detail: ("machine-config daemon state " + (ann("machineconfiguration.openshift.io/state") | if . == "" then "unknown" else . end)
+                          + (if (.spec.unschedulable // false) then "; node cordoned (a PodDisruptionBudget may be blocking the drain)" else "" end)),
+                 grace: "node_stall"} ]
+            + [ $nodes[] | select(ann("machineconfiguration.openshift.io/state") == "Degraded")
+              | {key: ("node-mcd-degraded:" + .metadata.name), title: ("Node " + .metadata.name + " machine-config daemon Degraded"),
+                 detail: (ann("machineconfiguration.openshift.io/reason") | .[0:200]), grace: "co"} ]
+            + [ $cos[] | select(cstat("Degraded") == "True")
+              | {key: ("co-degraded:" + .metadata.name), title: ("ClusterOperator " + .metadata.name + " Degraded"),
+                 detail: (cmsg("Degraded") | .[0:200]), grace: "co"} ]
+            + [ $cos[] | select(cstat("Available") != "True")
+              | {key: ("co-unavailable:" + .metadata.name), title: ("ClusterOperator " + .metadata.name + " not Available"),
+                 detail: (cmsg("Available") | .[0:200]), grace: "co"} ]
+            + [ $mcps[] | select(cstat("Degraded") == "True")
+              | {key: ("mcp-degraded:" + .metadata.name), title: ("MachineConfigPool " + .metadata.name + " Degraded"),
+                 detail: (cmsg("Degraded") | .[0:200]), grace: "co"} ]
+            + (if ($cv | cstat("Failing")) == "True"
+               then [{key: "cv-failing", title: "ClusterVersion reports Failing", detail: ($cv | cmsg("Failing") | .[0:200]), grace: "cv_failing"}]
+               else [] end)
+          )
+        }
+    ' "$tmpd/state.json" >"$tmpd/out.json" 2>"$tmpd/err" || emit_error "unreadable cluster state: $(head -c 300 "$tmpd/err")"
+    cat "$tmpd/out.json"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: poll_raw
+  changed_when: false
+  failed_when: false
+
+- name: "Poll: Parse cluster state"
+  set_fact:
+    poll_data: >-
+      {{ (poll_raw.stdout | from_json)
+         if ((poll_raw.stdout | default('') | trim) is match('[{]'))
+         else {'ok': false, 'error': (poll_raw.stderr | default('', true) | trim | truncate(600)) or 'the state query produced no output'} }}
+
+# ----------------------------------------------------------------------------
+# 2. API outage handling
+# ----------------------------------------------------------------------------
+- name: "Poll: Track API reachability"
+  set_fact:
+    monitor_api_fail_since: >-
+      {{ 0 if (poll_data.ok | default(false) | bool)
+         else ((monitor_api_fail_since | int) if ((monitor_api_fail_since | int) > 0) else (poll_now_epoch | int)) }}
+
+# Why: OAuth tokens expire (24 h by default); a long multi-hop run logs in again
+#      instead of treating an expired session as an outage.
+- name: "Poll: Log in again — the session token was rejected"
+  include_role:
+    name: login
+  when:
+    - not (poll_data.ok | default(false) | bool)
+    - poll_data.error | default('') is search('(?i)unauthorized|must be logged in')
+
+- name: "Poll: Report unreachable API"
+  debug:
+    msg: >-
+      [POLL {{ '%03d' | format(poll_iteration_idx | int) }}] {{ _poll_elapsed }} | cluster API not readable for
+      {{ ((poll_now_epoch | int) - (monitor_api_fail_since | int)) // 60 }} min
+      (tolerated up to {{ monitor_api_outage_minutes | default(10) }} min): {{ poll_data.error | default('unknown') | truncate(300) }}
+  when: not (poll_data.ok | default(false) | bool)
+
+- name: "Poll: Abort — cluster API unreachable for too long"
+  set_fact:
+    monitor_abort: true
+    monitor_abort_code: 30
+    monitor_abort_reason: >-
+      the cluster API could not be read for {{ ((poll_now_epoch | int) - (monitor_api_fail_since | int)) // 60 }} minutes
+      (last error: {{ poll_data.error | default('unknown') | truncate(300) }})
+  when:
+    - not (poll_data.ok | default(false) | bool)
+    - ((poll_now_epoch | int) - (monitor_api_fail_since | int)) >= ((monitor_api_outage_minutes | default(10) | int) * 60)
+
+# ----------------------------------------------------------------------------
+# 3. Analyse a successful poll
+# ----------------------------------------------------------------------------
+- name: "Poll: Analyse cluster state"
+  when: poll_data.ok | default(false) | bool
+  block:
+    - name: "Poll: Derive version and pool facts"
+      set_fact:
+        poll_cv: "{{ poll_data.cv }}"
+        _poll_unpaused_mcp: "{{ poll_data.mcp | selectattr('paused', 'equalto', false) | list }}"
+        _poll_paused_mcp: "{{ poll_data.mcp | selectattr('paused', 'equalto', true) | map(attribute='name') | list }}"
+        _poll_cv_settled: >-
+          {{ ((poll_data.cv.latest == resolved_target_version and poll_data.cv.latest_state == 'Completed')
+              or monitor_mode_effective != 'hop')
+             and poll_data.cv.available == 'True'
+             and poll_data.cv.progressing != 'True'
+             and poll_data.cv.failing != 'True' }}
+        _poll_cv_pct: >-
+          {{ 100 if (poll_data.cv.latest == resolved_target_version and poll_data.cv.latest_state == 'Completed')
+             else ((poll_data.cv.message | regex_search('[0-9]+% complete') or '0') | regex_replace('[^0-9]', '') | int) }}
+
+    - name: "Poll: Derive rollout progress and blockers"
+      set_fact:
+        monitor_mcp_rollout_seen: >-
+          {{ (monitor_mcp_rollout_seen | default(false) | bool)
+             or ((_poll_unpaused_mcp | selectattr('updating', 'equalto', 'True') | list | length) > 0)
+             or ((_poll_unpaused_mcp | map(attribute='updated_count') | sum) < (_poll_unpaused_mcp | map(attribute='total_count') | sum)) }}
+        _poll_pools_unsettled: >-
+          {{ (_poll_unpaused_mcp | map(attribute='name') | list)
+             | difference(_poll_unpaused_mcp | selectattr('updated', 'equalto', 'True')
+                          | rejectattr('updating', 'equalto', 'True') | rejectattr('degraded', 'equalto', 'True')
+                          | map(attribute='name') | list) }}
+
+    - name: "Poll: List what still blocks the settle gate"
+      set_fact:
+        _poll_blockers: >-
+          {{ ((['ClusterVersion at ' ~ (poll_data.cv.latest or 'unknown') ~ ' (' ~ (poll_data.cv.latest_state or 'unknown')
+                ~ ', Progressing=' ~ poll_data.cv.progressing ~ ', Failing=' ~ poll_data.cv.failing ~ ')'])
+               if not (_poll_cv_settled | bool) else [])
+             + ((['operators degraded: ' ~ (poll_data.co.degraded | join(', '))]) if (poll_data.co.degraded | length > 0) else [])
+             + ((['operators progressing: ' ~ (poll_data.co.progressing | join(', '))]) if (poll_data.co.progressing | length > 0) else [])
+             + ((['operators unavailable: ' ~ (poll_data.co.unavailable | join(', '))]) if (poll_data.co.unavailable | length > 0) else [])
+             + ((['pools not updated: ' ~ (_poll_pools_unsettled | join(', '))]) if (_poll_pools_unsettled | length > 0) else [])
+             + ((['nodes updating / not ready: ' ~ (poll_data.unsettled_nodes | join(', ') | truncate(200))]) if (poll_data.unsettled_nodes | length > 0) else []) }}
+        progress_percent: >-
+          {%- set mcp_total = _poll_unpaused_mcp | map(attribute='total_count') | sum -%}
+          {%- set mcp_upd = _poll_unpaused_mcp | map(attribute='updated_count') | sum -%}
+          {%- set mcp_pct = ((mcp_upd * 100) // mcp_total) if ((monitor_mcp_rollout_seen | bool) and mcp_total > 0) else 0 -%}
+          {%- if monitor_mode_effective == 'rollout' -%}
+          {{ [mcp_pct, 99] | min }}
+          {%- else -%}
+          {{ [((_poll_cv_pct | int) * 60 + mcp_pct * 40) // 100, 99] | min }}
+          {%- endif -%}
+        # Why: changes in any of these mean the update is still moving.
+        _poll_signature: >-
+          {{ poll_data.cv.latest }}|{{ poll_data.cv.latest_state }}|{{ _poll_cv_pct }}|{{ poll_data.cv.message | regex_search('[0-9]+ of [0-9]+ done') | default('', true) }}|{{ poll_data.co.at_desired }}|{{ poll_data.mcp | map(attribute='updated_count') | join(',') }}|{{ poll_data.mcp | map(attribute='ready_count') | join(',') }}|{{ poll_data.active_nodes | map(attribute='name') | join(',') }}|{{ poll_data.active_nodes | map(attribute='action') | join(',') }}
+
+    # Why: in rollout mode the Machine Config Operator needs a moment to render the new
+    #      configuration; until the rollout is seen (or three poll intervals pass, for a
+    #      pool that had nothing pending) an unchanged cluster is not "settled".
+    - name: "Poll: Evaluate the settle gate"
+      set_fact:
+        monitor_settled_streak: >-
+          {{ ((monitor_settled_streak | int) + 1)
+             if ((_poll_blockers | length == 0)
+                 and (monitor_mode_effective == 'hop'
+                      or (monitor_mcp_rollout_seen | bool)
+                      or ((poll_now_epoch | int) - (monitor_start_epoch | int)) >= (3 * (monitor_poll_seconds | int))))
+             else 0 }}
+        monitor_last_progress_epoch: "{{ (poll_now_epoch | int) if (_poll_signature != monitor_progress_signature) else (monitor_last_progress_epoch | int) }}"
+        monitor_progress_signature: "{{ _poll_signature }}"
+        monitor_release_rejected_since: >-
+          {{ (((monitor_release_rejected_since | int) if ((monitor_release_rejected_since | int) > 0) else (poll_now_epoch | int)))
+             if (monitor_mode_effective == 'hop'
+                 and (poll_data.cv.release_accepted == 'False' or poll_data.cv.desired != resolved_target_version))
+             else 0 }}
+        monitor_cv_failing_since: >-
+          {{ (((monitor_cv_failing_since | int) if ((monitor_cv_failing_since | int) > 0) else (poll_now_epoch | int)))
+             if (poll_data.cv.failing == 'True') else 0 }}
+
+    - name: "Poll: Record settle state"
+      set_fact:
+        hop_settled: "{{ (monitor_settled_streak | int) >= (settle_consecutive_polls | default(2) | int) }}"
+
+    - name: "Poll: Set progress to 100% once settled"
+      set_fact:
+        progress_percent: 100
+      when: hop_settled | bool
+
+    # ------------------------------------------------------------------------
+    # 4. Fail-fast conditions
+    # ------------------------------------------------------------------------
+    - name: "Poll: Abort — release not accepted / desired version changed"
+      set_fact:
+        monitor_abort: true
+        monitor_abort_code: 20
+        monitor_abort_reason: >-
+          {{ ('ClusterVersion desired version is ' ~ (poll_data.cv.desired or 'unset') ~ ', not the hop target (changed outside this automation?)')
+             if (poll_data.cv.desired != resolved_target_version)
+             else ('the release was not accepted for ' ~ (release_not_accepted_fail_minutes | default(10)) ~ ' minutes: ' ~ (poll_data.cv.release_msg or 'no message')) }}
+      when:
+        - not (hop_settled | bool)
+        - (monitor_release_rejected_since | int) > 0
+        - ((poll_now_epoch | int) - (monitor_release_rejected_since | int)) >= ((release_not_accepted_fail_minutes | default(10) | int) * 60)
+
+    - name: "Poll: Abort — ClusterVersion Failing for too long"
+      set_fact:
+        monitor_abort: true
+        monitor_abort_code: 20
+        monitor_abort_reason: >-
+          ClusterVersion has reported Failing for {{ ((poll_now_epoch | int) - (monitor_cv_failing_since | int)) // 60 }} minutes:
+          {{ poll_data.cv.failing_msg or 'no message' }}
+      when:
+        - not (hop_settled | bool)
+        - not (monitor_abort | bool)
+        - (monitor_cv_failing_since | int) > 0
+        - ((poll_now_epoch | int) - (monitor_cv_failing_since | int)) >= ((cv_failing_fail_minutes | default(30) | int) * 60)
+
+    - name: "Poll: Abort — no progress within the no-progress timeout"
+      set_fact:
+        monitor_abort: true
+        monitor_abort_code: 30
+        monitor_abort_reason: >-
+          no progress for {{ ((poll_now_epoch | int) - (monitor_last_progress_epoch | int)) // 60 }} minutes
+          (limit {{ hop_timeout_minutes | default(90) }}). Still open: {{ _poll_blockers | join('; ') or 'nothing reported' }}
+      when:
+        - not (hop_settled | bool)
+        - not (monitor_abort | bool)
+        - ((poll_now_epoch | int) - (monitor_last_progress_epoch | int)) >= ((hop_timeout_minutes | default(90) | int) * 60)
+
+    # ------------------------------------------------------------------------
+    # 5. Degradation tracking (grace periods, one alert per condition)
+    # ------------------------------------------------------------------------
+    - name: "Poll: Track when each open condition was first seen"
+      set_fact:
+        degradation_first_seen: >-
+          {%- set out = {} -%}
+          {%- for c in poll_data.conditions -%}
+          {%- set _ = out.update({c.key: ((degradation_first_seen[c.key] | int) if (c.key in degradation_first_seen) else (poll_now_epoch | int))}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "Poll: Select conditions open longer than their grace period"
+      set_fact:
+        progress_open_issues: >-
+          {%- set out = [] -%}
+          {%- for c in poll_data.conditions -%}
+          {%- set mins = ((poll_now_epoch | int) - (degradation_first_seen[c.key] | int)) // 60 -%}
+          {%- if mins >= (_grace_map[c.grace] | default(10) | int) -%}
+          {%- set _ = out.append({'key': c.key, 'title': c.title, 'detail': c.detail, 'minutes': mins}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      vars:
+        _grace_map:
+          node_notready: "{{ degradation_node_notready_minutes | default(15) }}"
+          uncordoned_notready: "{{ degradation_uncordoned_notready_minutes | default(5) }}"
+          pressure: "{{ degradation_pressure_minutes | default(5) }}"
+          node_stall: "{{ node_stall_threshold_minutes | default(30) }}"
+          co: "{{ degradation_co_minutes | default(10) }}"
+          cv_failing: "{{ degradation_cv_failing_minutes | default(10) }}"
+
+    - name: "Poll: Pick conditions not alerted yet"
+      set_fact:
+        degradation_new_items: >-
+          {%- set out = [] -%}
+          {%- for c in progress_open_issues -%}
+          {%- if c.key not in degradation_alerted -%}
+          {%- set _ = out.append(c) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # ------------------------------------------------------------------------
+    # 6. Notifications (degradation alert, else heartbeat)
+    # ------------------------------------------------------------------------
+    - name: "Poll: Prepare progress mail content"
+      set_fact:
+        progress_label: "{{ monitor_label }}"
+        progress_target_version: "{{ resolved_target_version }}"
+        progress_hop_elapsed: "{{ _poll_elapsed }}"
+        progress_cv_version: "{{ poll_data.cv.latest }}{{ (' (' ~ poll_data.cv.latest_state ~ ')') if (poll_data.cv.latest_state | length > 0) else '' }}"
+        progress_cv_message: "{{ poll_data.cv.failing_msg if (poll_data.cv.failing == 'True') else poll_data.cv.message }}"
+        progress_mcp_list: "{{ poll_data.mcp }}"
+        progress_active_nodes: "{{ poll_data.active_nodes }}"
+        progress_degraded_nodes: "{{ poll_data.problem_nodes }}"
+        _poll_heartbeat_due: "{{ ((poll_now_epoch | int) - (last_heartbeat_epoch | int)) >= ((heartbeat_minutes | default(20) | int) * 60) }}"
+        _poll_send_degradation: "{{ (degradation_new_items | length > 0) and not (monitor_abort | bool) }}"
+
+    - name: "Poll: Log new degradation conditions"
+      include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+      vars:
+        event_status: "WARN"
+        event_gate: "INFO"
+        event_task: "Phase 04 degradation ({{ monitor_label }})"
+        event_reason: "{{ degradation_new_items | map(attribute='title') | join('; ') }}"
+        event_observed: "{{ degradation_new_items | map(attribute='detail') | join(' | ') | truncate(500) }}"
+      when: degradation_new_items | length > 0
+
+    - name: "Poll: Prepare degradation alert"
+      set_fact:
+        notify_event: "degradation"
+        notify_headline: >-
+          {{ monitor_label }}: {{ degradation_new_items[0].title }}{{ (' (+' ~ ((degradation_new_items | length) - 1) ~ ' more)') if (degradation_new_items | length > 1) else '' }}
+        notify_attachments_requested: []
+      when: _poll_send_degradation | bool
+
+    - name: "Poll: Send degradation alert"
+      include_tasks: "{{ playbook_dir }}/tasks/notify.yml"
+      when: _poll_send_degradation | bool
+
+    # Why: a degradation alert carries the full progress picture, so it also counts
+    #      as the heartbeat; each condition is alerted once per monitoring session.
+    - name: "Poll: Record alerted conditions"
+      set_fact:
+        degradation_alerted: "{{ degradation_alerted + (degradation_new_items | map(attribute='key') | list) }}"
+        last_heartbeat_epoch: "{{ (poll_now_epoch | int) if (_poll_send_degradation | bool) else (last_heartbeat_epoch | int) }}"
+      when: degradation_new_items | length > 0
+
+    - name: "Poll: Prepare heartbeat"
+      set_fact:
+        degradation_new_items: []
+        notify_event: "heartbeat"
+        notify_headline: "{{ monitor_label }} to {{ resolved_target_version }}: {{ progress_percent }}% after {{ _poll_elapsed }}"
+        notify_attachments_requested: []
+      when:
+        - _poll_heartbeat_due | bool
+        - not (_poll_send_degradation | bool)
+        - not (hop_settled | bool)
+        - not (monitor_abort | bool)
+
+    - name: "Poll: Send heartbeat"
+      include_tasks: "{{ playbook_dir }}/tasks/notify.yml"
+      when:
+        - _poll_heartbeat_due | bool
+        - not (_poll_send_degradation | bool)
+        - not (hop_settled | bool)
+        - not (monitor_abort | bool)
+
+    - name: "Poll: Restart the heartbeat timer"
+      set_fact:
+        last_heartbeat_epoch: "{{ poll_now_epoch | int }}"
+      when:
+        - _poll_heartbeat_due | bool
+        - not (_poll_send_degradation | bool)
+        - not (hop_settled | bool)
+        - not (monitor_abort | bool)
+
+    # ------------------------------------------------------------------------
+    # 7. Tier 2 (opt-in): force the machine-config daemon on a node degraded too long
+    # ------------------------------------------------------------------------
+    # Why: /run/machine-config-daemon-force makes the daemon skip on-disk validation,
+    #      the documented recovery for a daemon Degraded on "unexpected on-disk state".
+    #      It does not help a drain blocked by a PodDisruptionBudget, so it is applied
+    #      only to nodes whose daemon reports Degraded, once per node per session.
+    - name: "Poll: Select nodes for the Tier 2 machine-config daemon force"
+      set_fact:
+        _poll_force_candidates: >-
+          {%- set out = [] -%}
+          {%- for k in degradation_first_seen -%}
+          {%- set node = k | regex_replace('^node-mcd-degraded:', '') -%}
+          {%- if k is match('node-mcd-degraded:') and node not in stalled_nodes_forced
+                and ((poll_now_epoch | int) - (degradation_first_seen[k] | int)) >= ((node_stall_threshold_minutes | default(30) | int) * 60) -%}
+          {%- set _ = out.append(node) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      when: auto_force_stalled_node | default(false) | bool
+
+    - name: "Auto-Remediation (Tier 2): Force the machine-config daemon on degraded node"
+      shell: |
+        # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+        set -o pipefail
+        timeout 300 oc debug {{ ('node/' ~ item) | quote }} -- chroot /host touch /run/machine-config-daemon-force
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: mcd_force_results
+      changed_when: mcd_force_results.rc == 0
+      failed_when: false
+      loop: "{{ _poll_force_candidates | default([]) }}"
+      when: auto_force_stalled_node | default(false) | bool
+
+    - name: "Auto-Remediation (Tier 2): Record forced nodes"
+      set_fact:
+        stalled_nodes_forced: "{{ stalled_nodes_forced + (_poll_force_candidates | default([])) }}"
+      when:
+        - auto_force_stalled_node | default(false) | bool
+        - _poll_force_candidates | default([]) | length > 0
+
+    - name: "Auto-Remediation (Tier 2): Log the machine-config daemon force"
+      include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+      vars:
+        event_status: "AUTO-FIX"
+        event_gate: "INFO"
+        event_task: "Phase 04 machine-config daemon force"
+        event_reason: "Created /run/machine-config-daemon-force on {{ _poll_force_candidates | join(', ') }} (daemon Degraded for over {{ node_stall_threshold_minutes | default(30) }} min)"
+        event_observed: "exit codes {{ mcd_force_results.results | default([]) | selectattr('rc', 'defined') | map(attribute='rc') | list }}"
+      when:
+        - auto_force_stalled_node | default(false) | bool
+        - _poll_force_candidates | default([]) | length > 0
+
+    # ------------------------------------------------------------------------
+    # 8. Console status row
+    # ------------------------------------------------------------------------
+    - name: "Poll: Status"
+      debug:
+        msg: >-
+          [POLL {{ '%03d' | format(poll_iteration_idx | int) }}] {{ _poll_elapsed }} | {{ progress_percent }}% |
+          CV {{ poll_data.cv.latest or '?' }} {{ poll_data.cv.latest_state }} (desired {{ poll_data.cv.desired or '?' }}) |
+          COs at target {{ poll_data.co.at_desired }}/{{ poll_data.co.total }} |
+          MCP {% for p in poll_data.mcp %}{{ p.name }} {{ p.updated_count }}/{{ p.total_count }}{{ ' paused' if p.paused else '' }}{% if not loop.last %}, {% endif %}{% endfor %} |
+          updating: {{ poll_data.active_nodes | map(attribute='name') | join(', ') | truncate(120) or 'none' }} |
+          issues: {{ progress_open_issues | map(attribute='title') | join('; ') | truncate(160) or 'none' }} |
+          settled {{ monitor_settled_streak }}/{{ settle_consecutive_polls | default(2) }}
+
+# ----------------------------------------------------------------------------
+# 9. Hard limit and cadence
+# ----------------------------------------------------------------------------
+- name: "Poll: Abort — hard time limit reached"
+  set_fact:
+    monitor_abort: true
+    monitor_abort_code: 30
+    monitor_abort_reason: >-
+      not settled after {{ hop_max_minutes | default(480) }} minutes (hard limit).
+      Still open: {{ _poll_blockers | default([]) | join('; ') or 'unknown' }}
+  when:
+    - not (hop_settled | bool)
+    - not (monitor_abort | bool)
+    - ((poll_now_epoch | int) - (monitor_start_epoch | int)) >= ((hop_max_minutes | default(480) | int) * 60)
+
+- name: "Poll: Wait {{ poll_interval_minutes | default(2) }} min before the next poll"
+  wait_for:
+    timeout: "{{ monitor_poll_seconds | int }}"
+  when:
+    - not (hop_settled | bool)
+    - not (monitor_abort | bool)

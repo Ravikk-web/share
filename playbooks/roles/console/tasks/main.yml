@@ -1,0 +1,153 @@
+---
+# ============================================================================
+# Role Tasks: console — Web Console Developer Perspective
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses shell, set_fact, include_tasks, debug.
+#
+# Purpose: After the upgrade, makes sure the web console's Developer perspective is
+#          enabled (Phase 06 closeout, live runs only; dry runs and post-checks only
+#          report it).
+# How:     consoles.operator.openshift.io/cluster spec.customization.perspectives holds
+#          one entry per perspective ({id, visibility: {state}}). With no "dev" entry
+#          the release default applies: Enabled before OpenShift 4.19, Disabled from
+#          4.19. A "dev" entry set to AccessReview (RBAC-driven visibility) is an admin
+#          choice and is left unchanged; only Disabled (explicit or default) is changed.
+# Why:     A JSON merge patch replaces the whole perspectives list, so the patch
+#          re-sends every other entry unchanged and only sets "dev" to Enabled.
+# Cluster writes: consoles.operator.openshift.io/cluster spec.customization.perspectives
+# Inputs:  enable_developer_perspective, dry_run, console_settle_timeout_minutes,
+#          run_final_version (optional)
+# Role / Playbook Dependencies: vars/upgrade.yml, tasks/log_event.yml, jq 1.5
+# Gate Type: WARN (a failure is reported; it never fails the finished upgrade)
+# Outputs: developer_perspective_status (text), developer_perspective_state
+#          (PASS | WARN | AUTO-FIXED), developer_perspective_changed (bool)
+# ============================================================================
+
+- name: "console: Read the console configuration and cluster version"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get consoles.operator.openshift.io cluster -o json | jq -c '{
+      perspectives: (.spec.customization.perspectives // []),
+      management_state: (.spec.managementState // "Managed")}'
+    oc get clusterversion version -o json | jq -r '(((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // "")'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: console_state_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: console_state_raw.rc == 0
+
+- name: "console: Determine the effective Developer perspective state"
+  set_fact:
+    _console_cfg: "{{ console_state_raw.stdout_lines[0] | from_json }}"
+    _console_version: "{{ (console_state_raw.stdout_lines[1] | default('') | trim) or (run_final_version | default('')) }}"
+
+- name: "console: Resolve state and the patched perspective list"
+  set_fact:
+    _console_dev_entry: "{{ _console_cfg.perspectives | selectattr('id', 'equalto', 'dev') | list }}"
+    _console_default_state: >-
+      {%- set p = (_console_version | string).split('.') -%}
+      {{ 'Disabled' if ((p | length >= 2) and ((p[0] | int, p[1] | int) >= (4, 19))) else 'Enabled' }}
+    _console_new_perspectives: >-
+      {{ (_console_cfg.perspectives | rejectattr('id', 'equalto', 'dev') | list)
+         + [{'id': 'dev', 'visibility': {'state': 'Enabled'}}] }}
+
+- name: "console: Decide what to do"
+  set_fact:
+    _console_state: "{{ ((_console_dev_entry[0].visibility | default({})).state | default('Enabled')) if (_console_dev_entry | length > 0) else _console_default_state }}"
+    _console_source: "{{ 'explicit setting' if (_console_dev_entry | length > 0) else ('release default for ' ~ (_console_version or 'this version')) }}"
+
+- name: "console: Record a perspective that needs no change"
+  set_fact:
+    developer_perspective_changed: false
+    developer_perspective_state: "{{ 'PASS' if _console_state == 'Enabled' else 'WARN' }}"
+    developer_perspective_status: >-
+      {{ ('Already enabled (' ~ _console_source ~ ')') if _console_state == 'Enabled'
+         else ('Visibility is AccessReview (' ~ _console_source ~ '); left unchanged') if _console_state == 'AccessReview'
+         else ('Console is ' ~ _console_cfg.management_state ~ '; not changed') }}
+  when: _console_state != 'Disabled' or _console_cfg.management_state != 'Managed'
+
+- name: "console: Report only (dry run, post-check or disabled by configuration)"
+  set_fact:
+    developer_perspective_changed: false
+    developer_perspective_state: "WARN"
+    developer_perspective_status: >-
+      Disabled ({{ _console_source }}); {{ 'a live run enables it' if (enable_developer_perspective | default(true) | bool) else 'enable_developer_perspective is false, not changed' }}
+  when:
+    - _console_state == 'Disabled'
+    - _console_cfg.management_state == 'Managed'
+    - (dry_run | default(false) | bool) or not (enable_developer_perspective | default(true) | bool) or (console_report_only | default(false) | bool)
+
+- name: "console: Enable the Developer perspective"
+  when:
+    - _console_state == 'Disabled'
+    - _console_cfg.management_state == 'Managed'
+    - not (dry_run | default(false) | bool)
+    - enable_developer_perspective | default(true) | bool
+    - not (console_report_only | default(false) | bool)
+  block:
+    - name: "console: Patch the perspectives list (other entries preserved)"
+      shell: |
+        # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+        set -o pipefail
+        oc patch consoles.operator.openshift.io cluster --type merge -p {{ {'spec': {'customization': {'perspectives': _console_new_perspectives}}} | to_json | quote }}
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: console_patch_result
+      changed_when: console_patch_result.rc == 0
+      failed_when: false
+
+    # Why: the console operator rolls out new console pods after the change; wait for
+    #      the console ClusterOperator to settle and confirm the setting stuck.
+    - name: "console: Wait for the console operator to settle and verify"
+      shell: |
+        # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+        set -o pipefail
+        deadline=$((SECONDS + {{ (console_settle_timeout_minutes | default(10) | int) * 60 }}))
+        while :; do
+          co="$(oc get clusteroperator console -o json | jq -r '[(.status.conditions // [])[] | select(.type == "Available" or .type == "Progressing" or .type == "Degraded") | "\(.type)=\(.status)"] | sort | join(",")')" || co="unknown"
+          [ "$co" = "Available=True,Degraded=False,Progressing=False" ] && break
+          [ "$SECONDS" -ge "$deadline" ] && break
+          sleep 20
+        done
+        dev="$(oc get consoles.operator.openshift.io cluster -o json | jq -r '([(.spec.customization.perspectives // [])[] | select(.id == "dev") | .visibility.state] | .[0]) // "unset"')" || dev="unknown"
+        printf '%s|%s\n' "$dev" "$co"
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+      register: console_verify_raw
+      changed_when: false
+      failed_when: false
+      when: console_patch_result.rc == 0
+
+    - name: "console: Record the result"
+      set_fact:
+        developer_perspective_changed: "{{ console_patch_result.rc == 0 }}"
+        developer_perspective_state: >-
+          {{ 'AUTO-FIXED' if (console_patch_result.rc == 0 and (console_verify_raw.stdout | default('')).startswith('Enabled|'))
+             else 'WARN' }}
+        developer_perspective_status: >-
+          {{ ('Enabled by this run (was Disabled: ' ~ _console_source ~ '); console operator '
+              ~ ('settled' if ((console_verify_raw.stdout | default('')).endswith('Available=True,Degraded=False,Progressing=False')) else ('not settled yet: ' ~ ((console_verify_raw.stdout | default('|unknown')).split('|')[1]))))
+             if (console_patch_result.rc == 0 and (console_verify_raw.stdout | default('')).startswith('Enabled|'))
+             else ('Could not enable: ' ~ ((console_patch_result.stderr | default('') | trim) or ('setting reads ' ~ ((console_verify_raw.stdout | default('unknown|')).split('|')[0])))) }}
+
+    - name: "console: Log the change"
+      include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+      vars:
+        event_status: "{{ 'AUTO-FIX' if developer_perspective_state == 'AUTO-FIXED' else 'FIX-FAILED' }}"
+        event_gate: "WARN"
+        event_task: "Web console Developer perspective"
+        event_reason: "{{ developer_perspective_status }}"
+
+- name: "console: Display the result"
+  debug:
+    msg: "Developer perspective: {{ developer_perspective_status }}"

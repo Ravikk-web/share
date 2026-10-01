@@ -1,0 +1,79 @@
+---
+# ============================================================================
+# Role Tasks: remediate - unpause_mcp (Check 03)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, include_tasks).
+#
+# Purpose: Unpauses paused MachineConfigPools that are on mcp_auto_unpause_list.
+#          Pools not on the list stay paused and keep Check 03 failing.
+# Impact:  A pool with pending configuration starts rolling (node reboots) as soon
+#          as it is unpaused; Phase 02 waits for the rollout before re-checking.
+# Why:     Check 03 also fails for degraded / not-updated pools, which unpausing
+#          does not fix; the Phase 02 re-scan (not this task) decides AUTO-FIXED.
+# Role / Playbook Dependencies: vars/upgrade.yml, tasks/log_event.yml
+# Gate Type: HARD (verified by the Phase 02 re-scan: AUTO-FIXED / FIX-FAILED)
+# Outputs: MCP spec.paused patches, remediation_attempted_nums, preval_autofix_items
+# ============================================================================
+
+- name: "unpause MCP: Query paused MachineConfigPools"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get mcp -o json | jq -c '[.items[]? | select((.spec.paused // false) == true) | .metadata.name]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: mcp_paused_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: mcp_paused_raw.rc == 0
+
+- name: "unpause MCP: Partition paused pools by the allow-list"
+  set_fact:
+    permitted_unpause_pools: "{{ (mcp_paused_raw.stdout | from_json) | intersect(mcp_auto_unpause_list | default(['worker', 'master'])) }}"
+    blocked_unpause_pools: "{{ (mcp_paused_raw.stdout | from_json) | difference(mcp_auto_unpause_list | default(['worker', 'master'])) }}"
+
+- name: "unpause MCP: Unpause allow-listed pool"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc patch mcp {{ item | quote }} --type=merge -p '{"spec":{"paused":false}}'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: unpause_result
+  changed_when: unpause_result.rc == 0
+  failed_when: false
+  loop: "{{ permitted_unpause_pools }}"
+
+# Why: Check 03 counts as "attempted" only when an allow-listed pool was patched. A
+#      failure the engine cannot touch (degraded pool, pool not on the allow-list)
+#      stays FAIL instead of being reported as FIX-FAILED.
+- name: "unpause MCP: Record remediation attempt"
+  set_fact:
+    unpaused_pools: "{{ unpause_result.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+    remediation_attempted_nums: >-
+      {{ (remediation_attempted_nums | default([])) + ([3] if (permitted_unpause_pools | length > 0) else []) }}
+
+- name: "unpause MCP: Record rollout and audit item"
+  set_fact:
+    remediation_rollout_needed: "{{ (remediation_rollout_needed | default(false) | bool) or (unpaused_pools | length > 0) }}"
+    preval_autofix_items: >-
+      {{ (preval_autofix_items | default([])) + ([{
+           'name': 'MachineConfigPool unpause (' ~ (unpaused_pools | join(', ')) ~ ')',
+           'action': 'Set spec.paused=false on ' ~ (unpaused_pools | join(', ')) ~ ' and waited for any pending configuration rollout.',
+           'reference': 'https://docs.openshift.com/container-platform/latest/post_installation_configuration/machine-configuration-tasks.html'
+         }] if (unpaused_pools | length > 0) else []) }}
+
+- name: "unpause MCP: Log remediation outcome"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "{{ 'AUTO-FIX' if (unpaused_pools | length > 0) else ('FIX-FAILED' if (permitted_unpause_pools | length > 0) else 'INFO') }}"
+    event_gate: "HARD"
+    event_task: "MachineConfigPool unpause (Check 03)"
+    event_reason: "Unpaused: {{ unpaused_pools | join(', ') or 'none' }}; not on allow-list (left paused): {{ blocked_unpause_pools | join(', ') or 'none' }}"
+    event_observed: "{{ unpause_result.results | default([]) | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | map(attribute='stderr') | join('; ') }}"

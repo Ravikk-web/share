@@ -1,0 +1,132 @@
+---
+# ============================================================================
+# Role Tasks: sendmail (Notification Transport)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: The mail module is provided by the community.general collection
+#                 on ansible-core 2.14 (short name `mail` resolves via routing).
+#
+# Purpose: Renders the email body fresh from notify_template and dispatches it via
+#          direct SMTP. Called only through tasks/notify.yml, which prepares the
+#          per-email envelope (notify_to, notify_subject, notify_template,
+#          notify_attachments). Records every outcome in notification_ledger.
+# Why:     A notification must never stop an upgrade. SMTP errors are caught here,
+#          logged as WARN and listed in the run summary. All per-email facts are
+#          reset after each call so nothing (subject, recipients, attachments)
+#          can leak into the next email.
+# Role / Playbook Dependencies: vars/smtp.yml, tasks/log_event.yml, templates/*.j2
+# Gate Type: N/A (Notification dispatch; never fails)
+# Outputs: SMTP delivery, notification_ledger entry, run log event
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Resolve Envelope
+# ----------------------------------------------------------------------------
+- name: "sendmail: Resolve template path and recipient list"
+  set_fact:
+    _mail_template_path: >-
+      {{ notify_template
+         if (notify_template | default('') is match('^(/|[A-Za-z]:)'))
+         else (playbook_dir ~ '/templates/' ~ (notify_template | default('progress-mail.j2', true) | regex_replace('^templates/', ''))) }}
+    _mail_recipients: "{{ notify_to | default([]) | select('string') | map('trim') | select() | unique | list }}"
+    _mail_status: "SKIPPED"
+    _mail_error: ""
+
+- name: "sendmail: Record that no recipients are configured"
+  set_fact:
+    _mail_error: "No recipients configured for this notification"
+  when: _mail_recipients | length == 0
+
+# ----------------------------------------------------------------------------
+# 2. Render & Dispatch (errors are caught; the run always continues)
+# ----------------------------------------------------------------------------
+- name: "sendmail: Render and dispatch email"
+  block:
+    - name: "sendmail: Render email body from template (fresh on every call)"
+      set_fact:
+        _mail_body: "{{ lookup('template', _mail_template_path) }}"
+
+    - name: "sendmail: Dispatch email via direct SMTP"
+      mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port | int }}"
+        from: "{{ mail_from }}"
+        to: "{{ _mail_recipients }}"
+        subject: "{{ notify_subject | default('[ARO Upgrade] Notification', true) }}"
+        body: "{{ _mail_body }}"
+        subtype: html
+        charset: "utf-8"
+        attach: "{{ notify_attachments | default([]) }}"
+        # Why: stable headers let mail rules filter and group every mail of one run.
+        headers:
+          - "X-ARO-Run-ID={{ run_timestamp | default('unknown') }}"
+          - "X-ARO-Cluster={{ cluster_name | default('unknown') }}"
+          - "X-ARO-Event={{ notify_event | default('notification', true) }}"
+        timeout: "{{ mail_timeout_seconds | default(30) | int }}"
+        username: "{{ smtp_username if (smtp_username | default('') | length > 0) else omit }}"
+        password: "{{ smtp_password if (smtp_password | default('') | length > 0) else omit }}"
+        secure: "{{ smtp_secure if (smtp_secure | default('') | length > 0) else omit }}"
+
+    - name: "sendmail: Mark notification as sent"
+      set_fact:
+        _mail_status: "SENT"
+
+  # --------------------------------------------------------------------------
+  # Rescue: SMTP / rendering failure
+  # --------------------------------------------------------------------------
+  # 1. Error extraction: ansible_failed_result.msg (mail module or template error).
+  # 2. Alerts dispatched: none (this is the alert channel); logged as WARN instead.
+  # 3. Teardown guarantee: not applicable — the calling phase simply continues.
+  # --------------------------------------------------------------------------
+  rescue:
+    - name: "sendmail: Record failed notification"
+      set_fact:
+        _mail_status: "FAILED"
+        _mail_error: "{{ ansible_failed_result.msg | default('SMTP error') }}"
+
+    - name: "sendmail: Warn that the notification could not be sent"
+      debug:
+        msg: "[WARN] Notification '{{ notify_event | default('notification') }}' was not sent: {{ _mail_error }}. The run continues."
+  when: _mail_recipients | length > 0
+
+# ----------------------------------------------------------------------------
+# 3. Ledger & Audit Log
+# ----------------------------------------------------------------------------
+- name: "sendmail: Record outcome in the run notification ledger"
+  set_fact:
+    notification_ledger: >-
+      {{ (notification_ledger | default([])) + [{
+           'time': lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S'),
+           'event': (notify_event | default('notification', true)),
+           'subject': (notify_subject | default('')),
+           'recipients': (_mail_recipients | length),
+           'attachments': (notify_attachments | default([]) | map('basename') | list),
+           'status': _mail_status,
+           'error': _mail_error
+         }] }}
+
+- name: "sendmail: Log notification outcome to run logs"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "{{ 'INFO' if _mail_status == 'SENT' else 'WARN' }}"
+    event_gate: "INFO"
+    event_task: "Notification ({{ notify_event | default('notification', true) }})"
+    event_reason: "{{ _mail_status }}: {{ notify_subject | default('') }}"
+    event_observed: "{{ ('recipients=' ~ (_mail_recipients | join(';'))) if _mail_status == 'SENT' else _mail_error }}"
+
+# ----------------------------------------------------------------------------
+# 4. Reset Per-Email Facts
+# ----------------------------------------------------------------------------
+# Why: facts persist across plays; clearing every per-email value guarantees the
+#      next notification cannot reuse this one's subject, recipients or attachments.
+- name: "sendmail: Reset per-email facts after dispatch"
+  set_fact:
+    notify_event: ""
+    notify_event_tag: ""
+    notify_headline: ""
+    notify_to: []
+    notify_subject: ""
+    notify_template: ""
+    notify_attachments: []
+    notify_attachments_requested: []
+    _mail_body: ""

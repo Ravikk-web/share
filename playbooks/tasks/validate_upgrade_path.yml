@@ -1,0 +1,283 @@
+---
+# ============================================================================
+# Task Include: validate_upgrade_path.yml — Full Upgrade Path Validation
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses shell, set_fact, debug; compatible across 2.7 and 2.14.
+#
+# Purpose: Validates EVERY edge of upgrade_path before anything changes (read-only):
+#          1. Reads the live ClusterVersion (completed / desired version, channel,
+#             availableUpdates, conditionalUpdates with the cluster's own risk verdict).
+#          2. Splits the path into hops already reached (skipped, which makes --resume
+#             safe), an update already in progress (monitored, not re-triggered) and
+#             the hops still to run.
+#          3. Checks each remaining edge against the OpenShift Update Service graph
+#             for the channel that hop uses (<target_channel_prefix>-<major.minor>),
+#             and the first edge also against the cluster's own offer.
+# Verdicts: PASS  recommended edge (graph or cluster)
+#           WARN  conditional edge the cluster will evaluate at hop time, or an edge
+#                 that could not be verified (graph unreachable) — each hop is
+#                 verified live again before it is triggered
+#           FAIL  no such edge, a version not in the channel, conditional risks that
+#                 apply to this cluster (unless allow_conditional_updates), or an
+#                 update in progress to a version outside the path
+# Why:     Only the first hop used to be checked, against the cluster's CURRENT
+#          channel (so a minor first hop always failed) and conditionalUpdates were
+#          read from the wrong field (.version instead of .release.version).
+# Inputs:  upgrade_path, target_channel_prefix / target_channel, upgrade_graph_*,
+#          allow_conditional_updates, insecure_skip_tls_verify
+# Role / Playbook Dependencies: vars/upgrade.yml, curl, jq 1.5
+# Gate Type: HARD (the caller fails when path_validation_status is FAIL)
+# Outputs: path_validation (rows), path_validation_status, path_live_cv,
+#          path_reached_hops, path_remaining_hops, path_in_progress_hop,
+#          path_current_version, available_edges_list, conditional_edges_list,
+#          target_first_hop, is_valid_target_edge, all_valid_update_edges
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Live ClusterVersion state
+# ----------------------------------------------------------------------------
+- name: "Path: Query ClusterVersion update state"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get clusterversion version -o json | jq -c '
+      def cond(t): (((.status.conditions // []) | map(select(.type == t)) | .[0]) // {});
+      {
+        completed: ((((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // "")),
+        desired: (.status.desired.version // ""),
+        progressing: ((cond("Progressing").status // "False") | tostring),
+        channel: (.spec.channel // ""),
+        retrieved: (cond("RetrievedUpdates") | {status: ((.status // "Unknown") | tostring), message: ((.message // "") | .[0:300])}),
+        available: [(.status.availableUpdates // [])[] | (.version // empty)],
+        conditional: [(.status.conditionalUpdates // [])[] | {
+          version: (.release.version // ""),
+          recommended: ((((.conditions // []) | map(select(.type == "Recommended")) | .[0].status) // "Unknown") | tostring),
+          risks: [(.risks // [])[] | {name: (.name // ""), message: ((.message // "") | .[0:300]), url: (.url // "")}]
+        }]
+      }'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: _vp_cv_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: _vp_cv_raw.rc == 0
+
+- name: "Path: Parse update state"
+  set_fact:
+    path_live_cv: "{{ _vp_cv_raw.stdout | from_json }}"
+
+- name: "Path: Determine the cluster's current version"
+  set_fact:
+    path_current_version: "{{ path_live_cv.completed or path_live_cv.desired }}"
+    _vp_updating: "{{ path_live_cv.progressing == 'True' and path_live_cv.desired != path_live_cv.completed }}"
+    _vp_bad_format: "{{ upgrade_path | map('string') | reject('match', '^[0-9]+[.][0-9]+[.][0-9]+$') | list }}"
+
+- name: "Path: Stop — the cluster version could not be read"
+  fail:
+    msg: "[HARD GATE FAILURE] Could not determine the current cluster version from ClusterVersion (read: '{{ path_current_version }}')."
+  when: not (path_current_version is match('^[0-9]+[.][0-9]+[.][0-9]+$'))
+
+# ----------------------------------------------------------------------------
+# 2. Reached / in-progress / remaining hops
+# ----------------------------------------------------------------------------
+- name: "Path: Split the path into reached and remaining hops"
+  set_fact:
+    path_reached_hops: >-
+      {%- set out = [] -%}
+      {%- for h in upgrade_path | map('string') | list -%}
+      {%- if h is match('^[0-9]+[.][0-9]+[.][0-9]+$') and h is version(path_current_version, '<=') -%}
+      {%- set _ = out.append(h) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    path_remaining_hops: >-
+      {%- set out = [] -%}
+      {%- for h in upgrade_path | map('string') | list -%}
+      {%- if h is match('^[0-9]+[.][0-9]+[.][0-9]+$') and h is version(path_current_version, '>') -%}
+      {%- set _ = out.append(h) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+# Why: an update already running to the next hop is monitored (resume) instead of being
+#      re-triggered; one running to any other version is never taken over.
+- name: "Path: Detect an update already in progress"
+  set_fact:
+    path_in_progress_hop: >-
+      {{ path_live_cv.desired
+         if ((_vp_updating | bool) and (path_remaining_hops | length > 0) and path_live_cv.desired == path_remaining_hops[0])
+         else '' }}
+    _vp_foreign_update: >-
+      {{ (_vp_updating | bool)
+         and not ((path_remaining_hops | length > 0) and path_live_cv.desired == path_remaining_hops[0]) }}
+
+- name: "Path: List the edges still to be taken"
+  set_fact:
+    _vp_edges: >-
+      {%- set out = [] -%}
+      {%- set prev = [path_in_progress_hop if (path_in_progress_hop | length > 0) else path_current_version] -%}
+      {%- for h in path_remaining_hops -%}
+      {%- if h != path_in_progress_hop -%}
+      {%- set p = h.split('.') -%}
+      {%- set _ = out.append({'from': prev[-1], 'to': h,
+            'channel': (target_channel if (target_channel | default('') | length > 0)
+                        else ((target_channel_prefix | default('stable')) ~ '-' ~ p[0] ~ '.' ~ p[1]))}) -%}
+      {%- endif -%}
+      {%- set _ = prev.append(h) -%}
+      {%- endfor -%}
+      {{ out }}
+
+# ----------------------------------------------------------------------------
+# 3. OpenShift Update Service graph (one download per channel)
+# ----------------------------------------------------------------------------
+# Why: the same service the cluster uses. TLS verification follows
+#      insecure_skip_tls_verify; the proxy comes from upgrade_graph_proxy or the
+#      environment (https_proxy). An unreachable graph never fails the run by itself.
+- name: "Path: Check each edge against the OpenShift update graph"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    tmpd="$(mktemp -d)"
+    trap 'rm -rf "$tmpd"' EXIT
+    edges={{ _vp_edges | to_json | quote }}
+    n="$(printf '%s' "$edges" | jq 'length')"
+    results='[]'
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      from="$(printf '%s' "$edges" | jq -r ".[$i].from")"
+      to="$(printf '%s' "$edges" | jq -r ".[$i].to")"
+      ch="$(printf '%s' "$edges" | jq -r ".[$i].channel")"
+      gf="$tmpd/graph-$ch.json"
+      if [ ! -s "$gf" ] && [ ! -f "$gf.failed" ]; then
+        if ! curl -sS --fail --max-time {{ upgrade_graph_timeout_seconds | default(30) | int }} \
+             {{ '-k' if (insecure_skip_tls_verify | default(true) | bool) else '' }} \
+             {{ ('--proxy ' ~ (upgrade_graph_proxy | quote)) if (upgrade_graph_proxy | default('') | length > 0) else '' }} \
+             -H 'Accept: application/json' \
+             "{{ upgrade_graph_url | default('https://api.openshift.com/api/upgrades_info/v1/graph') }}?channel=${ch}&arch={{ upgrade_graph_arch | default('amd64') }}" \
+             -o "$gf" 2>"$tmpd/err-$ch"; then
+          rm -f "$gf"
+          head -c 300 "$tmpd/err-$ch" > "$gf.failed"
+        fi
+      fi
+      if [ -f "$gf.failed" ]; then
+        r="$(jq -cn --arg f "$from" --arg t "$to" --arg c "$ch" --arg e "$(cat "$gf.failed")" \
+             '{from: $f, to: $t, channel: $c, status: "UNKNOWN", detail: ("update graph not reachable: " + $e), risks: []}')"
+      else
+        r="$(jq -c --arg f "$from" --arg t "$to" --arg c "$ch" '
+              ((.nodes // []) | map(.version)) as $v
+              | (($v | indices($f)) | .[0]) as $fi
+              | (($v | indices($t)) | .[0]) as $ti
+              | [(.conditionalEdges // [])[]
+                 | select((.edges // []) | map(.from == $f and .to == $t) | any)
+                 | (.risks // [])[]
+                 | {name: (.name // ""), message: ((.message // "") | .[0:300]), url: (.url // "")}] as $risks
+              | (if $ti == null then {status: "NOT_IN_CHANNEL", detail: ($t + " is not in channel " + $c)}
+                 elif $fi == null then {status: "NOT_IN_CHANNEL", detail: ($f + " has no update path into channel " + $c + " (update to a newer " + $f + " z-stream first)")}
+                 elif ((.edges // []) | map(.[0] == $fi and .[1] == $ti) | any) then {status: "RECOMMENDED", detail: ("recommended update in " + $c)}
+                 elif ($risks | length) > 0 then {status: "CONDITIONAL", detail: ("conditional update in " + $c + " with " + (($risks | length) | tostring) + " known risk(s)")}
+                 else {status: "NO_EDGE", detail: ("no update edge " + $f + " -> " + $t + " in " + $c)} end)
+              + {from: $f, to: $t, channel: $c, risks: $risks}' "$gf" 2>/dev/null)" \
+          || r="$(jq -cn --arg f "$from" --arg t "$to" --arg c "$ch" \
+                  '{from: $f, to: $t, channel: $c, status: "UNKNOWN", detail: "update graph response could not be read", risks: []}')"
+      fi
+      results="$(printf '%s' "$results" | jq -c --argjson r "$r" '. + [$r]')"
+      i=$((i + 1))
+    done
+    printf '%s\n' "$results"
+  args:
+    executable: /bin/bash
+  register: _vp_graph_raw
+  changed_when: false
+  failed_when: false
+  when:
+    - upgrade_graph_validation_enabled | default(true) | bool
+    - _vp_edges | length > 0
+
+- name: "Path: Parse graph results"
+  set_fact:
+    _vp_graph: >-
+      {{ (_vp_graph_raw.stdout | from_json)
+         if ((_vp_graph_raw.stdout | default('') | trim).startswith('['))
+         else [] }}
+    _vp_graph_note: >-
+      {{ 'update graph validation disabled (upgrade_graph_validation_enabled: false)'
+         if not (upgrade_graph_validation_enabled | default(true) | bool)
+         else ('update graph check did not run: ' ~ (_vp_graph_raw.stderr | default('no output') | truncate(200))) }}
+
+# ----------------------------------------------------------------------------
+# 4. Verdict per edge
+# ----------------------------------------------------------------------------
+- name: "Path: Decide each edge"
+  set_fact:
+    path_validation: >-
+      {%- set rows = [] -%}
+      {%- for h in path_reached_hops -%}
+      {%- set _ = rows.append({'from': '', 'to': h, 'channel': '', 'status': 'PASS', 'source': 'cluster',
+            'detail': 'already reached (cluster at ' ~ path_current_version ~ '); hop skipped', 'risks': []}) -%}
+      {%- endfor -%}
+      {%- if path_in_progress_hop | length > 0 -%}
+      {%- set _ = rows.append({'from': path_live_cv.completed, 'to': path_in_progress_hop, 'channel': path_live_cv.channel, 'status': 'PASS',
+            'source': 'cluster', 'detail': 'update already in progress; it is monitored to completion, not triggered again', 'risks': []}) -%}
+      {%- endif -%}
+      {%- for e in _vp_edges -%}
+      {%- set gm = _vp_graph | selectattr('to', 'equalto', e.to) | selectattr('from', 'equalto', e['from']) | list -%}
+      {%- set g0 = gm[0] if (gm | length > 0) else {'status': 'UNKNOWN', 'detail': _vp_graph_note, 'risks': []} -%}
+      {%- set first = loop.first and (path_in_progress_hop | length == 0) -%}
+      {%- set live_cond = (path_live_cv.conditional | selectattr('version', 'equalto', e.to) | list) if first else [] -%}
+      {%- if first and (e.to in path_live_cv.available) -%}
+      {%- set r = {'status': 'PASS', 'source': 'cluster', 'detail': 'offered by the cluster (availableUpdates)' ~ (('; graph: ' ~ g0.detail) if g0.status != 'UNKNOWN' else '')} -%}
+      {%- elif live_cond | length > 0 -%}
+      {%- set lc = live_cond[0] -%}
+      {%- if lc.recommended == 'True' -%}
+      {%- set r = {'status': 'PASS', 'source': 'cluster', 'detail': 'conditional update; the cluster evaluated its risks as not applicable'} -%}
+      {%- elif allow_conditional_updates | default(false) | bool -%}
+      {%- set r = {'status': 'WARN', 'source': 'cluster', 'detail': 'conditional update accepted by configuration (allow_conditional_updates); risks: ' ~ (lc.risks | map(attribute='name') | join(', '))} -%}
+      {%- else -%}
+      {%- set r = {'status': 'FAIL', 'source': 'cluster', 'detail': 'conditional update whose risks apply to this cluster: ' ~ (lc.risks | map(attribute='name') | join(', ')) ~ '. Review the risks; choose another version or set allow_conditional_updates: true.'} -%}
+      {%- endif -%}
+      {%- elif g0.status == 'RECOMMENDED' -%}
+      {%- set r = {'status': 'PASS', 'source': 'graph', 'detail': g0.detail} -%}
+      {%- elif g0.status == 'CONDITIONAL' -%}
+      {%- set r = {'status': 'WARN', 'source': 'graph', 'detail': g0.detail ~ ' (' ~ (g0.risks | map(attribute='name') | join(', ')) ~ '). The cluster evaluates these risks when it reaches this hop; the hop stops if they apply' ~ ('' if (allow_conditional_updates | default(false) | bool) else ' (allow_conditional_updates is false)') ~ '.'} -%}
+      {%- elif g0.status in ['NOT_IN_CHANNEL', 'NO_EDGE'] -%}
+      {%- set r = {'status': 'FAIL', 'source': 'graph', 'detail': g0.detail} -%}
+      {%- elif first and path_live_cv.channel == e.channel and path_live_cv.retrieved.status == 'True' -%}
+      {%- set r = {'status': 'FAIL', 'source': 'cluster', 'detail': 'the cluster does not offer ' ~ e.to ~ ' in channel ' ~ e.channel ~ ' (' ~ g0.detail ~ ')'} -%}
+      {%- else -%}
+      {%- set r = {'status': 'WARN', 'source': 'none', 'detail': 'not verified in advance (' ~ g0.detail ~ '); the edge is verified on the cluster before this hop starts'} -%}
+      {%- endif -%}
+      {%- set _ = rows.append({'from': e['from'], 'to': e.to, 'channel': e.channel, 'status': r.status, 'source': r.source,
+            'detail': r.detail, 'risks': (g0.risks | default([]))}) -%}
+      {%- endfor -%}
+      {{ rows }}
+
+- name: "Path: Collect path-level problems"
+  set_fact:
+    _vp_problems: >-
+      {{ (['invalid version format: ' ~ (_vp_bad_format | join(', '))] if (_vp_bad_format | length > 0) else [])
+         + (['an update to ' ~ path_live_cv.desired ~ ' is in progress and it is not the next hop of this path'] if (_vp_foreign_update | bool) else []) }}
+
+- name: "Path: Summarize the path verdict"
+  set_fact:
+    path_validation_status: >-
+      {{ 'FAIL' if ((_vp_problems | length > 0) or (path_validation | selectattr('status', 'equalto', 'FAIL') | list | length > 0))
+         else ('WARN' if (path_validation | selectattr('status', 'equalto', 'WARN') | list | length > 0) else 'PASS') }}
+    path_validation_problems: "{{ _vp_problems }}"
+    # Why: facts read by templates/phase01-policy-check.j2 (first-hop edge panel).
+    available_edges_list: "{{ path_live_cv.available }}"
+    conditional_edges_list: "{{ path_live_cv.conditional | map(attribute='version') | list }}"
+    all_valid_update_edges: "{{ (path_live_cv.available + (path_live_cv.conditional | map(attribute='version') | list)) | unique }}"
+    target_first_hop: "{{ path_remaining_hops[0] if (path_remaining_hops | length > 0) else (upgrade_path | last) }}"
+    is_valid_target_edge: >-
+      {{ (_vp_problems | length == 0) and (path_validation | selectattr('status', 'equalto', 'FAIL') | list | length == 0) }}
+
+- name: "Path: Display the path verdict"
+  debug:
+    msg: >-
+      Path {{ path_current_version }} -> {{ upgrade_path | join(' -> ') }}: {{ path_validation_status }}.
+      {% for r in path_validation %}[{{ r.status }}] {{ (r['from'] ~ ' -> ') if (r['from'] | length > 0) else '' }}{{ r.to }}{{ (' (' ~ r.channel ~ ')') if (r.channel | length > 0) else '' }}: {{ r.detail }}{% if not loop.last %} | {% endif %}{% endfor %}
+      {{ ('Problems: ' ~ (_vp_problems | join('; '))) if (_vp_problems | length > 0) else '' }}

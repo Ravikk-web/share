@@ -1,0 +1,148 @@
+---
+# ============================================================================
+# Role Tasks: operator_validate
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses shell and set_fact; compatible across 2.7 and 2.14.
+#
+# Purpose: Judges operator health after Phase 06 approvals and builds the rows of
+#          the operators report (one per Subscription) plus four summary checks:
+#            01 Approved operator upgrades   HARD  every operator approved in this run
+#                                                  is on its new CSV and Succeeded
+#            02 Operator health regressions  HARD  no CSV that was Succeeded before
+#                                                  Phase 06 is now in another phase
+#            03 Operators already unhealthy  WARN  not Succeeded before Phase 06 either
+#            04 Pending upgrades not approved WARN stale / unreferenced InstallPlans,
+#                                                  or pending upgrades in a dry run
+# Why:     Previously any non-Succeeded CSV anywhere failed Phase 06, including
+#          operators this run never touched; now the gate covers what the run changed.
+# Inputs:  approved_installplans, skipped_installplans, operator_csv_baseline
+#          (from operator_upgrade; empty when approvals were skipped)
+# Role / Playbook Dependencies: jq 1.5
+# Gate Type: HARD (enforced by 06_Operator_Upgrade.yaml)
+# Outputs: operators (report rows), operator_health_checks, operator_validate_status,
+#          operator_summary_text
+# ============================================================================
+
+- name: "operator_validate: Read subscriptions and operator CSVs"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get subscriptions.operators.coreos.com -A -o json | jq -c '[.items[]? | {
+      name: .metadata.name, namespace: .metadata.namespace, package: (.spec.name // .metadata.name),
+      channel: (.spec.channel // ""), approval: (.spec.installPlanApproval // "Automatic"),
+      state: (.status.state // ""), installed_csv: (.status.installedCSV // ""), current_csv: (.status.currentCSV // "")}]'
+    oc get clusterserviceversions.operators.coreos.com -A -l '!olm.copiedFrom' -o json | jq -c '[.items[]? | {
+      name: .metadata.name, namespace: .metadata.namespace, phase: (.status.phase // "Unknown"),
+      reason: (.status.reason // ""), message: ((.status.message // "") | .[0:200])}]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: opv_state_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: opv_state_raw.rc == 0
+
+- name: "operator_validate: Parse state"
+  set_fact:
+    opv_subs: "{{ opv_state_raw.stdout_lines[0] | from_json }}"
+    opv_csvs: "{{ opv_state_raw.stdout_lines[1] | from_json }}"
+
+- name: "operator_validate: Judge each subscription"
+  set_fact:
+    operators: >-
+      {%- set rows = [] -%}
+      {%- set baseline = operator_csv_baseline | default([]) -%}
+      {%- for s in opv_subs | sort(attribute='namespace') -%}
+      {%- set now = opv_csvs | selectattr('namespace', 'equalto', s.namespace) | selectattr('name', 'equalto', s.installed_csv) | list -%}
+      {%- set phase = now[0].phase if (now | length > 0) else 'Missing' -%}
+      {%- set before = baseline | selectattr('namespace', 'equalto', s.namespace) | selectattr('name', 'equalto', s.installed_csv) | list -%}
+      {%- set approved = approved_installplans | default([]) | selectattr('namespace', 'equalto', s.namespace) | selectattr('subscription', 'equalto', s.name) | list -%}
+      {%- if approved | length > 0 -%}
+      {%- set ok = phase == 'Succeeded' and (s.installed_csv in approved[0].csv_names) -%}
+      {%- set status = 'PASS' if ok else 'FAIL' -%}
+      {%- set kind = 'approved' -%}
+      {%- set detail = ('Upgraded ' ~ (approved[0].from_csv or 'none') ~ ' -> ' ~ s.installed_csv) if ok
+                       else ('Approved upgrade to ' ~ (approved[0].csv_names | join(', ')) ~ ' did not complete: installed ' ~ (s.installed_csv or 'none') ~ ' is ' ~ phase
+                             ~ ((' (' ~ now[0].reason ~ ')') if (now | length > 0 and now[0].reason | length > 0) else '')) -%}
+      {%- elif phase == 'Succeeded' -%}
+      {%- set status = 'PASS' -%}
+      {%- set kind = 'healthy' -%}
+      {%- set detail = s.installed_csv ~ ' Succeeded' ~ ((' - upgrade pending (' ~ s.current_csv ~ '), not approved') if s.state == 'UpgradePending' else '') -%}
+      {%- elif (before | length > 0) and before[0].phase == 'Succeeded' -%}
+      {%- set status = 'FAIL' -%}
+      {%- set kind = 'regression' -%}
+      {%- set detail = s.installed_csv ~ ' was Succeeded before Phase 06 and is now ' ~ phase -%}
+      {%- else -%}
+      {%- set status = 'WARN' -%}
+      {%- set kind = 'preexisting' -%}
+      {%- set detail = (s.installed_csv or 'no installed CSV') ~ ' is ' ~ phase ~ ' (not Succeeded before Phase 06 either)' -%}
+      {%- endif -%}
+      {%- set _ = rows.append({'subscription': s.name, 'package': s.package, 'namespace': s.namespace,
+            'installed_csv': s.installed_csv or 'None', 'target_channel': s.channel, 'installplan_approval': s.approval,
+            'csv_phase': phase, 'status': status, 'kind': kind, 'pending': s.state == 'UpgradePending',
+            'details': detail}) -%}
+      {%- endfor -%}
+      {{ rows }}
+
+- name: "operator_validate: Build the summary checks"
+  set_fact:
+    operator_health_checks:
+      - num: 1
+        name: "Approved operator upgrades"
+        gate: "HARD"
+        status: "{{ 'FAIL' if (operators | selectattr('kind', 'equalto', 'approved') | selectattr('status', 'equalto', 'FAIL') | list | length > 0) else 'PASS' }}"
+        observed: >-
+          {{ ('No operator upgrade was approved in this run'
+              ~ (' (dry run)' if (dry_run | default(false) | bool) else ''))
+             if (operators | selectattr('kind', 'equalto', 'approved') | list | length == 0)
+             else ((operators | selectattr('kind', 'equalto', 'approved') | selectattr('status', 'equalto', 'PASS') | list | length) ~ ' of '
+                   ~ (operators | selectattr('kind', 'equalto', 'approved') | list | length) ~ ' approved upgrade(s) Succeeded'
+                   ~ ((': failed ' ~ (operators | selectattr('kind', 'equalto', 'approved') | selectattr('status', 'equalto', 'FAIL') | map(attribute='package') | join(', ')))
+                      if (operators | selectattr('kind', 'equalto', 'approved') | selectattr('status', 'equalto', 'FAIL') | list | length > 0) else '')) }}
+      - num: 2
+        name: "Operator health regressions"
+        gate: "HARD"
+        status: "{{ 'FAIL' if (operators | selectattr('kind', 'equalto', 'regression') | list | length > 0) else 'PASS' }}"
+        observed: >-
+          {{ ('No operator became unhealthy during Phase 06')
+             if (operators | selectattr('kind', 'equalto', 'regression') | list | length == 0)
+             else ('No longer Succeeded: ' ~ (operators | selectattr('kind', 'equalto', 'regression') | map(attribute='details') | join('; '))) }}
+      - num: 3
+        name: "Operators already unhealthy before Phase 06"
+        gate: "WARN"
+        status: "{{ 'WARN' if (operators | selectattr('kind', 'equalto', 'preexisting') | list | length > 0) else 'PASS' }}"
+        observed: >-
+          {{ ('None')
+             if (operators | selectattr('kind', 'equalto', 'preexisting') | list | length == 0)
+             else (operators | selectattr('kind', 'equalto', 'preexisting') | map(attribute='details') | join('; ')) }}
+      - num: 4
+        name: "Pending operator upgrades not approved"
+        gate: "WARN"
+        status: >-
+          {{ 'WARN' if ((skipped_installplans | default([]) | length > 0)
+                        or (operators | selectattr('pending', 'equalto', true) | rejectattr('kind', 'equalto', 'approved') | list | length > 0))
+             else 'PASS' }}
+        observed: >-
+          {{ ((operators | selectattr('pending', 'equalto', true) | rejectattr('kind', 'equalto', 'approved') | map(attribute='package') | list | length) ~ ' subscription(s) with a pending upgrade not approved'
+              ~ ((': ' ~ (operators | selectattr('pending', 'equalto', true) | rejectattr('kind', 'equalto', 'approved') | map(attribute='package') | join(', ')))
+                 if (operators | selectattr('pending', 'equalto', true) | rejectattr('kind', 'equalto', 'approved') | list | length > 0) else '')
+              ~ '; ' ~ (skipped_installplans | default([]) | length) ~ ' unreferenced InstallPlan(s) left untouched'
+              ~ ((': ' ~ (skipped_installplans | map(attribute='name') | join(', '))) if (skipped_installplans | default([]) | length > 0) else '')) }}
+
+- name: "operator_validate: Summarize"
+  set_fact:
+    operator_validate_status: >-
+      {{ 'FAIL' if (operator_health_checks | selectattr('status', 'equalto', 'FAIL') | list | length > 0)
+         else ('WARN' if (operator_health_checks | selectattr('status', 'equalto', 'WARN') | list | length > 0) else 'PASS') }}
+    operator_summary_text: >-
+      {{ (operators | selectattr('kind', 'equalto', 'approved') | selectattr('status', 'equalto', 'PASS') | list | length) }} operator upgrade(s) approved and Succeeded{{
+         (' (' ~ (operators | selectattr('kind', 'equalto', 'approved') | selectattr('status', 'equalto', 'PASS') | map(attribute='package') | join(', ')) ~ ')')
+         if (operators | selectattr('kind', 'equalto', 'approved') | selectattr('status', 'equalto', 'PASS') | list | length > 0) else '' }};
+      {{ operators | length }} subscription(s) checked; {{ operator_health_checks[3].observed }}
+
+- name: "operator_validate: Display the verdict"
+  debug:
+    msg: "Operator validation {{ operator_validate_status }}: {% for c in operator_health_checks %}[{{ c.status }}] {{ c.name }}: {{ c.observed }}{% if not loop.last %} | {% endif %}{% endfor %}"

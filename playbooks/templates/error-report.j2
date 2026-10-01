@@ -1,0 +1,138 @@
+{#
+==============================================================================
+Error Report Template: error-report.j2
+==============================================================================
+Targets: Jinja2 / Ansible 2.7.17 & 2.14.18
+
+Context: Failure alert email (exactly one per failed run), rendered by
+         roles/sendmail from tasks/notify.yml (notify_event: alert).
+Dependencies (facts set by roles/error_handle and the failing phase):
+  - cluster_name, run_timestamp, run_mode, upgrade_path
+  - current_step_no (string): failed phase label, e.g. "Phase 03"
+  - failed_task_name / failed_gate_type (strings)
+  - failure_reason (string): high-level reason
+  - resolved_error (string): the actual error text (stderr / msg)
+  - is_rbac_error (bool), rbac_missing_verb / _resource / _group, rbac_check_command
+  - notify_attachments (list): files actually attached to this email
+  - UI color tokens from vars/report_vars.yml
+Constraints:
+  - Max-width 580px, table layout + inline CSS for Outlook, no JavaScript
+  - All cluster-provided text is HTML-escaped
+==============================================================================
+#}
+{%- set log_file = (log_dir | default(playbook_dir ~ '/logs')) ~ '/' ~ (cluster_name | default('cluster')) ~ '_' ~ (run_timestamp | default('current')) ~ '.txt' -%}
+{%- set attachments = notify_attachments | default([]) | map('basename') | list -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ cluster_name | default('Cluster') | e }} upgrade halted</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: {{ color_page_bg | default('#f8f9fb') }}; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.5; color: {{ color_heading | default('#101828') }};">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: {{ color_page_bg | default('#f8f9fb') }}; padding: 20px 0;">
+    <tr>
+      <td align="center">
+        <table border="0" cellspacing="0" cellpadding="0" style="max-width: {{ email_max_width | default('580px') }}; width: 100%; margin: 0 auto; background-color: {{ color_surface | default('#ffffff') }}; border: 1px solid {{ color_border | default('#e4e7ec') }}; border-top: 4px solid {{ color_fail | default('#b42318') }}; border-radius: 6px; border-collapse: separate;">
+
+          <!-- Header -->
+          <tr>
+            <td style="padding: 24px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">
+              <span style="display: inline-block; padding: 4px 10px; font-size: 12px; font-weight: 700; border-radius: 12px; background-color: {{ bg_fail | default('#fdecea') }}; color: {{ color_fail | default('#b42318') }}; border: 1px solid #fecdca;">UPGRADE HALTED &#10006;</span>
+              <h1 style="margin: 12px 0 4px 0; font-size: 20px; font-weight: 700; color: {{ color_heading | default('#101828') }};">{{ cluster_name | default('Cluster') | e }}: {{ failed_task_name | default('Upgrade step') | e }} failed</h1>
+              <p style="margin: 0; font-size: 13px; color: #667085;">{{ failure_reason | default('A safety gate stopped the automated upgrade.') | e }}</p>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding: 20px 24px;">
+
+              {% if is_rbac_error | default(false) | bool %}
+              <!-- RBAC callout -->
+              <div style="border-radius: 6px; padding: 14px 16px; margin-bottom: 20px; font-size: 13px; background-color: {{ bg_warn | default('#fff8e1') }}; border: 1px solid #fedf89; color: #7a4f01;">
+                <div style="font-weight: 700; margin-bottom: 6px;">&#9888; Permission denied for the automation account</div>
+                <div style="margin-bottom: 6px;">
+                  Missing permission: <code>{{ (rbac_missing_verb | default('', true) or 'unknown verb') | e }}</code>
+                  on <code>{{ (rbac_missing_resource | default('', true) or 'unknown resource') | e }}{% if rbac_missing_group | default('') | length > 0 %}.{{ rbac_missing_group | e }}{% endif %}</code>.
+                  The automation expects its account to have cluster-admin.
+                </div>
+                <div style="font-size: 12px; font-weight: 600; margin: 8px 0 4px 0;">Check the account's access:</div>
+                <code style="display: block; background-color: #ffffff; color: #0f172a; border: 1px solid #fedf89; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; padding: 8px 10px; border-radius: 4px; word-break: break-all;">{{ rbac_check_command | default('oc auth can-i --list') | e }}</code>
+                <div style="font-size: 12px; font-weight: 600; margin: 8px 0 4px 0;">Grant it (cluster administrator):</div>
+                <code style="display: block; background-color: #ffffff; color: #0f172a; border: 1px solid #fedf89; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; padding: 8px 10px; border-radius: 4px; word-break: break-all;">{{ rbac_remediation_cmd | default('oc adm policy add-cluster-role-to-user cluster-admin <npid>') | e }}</code>
+              </div>
+              {% endif %}
+
+              <!-- Session note -->
+              <div style="border-radius: 6px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; background-color: {{ bg_info | default('#f2f4f7') }}; border: 1px solid {{ color_border | default('#e4e7ec') }}; color: {{ color_info | default('#344054') }};">
+                The automation's cluster session is logged out and its temporary kubeconfig removed immediately after this alert.
+                {% if (current_step_no | default('') | string) is search('03|04') %}
+                An upgrade that was already triggered keeps running on the cluster; check <code>oc get clusterversion</code> before re-running.
+                {% endif %}
+              </div>
+
+              <!-- Diagnostics -->
+              <div style="margin: 10px 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Failure Details</div>
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 13px; margin-bottom: 20px; border-collapse: collapse;">
+                <tr>
+                  <td style="width: 32%; font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Cluster</td>
+                  <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};"><strong>{{ cluster_name | default('N/A') | e }}</strong></td>
+                </tr>
+                <tr>
+                  <td style="font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Run</td>
+                  <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ run_timestamp | default('N/A') | e }} &bull; {{ run_mode | default('full-upgrade') | e }}</td>
+                </tr>
+                <tr>
+                  <td style="font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Failed step</td>
+                  <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ current_step_no | default('') | e }} &mdash; <code>{{ failed_task_name | default('Unknown step') | e }}</code></td>
+                </tr>
+                <tr>
+                  <td style="font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Gate</td>
+                  <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};"><span style="font-weight: 700; color: {{ color_fail | default('#b42318') }};">{{ failed_gate_type | default('HARD') | e }}</span></td>
+                </tr>
+                <tr>
+                  <td style="font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px;">Upgrade path</td>
+                  <td style="padding: 8px 12px;">{{ upgrade_path | default([]) | join(' &rarr; ') if (upgrade_path | default([]) | length > 0) else 'N/A' }}</td>
+                </tr>
+              </table>
+
+              <!-- Error output -->
+              <div style="margin: 10px 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Error Output</div>
+              <div style="background-color: #0f172a; color: #f8fafc; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; padding: 12px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; margin: 8px 0 20px 0; line-height: 1.45;">{{ resolved_error | default('No error output captured.') | string | truncate(4000) | e }}</div>
+
+              {% if attachments | length > 0 %}
+              <div style="margin: 10px 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Attached</div>
+              <ul style="margin: 0 0 20px 0; padding-left: 18px; color: #475467; font-size: 13px;">
+                {% for att in attachments %}
+                <li style="margin-bottom: 4px;"><code>{{ att | e }}</code></li>
+                {% endfor %}
+              </ul>
+              {% endif %}
+
+              <!-- Next steps -->
+              <div style="padding: 14px 16px; background-color: #f8f9fb; border: 1px solid {{ color_border | default('#e4e7ec') }}; border-radius: 6px; font-size: 13px;">
+                <div style="font-weight: 700; margin-bottom: 6px; color: #344054;">Next steps</div>
+                <ol style="margin: 0; padding-left: 18px; color: #475467;">
+                  <li style="margin-bottom: 4px;">Review the run log on the jump server: <code>{{ log_file | e }}</code></li>
+                  <li style="margin-bottom: 4px;">Fix the cause shown above.</li>
+                  <li>Re-run with <code>./00_Run.sh --cluster {{ cluster_name | default('&lt;cluster&gt;') | e }} --resume</code>; hops already completed are skipped automatically.</li>
+                </ol>
+              </div>
+
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 16px 24px; background-color: #f9fafb; border-top: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; color: #667085; line-height: 1.4;">
+              <div><strong>Generated:</strong> {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }} &bull; <strong>Host:</strong> {{ ansible_hostname | default('localhost') | e }}</div>
+              <div style="margin-top: 4px;">Automated alert from the ARO Cluster Upgrade automation. Do not reply.</div>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

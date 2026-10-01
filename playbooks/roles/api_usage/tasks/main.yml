@@ -1,0 +1,99 @@
+---
+# ============================================================================
+# Role Tasks: api_usage (Removed Kubernetes API Usage Check)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, debug). No changes needed.
+#
+# Purpose: Read-only check of APIRequestCount for APIs that the target release(s)
+#          remove (status.removedInRelease). Any request in the last 24 hours by a
+#          user that is not on api_usage_ignore_users counts as "in use".
+# Why:     OpenShift asks for an admin acknowledgement before minor versions that
+#          remove APIs. The automation acknowledges automatically only when no
+#          workload still calls those APIs; otherwise the run stops before the hop.
+# Inputs:  api_usage_releases (list of Kubernetes minor strings, e.g. ["1.29"])
+#          api_usage_ignore_users (list), api_usage_check_enabled (bool)
+# Role / Playbook Dependencies: vars/upgrade.yml, jq 1.5
+# Gate Type: N/A (the caller decides: Phase 02 Check 07 / per-hop admin-ack gate)
+# Outputs: api_usage_query_ok, api_usage_findings, api_usage_blocking, api_usage_summary
+# ============================================================================
+
+- name: "api_usage: Initialize result facts"
+  set_fact:
+    api_usage_query_ok: true
+    api_usage_findings: []
+    api_usage_blocking: false
+    api_usage_summary: >-
+      {{ 'Removed-API usage check disabled (api_usage_check_enabled: false)'
+         if not (api_usage_check_enabled | default(true) | bool)
+         else ('No API removals in scope' if (api_usage_releases | default([]) | length == 0) else '') }}
+
+# Why: jq 1.5-safe — explicit parentheses, `any` over a mapped boolean list, and
+#      sort_by + reverse instead of a negated sort key. Output: a JSON array of
+#      {api, removed_in, users:[{username, user_agent, count}]} with non-ignored users only.
+- name: "api_usage: Query APIRequestCount for APIs removed in {{ api_usage_releases | default([]) | join(', ') }}"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get apirequestcounts -o json | jq -c \
+      --argjson rels {{ api_usage_releases | default([]) | to_json | quote }} \
+      --argjson ignore {{ api_usage_ignore_users | default([]) | to_json | quote }} '
+      [ .items[]?
+        | select(((.status.removedInRelease // "") as $r | ($rels | map(. == $r) | any)))
+        | { api: .metadata.name,
+            removed_in: .status.removedInRelease,
+            users: [ .status.last24h[]?.byNode[]?.byUser[]?
+                     | select(((.username // "") as $u | (($ignore | map(. == $u) | any) | not)))
+                     | { username: (.username // "unknown"), user_agent: (.userAgent // ""), count: (.requestCount // 0) } ] }
+        | .users = (.users
+                    | group_by(.username + "|" + .user_agent)
+                    | map({ username: .[0].username, user_agent: .[0].user_agent, count: (map(.count) | add) })
+                    | sort_by(.count) | reverse)
+        | select((.users | length) > 0) ]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: api_usage_raw
+  changed_when: false
+  failed_when: false
+  when:
+    - api_usage_check_enabled | default(true) | bool
+    - api_usage_releases | default([]) | length > 0
+
+- name: "api_usage: Evaluate findings"
+  set_fact:
+    api_usage_query_ok: "{{ api_usage_raw.rc | default(1) == 0 }}"
+    api_usage_findings: >-
+      {{ (api_usage_raw.stdout | from_json)
+         if ((api_usage_raw.rc | default(1)) == 0 and (api_usage_raw.stdout | default('') | trim | length > 0))
+         else [] }}
+  when:
+    - api_usage_check_enabled | default(true) | bool
+    - api_usage_releases | default([]) | length > 0
+
+# Why: fail closed — if usage cannot be verified the acknowledgement is not applied.
+- name: "api_usage: Summarize removed-API usage"
+  set_fact:
+    api_usage_blocking: "{{ (not (api_usage_query_ok | bool)) or (api_usage_findings | length > 0) }}"
+    api_usage_summary: >-
+      {%- if not (api_usage_query_ok | bool) -%}
+      Could not read APIRequestCount ({{ (api_usage_raw.stderr | default('') | trim | truncate(200)) or 'query failed' }}); removed-API usage is unverified
+      {%- elif api_usage_findings | length == 0 -%}
+      No workload calls to APIs removed in Kubernetes {{ api_usage_releases | join(', ') }} in the last 24h
+      {%- else -%}
+      {%- set parts = [] -%}
+      {%- for f in api_usage_findings -%}
+      {%- set users = [] -%}
+      {%- for u in f.users[:3] -%}{%- set _ = users.append(u.username ~ ' (' ~ (u.user_agent | truncate(40)) ~ ', ' ~ u.count ~ ' req)') -%}{%- endfor -%}
+      {%- set _ = parts.append(f.api ~ ' [removed in ' ~ f.removed_in ~ '] used by ' ~ (users | join('; '))) -%}
+      {%- endfor -%}
+      Removed APIs still in use: {{ parts | join(' | ') }}
+      {%- endif -%}
+  when:
+    - api_usage_check_enabled | default(true) | bool
+    - api_usage_releases | default([]) | length > 0
+
+- name: "api_usage: Report result"
+  debug:
+    msg: "Removed-API usage ({{ api_usage_releases | default([]) | join(', ') or 'none in scope' }}): {{ api_usage_summary }}"

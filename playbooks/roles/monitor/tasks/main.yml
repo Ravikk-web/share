@@ -1,0 +1,175 @@
+---
+# ============================================================================
+# Role Tasks: monitor
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses set_fact, include_tasks, fail, debug; compatible across 2.7 and 2.14.
+#
+# Purpose: Watches a hop (monitor_mode: hop) or a remediation node rollout
+#          (monitor_mode: rollout) until the cluster is settled, polling every
+#          poll_interval_minutes. Sends 20-minute heartbeats and degradation alerts.
+# Rules:   - Settled: ClusterVersion at target (hop mode), Available, not Progressing,
+#            not Failing; no degraded / progressing / unavailable ClusterOperator (outside
+#            co_allow_list); every MachineConfigPool Updated, not Updating or Degraded —
+#            for settle_consecutive_polls consecutive polls.
+#          - Fails when nothing progresses for hop_timeout_minutes, the hop exceeds
+#            hop_max_minutes, the API is unreachable for monitor_api_outage_minutes,
+#            the release is not accepted for release_not_accepted_fail_minutes, or
+#            ClusterVersion reports Failing for cv_failing_fail_minutes.
+# Why:     Time is read with `date +%s` on every poll; ansible_date_time is captured
+#          once per play and made every duration, heartbeat and stall timer read 0.
+#          A single failed query no longer aborts a live upgrade.
+# Inputs:  hop_target_version, hop_label, hop_number, hop_total, monitor_mode
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/smtp.yml, tasks/notify.yml,
+#               tasks/log_event.yml, roles/monitor/tasks/poll_iteration.yml, poll_body.yml
+# Gate Type: HARD (timeouts / fail-fast conditions)
+# Outputs: hop_settled, hop_elapsed_duration, monitor_abort_code (on failure)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Initialize Monitoring State
+# ----------------------------------------------------------------------------
+- name: "Monitor: Capture start time"
+  set_fact:
+    monitor_start_epoch: "{{ lookup('pipe', 'date +%s') | int }}"
+
+- name: "Monitor: Initialize monitoring state"
+  set_fact:
+    resolved_target_version: "{{ hop_target_version | default(target_version | default(''), true) }}"
+    monitor_mode_effective: "{{ monitor_mode | default('hop', true) }}"
+    monitor_label: >-
+      {{ ('Remediation rollout (Phase 02)' if (monitor_mode | default('hop', true)) == 'rollout'
+          else ('Hop ' ~ (hop_number | default(1)) ~ ' of ' ~ (hop_total | default(1)))) }}
+    # Why: a dry run never starts a hop, so there is nothing to watch (rollout mode is
+    #      only entered after a real remediation, e.g. in --pre-check, and always polls).
+    monitor_simulated: "{{ (dry_run | default(false) | bool) and (monitor_mode | default('hop', true)) == 'hop' }}"
+    monitor_poll_seconds: "{{ (poll_interval_minutes | default(2) | int) * 60 }}"
+    monitor_max_iterations: >-
+      {{ 0 if ((dry_run | default(false) | bool) and (monitor_mode | default('hop', true)) == 'hop')
+         else ((((hop_max_minutes | default(480) | int) // (poll_interval_minutes | default(2) | int)) + 2) | int) }}
+    monitor_last_progress_epoch: "{{ monitor_start_epoch }}"
+    monitor_progress_signature: ""
+    monitor_settled_streak: 0
+    monitor_iterations_completed: 0
+    monitor_mcp_rollout_seen: false
+    hop_settled: false
+    monitor_abort: false
+    monitor_abort_reason: ""
+    monitor_abort_code: 20
+    monitor_api_fail_since: 0
+    monitor_release_rejected_since: 0
+    monitor_cv_failing_since: 0
+    degradation_first_seen: {}
+    degradation_alerted: []
+    degradation_new_items: []
+    progress_open_issues: []
+    progress_percent: 0
+    stalled_nodes_forced: []
+    _poll_blockers: []
+    # Why: keep the heartbeat cadence across back-to-back hops, but start a fresh
+    #      interval when the previous heartbeat is older than one interval (otherwise
+    #      the first poll of a new session would send one immediately).
+    last_heartbeat_epoch: >-
+      {{ (last_heartbeat_epoch | int)
+         if ((last_heartbeat_epoch | default(0) | int) > 0
+             and ((monitor_start_epoch | int) - (last_heartbeat_epoch | int)) < ((heartbeat_minutes | default(20) | int) * 60))
+         else (monitor_start_epoch | int) }}
+
+- name: "Monitor: Validate target version input"
+  assert:
+    that:
+      - resolved_target_version | length > 0
+    fail_msg: "[HARD GATE FAILURE] monitor role requires hop_target_version (or target_version)."
+
+- name: "Monitor: Display monitoring banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "PHASE 04: LIVE MONITORING — {{ monitor_label }}"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name }}"
+      - "Target Version       : {{ resolved_target_version }}"
+      - "Polling Cadence      : every {{ poll_interval_minutes | default(2) }} min"
+      - "Heartbeat Cadence    : every {{ heartbeat_minutes | default(20) }} min"
+      - "No-Progress Timeout  : {{ hop_timeout_minutes | default(90) }} min (hard cap {{ hop_max_minutes | default(480) }} min)"
+      - "API Outage Tolerance : {{ monitor_api_outage_minutes | default(10) }} min"
+      - "Settle Requirement   : {{ settle_consecutive_polls | default(2) }} consecutive settled polls"
+      - "============================================================================"
+  when: not (monitor_simulated | bool)
+
+- name: "Monitor: Log monitoring start"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "START"
+    event_gate: "HARD"
+    event_task: "Phase 04 monitoring ({{ monitor_label }})"
+    event_reason: "Watching {{ resolved_target_version }} until settled"
+  when: not (monitor_simulated | bool)
+
+- name: "Monitor: Dry run — no hop was started, nothing to watch"
+  set_fact:
+    hop_settled: true
+  when: monitor_simulated | bool
+
+# ----------------------------------------------------------------------------
+# 2. Bounded Polling Loop
+# ----------------------------------------------------------------------------
+# Why: Ansible expands looped includes up front and cannot break out of them, so each
+#      iteration file holds a single conditional include; once the cluster settles
+#      (or monitoring aborts) the remaining iterations cost one skipped task each.
+- name: "Monitor: Execute bounded live polling loop"
+  include_tasks: poll_iteration.yml
+  loop: "{{ range(1, (monitor_max_iterations | int) + 1) | list }}"
+  loop_control:
+    loop_var: poll_iteration_idx
+
+# ----------------------------------------------------------------------------
+# 3. Outcome
+# ----------------------------------------------------------------------------
+- name: "Monitor: Compute elapsed duration"
+  set_fact:
+    hop_elapsed_duration: >-
+      {%- set s = (lookup('pipe', 'date +%s') | int) - (monitor_start_epoch | int) -%}
+      {{ '%02d:%02d:%02d' | format(s // 3600, (s % 3600) // 60, s % 60) }}
+
+# Why: hop failures map to CLI exit 20 (failed) or 30 (timeout / no progress);
+#      a rollout wait belongs to Phase 02, whose rescue reports exit 10.
+- name: "Monitor: Record failure exit code for the run status"
+  set_fact:
+    phase_exit_code: "{{ (monitor_abort_code | int) if (monitor_abort | bool) else 30 }}"
+  when:
+    - (monitor_abort | bool) or not (hop_settled | bool)
+    - monitor_mode_effective == 'hop'
+
+- name: "Monitor: Stop — {{ monitor_label }} did not settle"
+  fail:
+    msg: >-
+      [HARD GATE FAILURE] {{ monitor_label }} ({{ resolved_target_version }}) on '{{ cluster_name }}':
+      {{ monitor_abort_reason if (monitor_abort_reason | length > 0)
+         else ('did not settle within ' ~ (hop_max_minutes | default(480)) ~ ' minutes') }}
+      (elapsed {{ hop_elapsed_duration }}; cluster at {{ (poll_cv | default({})).latest | default('unknown') }}).
+  when: (monitor_abort | bool) or not (hop_settled | bool)
+
+- name: "Monitor: Display settle-gate success banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "SETTLE-GATE PASSED: {{ monitor_label }} ({{ resolved_target_version }})"
+      - "============================================================================"
+      - "Elapsed Duration     : {{ hop_elapsed_duration }}"
+      - "Polls                : {{ monitor_iterations_completed }}"
+      - "ClusterVersion       : {{ (poll_cv | default({})).latest | default(resolved_target_version) }} (Available, not Progressing)"
+      - "ClusterOperators     : settled | MachineConfigPools: all updated"
+      - "Paused pools         : {{ _poll_paused_mcp | default([]) | join(', ') or 'none' }} (not part of the settle gate)"
+      - "============================================================================"
+  when: not (monitor_simulated | bool)
+
+- name: "Monitor: Log settle-gate pass"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "PASS"
+    event_gate: "HARD"
+    event_task: "Phase 04 monitoring ({{ monitor_label }})"
+    event_reason: "Settled at {{ resolved_target_version }} in {{ hop_elapsed_duration }}"
+    event_observed: "{{ ('paused pools not updated: ' ~ (_poll_paused_mcp | join(', '))) if (_poll_paused_mcp | default([]) | length > 0) else '' }}"
+  when: not (monitor_simulated | bool)

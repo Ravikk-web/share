@@ -1,0 +1,87 @@
+---
+# ============================================================================
+# Role Tasks: remediate - restart_operator (Check 01, Tier 2, opt-in)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names (shell, set_fact, pause, include_tasks).
+#
+# Purpose: For each degraded ClusterOperator (not on co_allow_list), deletes the
+#          operator's own pods so its Deployment recreates them, then waits
+#          operator_restart_grace_seconds. Disabled by default.
+# Why:     The operator namespace is taken from the ClusterOperator's own
+#          relatedObjects (the namespace ending in "-operator"), and only pods owned
+#          by a ReplicaSet there are restarted — never a matching name elsewhere
+#          (previously the first pod whose name contained the CO name, e.g. an etcd
+#          static pod or a node daemon, could be deleted).
+# Role / Playbook Dependencies: vars/upgrade.yml, tasks/log_event.yml
+# Gate Type: HARD (verified by the Phase 02 re-scan: AUTO-FIXED / FIX-FAILED)
+# Outputs: Deleted operator pods, remediation_attempted_nums, preval_autofix_items
+# ============================================================================
+
+- name: "restart CO: Query degraded ClusterOperators and their operator namespaces"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get clusteroperators -o json | jq -c --argjson allow {{ co_allow_list | default([]) | to_json | quote }} '
+      [ .items[]?
+        | select((((.status.conditions // []) | map(select(.type == "Degraded")) | .[0].status) // "False") == "True")
+        | select((.metadata.name as $n | ($allow | map(. == $n) | any)) | not)
+        | { name: .metadata.name,
+            namespace: (([.status.relatedObjects[]? | select(.resource == "namespaces") | .name | select(endswith("-operator"))] | .[0])
+                        // ("openshift-" + .metadata.name + "-operator")) } ]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: degraded_co_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: degraded_co_raw.rc == 0
+
+- name: "restart CO: Parse degraded operators"
+  set_fact:
+    actionable_degraded_co: "{{ degraded_co_raw.stdout | from_json }}"
+
+- name: "restart CO: Delete the operator's own pods so its Deployment recreates them"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    pods="$(oc get pods -n {{ item.namespace | quote }} -o json | jq -r '.items[]? | select(any(.metadata.ownerReferences[]?; .kind == "ReplicaSet")) | .metadata.name')"
+    if [ -z "$pods" ]; then echo "no operator pods found in {{ item.namespace }}"; exit 0; fi
+    echo "$pods" | xargs oc delete pod -n {{ item.namespace | quote }} --wait=false
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: co_restart_results
+  changed_when: true
+  failed_when: false
+  loop: "{{ actionable_degraded_co }}"
+
+# Why: wait_for (not pause) never touches the terminal, so a run started with nohup
+#      or from a scheduler cannot be stopped by SIGTTOU.
+- name: "restart CO: Wait for operator reconciliation"
+  wait_for:
+    timeout: "{{ operator_restart_grace_seconds | default(180) | int }}"
+  when: actionable_degraded_co | length > 0
+
+- name: "restart CO: Record remediation attempt"
+  set_fact:
+    remediation_attempted_nums: >-
+      {{ (remediation_attempted_nums | default([])) + ([1] if (actionable_degraded_co | length > 0) else []) }}
+    preval_autofix_items: >-
+      {{ (preval_autofix_items | default([])) + ([{
+           'name': 'Degraded operator restart (' ~ (actionable_degraded_co | map(attribute='name') | join(', ')) ~ ')',
+           'action': 'Restarted the operator pods of ' ~ (actionable_degraded_co | map(attribute='name') | join(', ')) ~ ' and waited for reconciliation.',
+           'reference': 'https://docs.openshift.com/container-platform/latest/support/troubleshooting/investigating-cluster-operators.html'
+         }] if (actionable_degraded_co | length > 0) else []) }}
+
+- name: "restart CO: Log remediation outcome"
+  include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+  vars:
+    event_status: "{{ 'AUTO-FIX' if (actionable_degraded_co | length > 0) else 'INFO' }}"
+    event_gate: "HARD"
+    event_task: "Degraded operator restart (Check 01)"
+    event_reason: "Restarted operator pods for: {{ actionable_degraded_co | map(attribute='name') | join(', ') or 'none' }}"
+    event_observed: "{{ co_restart_results.results | default([]) | map(attribute='stdout') | join('; ') | truncate(500) }}"

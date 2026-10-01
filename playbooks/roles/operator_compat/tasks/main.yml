@@ -1,0 +1,198 @@
+---
+# ============================================================================
+# Role Tasks: operator_compat
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses short module names, set_fact, and include_tasks.
+#
+# Purpose: Read-only OLM compatibility scan against a target OpenShift version:
+#          - FAIL when an installed operator declares olm.maxOpenShiftVersion below
+#            the target (OLM would block the minor update, or the operator is
+#            unsupported there), or when OLM reports Upgradeable=False.
+#          - WARN when a newer channel matching the target minor is available.
+# Why:     Channel names alone do not tell whether an operator supports a version;
+#          olm.maxOpenShiftVersion (CSV olm.properties) is what OLM itself enforces.
+# Inputs:  operator_compat_target_version (optional; defaults to the highest hop in
+#          upgrade_path, else the cluster's current version)
+# Role / Playbook Dependencies: roles/operator_compat/tasks/scan_subscription.yml, jq 1.5
+# Gate Type: HARD via Prevalidation Check 15 (this role only gates when
+#            operator_compat_enforce_gate is true)
+# Outputs: operator_compat_plan, operator_compat_status, operator_compat_observed
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Initialize & Resolve Target Version
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Initialize compatibility fact containers"
+  set_fact:
+    operator_compat_plan: []
+    operator_compat_records: []
+    _oc_path_max: >-
+      {%- set best = [] -%}
+      {%- for v in upgrade_path | default([]) -%}
+        {%- if (v | string) is match('^[0-9]+[.][0-9]+[.][0-9]+$') and ((best | length == 0) or ((v | string) is version(best[-1], '>'))) -%}
+          {%- set _ = best.append(v | string) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ best[-1] if (best | length > 0) else '' }}
+
+- name: "operator_compat: Query current cluster version when no numeric target is given"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get clusterversion version -o json | jq -r '(((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // .status.desired.version) // ""'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: _oc_cv_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: _oc_cv_raw.rc == 0
+  when:
+    - not ((operator_compat_target_version | default('') | string) is match('^[0-9]+[.][0-9]+'))
+    - _oc_path_max | length == 0
+
+- name: "operator_compat: Resolve target OpenShift minor version"
+  set_fact:
+    _oc_target_version: >-
+      {{ (operator_compat_target_version | string)
+         if ((operator_compat_target_version | default('') | string) is match('^[0-9]+[.][0-9]+'))
+         else (_oc_path_max if (_oc_path_max | length > 0) else (_oc_cv_raw.stdout | default('') | trim)) }}
+
+- name: "operator_compat: Derive target major.minor"
+  set_fact:
+    target_ocp_minor: "{{ (_oc_target_version | string).split('.')[0:2] | join('.') if (_oc_target_version | length > 0) else '' }}"
+
+- name: "operator_compat: Display compatibility scan banner"
+  debug:
+    msg:
+      - "============================================================================"
+      - "OLM OPERATOR COMPATIBILITY SCAN"
+      - "============================================================================"
+      - "Target Cluster       : {{ cluster_name | default('unknown') }}"
+      - "Target OpenShift     : {{ _oc_target_version | default('unknown', true) }} (minor {{ target_ocp_minor | default('n/a', true) }})"
+      - "============================================================================"
+
+# ----------------------------------------------------------------------------
+# 2. Query Subscriptions, Installed CSVs and the OLM ClusterOperator
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Query and parse live OLM subscriptions with jq v1.5"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get subscriptions.operators.coreos.com -A -o json | jq -c '
+      [ .items[]? | {
+          name: (.metadata.name // "unknown"),
+          namespace: (.metadata.namespace // "unknown"),
+          package: (.spec.name // .metadata.name // "unknown"),
+          channel: (.spec.channel // ""),
+          source: (.spec.source // ""),
+          source_namespace: (.spec.sourceNamespace // "openshift-marketplace"),
+          approval: (.spec.installPlanApproval // "Automatic"),
+          installed_csv: (.status.installedCSV // .status.currentCSV // "None"),
+          state: (.status.state // "")
+        } ]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: op_subscriptions_parsed_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: op_subscriptions_parsed_raw.rc == 0
+
+# Why: -l '!olm.copiedFrom' skips the per-namespace copies OLM makes of
+#      AllNamespaces operators (one per namespace, often thousands of objects).
+#      olm.properties is a JSON string annotation; try/catch keeps a malformed one
+#      from breaking the scan (jq 1.5 supports try/catch).
+- name: "operator_compat: Query installed CSVs and their declared maximum OpenShift version"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get csv -A -l '!olm.copiedFrom' -o json | jq -c '
+      [ .items[]? | {
+          name: .metadata.name,
+          namespace: .metadata.namespace,
+          phase: (.status.phase // "Unknown"),
+          max_ocp: ((try ((.metadata.annotations["olm.properties"] // "[]") | fromjson) catch [])
+                    | map(select(.type == "olm.maxOpenShiftVersion")) | ((.[0].value // "") | tostring))
+        } ]'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: op_csvs_parsed_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: op_csvs_parsed_raw.rc == 0
+
+- name: "operator_compat: Query OLM ClusterOperator Upgradeable condition"
+  shell: |
+    # Why: set -o pipefail requires /bin/bash; Ansible default /bin/sh may be dash
+    set -o pipefail
+    oc get clusteroperator operator-lifecycle-manager -o json | jq -c '
+      (((.status.conditions // []) | map(select(.type == "Upgradeable")) | .[0]) // {})
+      | {status: ((.status // "True") | tostring), reason: (.reason // ""), message: (.message // "")}'
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig | default(playbook_dir ~ '/.kubeconfig-' ~ (cluster_name | default('default'))) }}"
+  register: op_olm_upgradeable_raw
+  changed_when: false
+  failed_when: false
+
+- name: "operator_compat: Set parsed subscription, CSV and OLM facts"
+  set_fact:
+    parsed_subscriptions: "{{ op_subscriptions_parsed_raw.stdout | from_json }}"
+    installed_csvs: "{{ op_csvs_parsed_raw.stdout | from_json }}"
+    olm_upgradeable: >-
+      {{ (op_olm_upgradeable_raw.stdout | from_json)
+         if (op_olm_upgradeable_raw.rc | default(1) == 0 and (op_olm_upgradeable_raw.stdout | default('') | trim | length > 0))
+         else {'status': 'Unknown', 'reason': 'QueryFailed', 'message': (op_olm_upgradeable_raw.stderr | default('') | truncate(200))} }}
+
+# ----------------------------------------------------------------------------
+# 3. Evaluate Each Subscription
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Scan individual subscriptions for version compatibility"
+  include_tasks: scan_subscription.yml
+  loop: "{{ parsed_subscriptions }}"
+  loop_control:
+    loop_var: sub_item
+  when: parsed_subscriptions | length > 0
+
+# ----------------------------------------------------------------------------
+# 4. Overall Verdict
+# ----------------------------------------------------------------------------
+- name: "operator_compat: Derive overall compatibility verdict"
+  set_fact:
+    operator_compat_status: >-
+      {{ 'FAIL' if ((operator_compat_plan | selectattr('status', 'equalto', 'FAIL') | list | length > 0)
+                   or ((olm_upgradeable.status | lower) == 'false'))
+         else ('WARN' if (operator_compat_plan | selectattr('status', 'equalto', 'WARN') | list | length > 0) else 'PASS') }}
+    operator_compat_observed: >-
+      {%- set bad = operator_compat_plan | selectattr('status', 'equalto', 'FAIL') | list -%}
+      {%- set warn = operator_compat_plan | selectattr('status', 'equalto', 'WARN') | list -%}
+      {%- if parsed_subscriptions | length == 0 -%}
+      No OLM subscriptions installed on cluster
+      {%- else -%}
+      {{ parsed_subscriptions | length }} subscription(s) checked against OpenShift {{ target_ocp_minor | default('?', true) }}.
+      {%- if bad | length > 0 %} Incompatible: {% for b in bad %}{{ b.subscription }} (max {{ b.max_ocp }}){% if not loop.last %}, {% endif %}{% endfor %}.{% endif %}
+      {%- if warn | length > 0 %} Channel switch recommended: {% for w in warn %}{{ w.subscription }} ({{ w.current_channel }} -> {{ w.target_channel }}){% if not loop.last %}, {% endif %}{% endfor %}.{% endif %}
+      {%- if bad | length == 0 and warn | length == 0 %} All compatible.{% endif %}
+      {%- endif -%}
+      {%- if (olm_upgradeable.status | lower) == 'false' %} OLM reports Upgradeable=False ({{ olm_upgradeable.reason }}): {{ olm_upgradeable.message | truncate(300) }}{% endif %}
+
+- name: "operator_compat: Display compatibility plan summary"
+  debug:
+    msg: "Operator compatibility: {{ operator_compat_status }} — {{ operator_compat_observed }}"
+
+- name: "operator_compat: Enforce compatibility gate if enabled"
+  fail:
+    msg: "[HARD GATE FAILURE] Operator compatibility: {{ operator_compat_observed }}"
+  when:
+    - operator_compat_enforce_gate | default(false) | bool
+    - operator_compat_status == 'FAIL'

@@ -1,0 +1,288 @@
+---
+# ============================================================================
+# Phase 05 Playbook: Post-Upgrade Checks & Baseline Diff
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses play-level vars_files, include_role / include_tasks and
+#                 block/rescue/always; compatible across Ansible 2.7 and 2.14.
+#
+# Purpose: Runs the 10-check postvalidation contract (final version, operators,
+#          pools, node readiness + kubelet version, node pressure, etcd, PVs, core
+#          pods, firing critical alerts, baseline diff), writes the postvalidation
+#          report, then enforces the HARD gate (Checks 01-06).
+# Modes:   live   — gate enforced; in a full run no mail here (the run's closing
+#                   summary attaches the report); a standalone post-check sends its
+#                   own closing postvalidation mail.
+#          dry run — read-only audit of the current version (gate reported, not
+#                   enforced); runs only when dry_run_include_postval is true or the
+#                   phase is run on its own.
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               roles/login, roles/logout, roles/postvalidation, roles/report,
+#               roles/error_handle, tasks/log_event.yml, tasks/send_run_summary.yml
+# Gate Type: HARD (Checks 01-06; exit code 25) / WARN (Checks 07-10)
+# Outputs: output/<cluster>_postvalidation_<ts>.html, health_summary, run_final_version,
+#          run_phase_results entry
+# ============================================================================
+
+- name: "Phase 05 — Post-Upgrade Checks & Baseline Diff"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+
+  tasks:
+    - name: "Phase 05: Postvalidation and baseline diff"
+      when:
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 5
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 5
+        - (not (dry_run | default(false) | bool)) or (dry_run_include_postval | default(true) | bool) or (standalone_phase | default(false) | bool)
+      block:
+        - name: "Phase 05: Initialize phase context"
+          set_fact:
+            phase05_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"
+            phase_05_failed: false
+            p05_report_written: false
+            p05_report_file: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_postvalidation_{{ run_timestamp }}.html"
+            # Why: a dry run audits the version the cluster is on; a live run checks the
+            #      version the hops actually reached (or the path's last hop).
+            final_target_version: >-
+              {{ 'current' if (dry_run | default(false) | bool)
+                 else (run_final_version | default(upgrade_path | default(['current']) | last, true)) }}
+            p05_gate_enforced: "{{ (postval_enforce_gate | default(true) | bool) and not (dry_run | default(false) | bool) }}"
+
+        - name: "Phase 05: Log in (standalone run or no active session)"
+          include_role:
+            name: login
+          when: not (cluster_session_active | default(false) | bool)
+
+        - name: "Phase 05: Display initiation banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 05: POSTVALIDATION {{ '(DRY RUN - READ-ONLY AUDIT)' if (dry_run | default(false) | bool) else '' }}"
+              - "============================================================================"
+              - "Cluster              : {{ cluster_name }}"
+              - "Expected Version     : {{ final_target_version }}"
+              - "Baseline Snapshot    : {{ baseline_snapshot_file_path | default('newest snapshot of this cluster') }}"
+              - "HARD Gate            : {{ 'enforced' if (p05_gate_enforced | bool) else 'reported only' }}"
+              - "============================================================================"
+
+        # Why: the role's own gate is switched off so the report is always written
+        #      first; the gate is enforced below.
+        - name: "Phase 05: Run the 10-check postvalidation contract"
+          include_role:
+            name: postvalidation
+          vars:
+            postval_enforce_gate: false
+
+        - name: "Phase 05: Record the version the cluster is on"
+          set_fact:
+            run_final_version: "{{ postval_cv_data.current_version | default(run_final_version | default(''), true) }}"
+            _p05_hard_failures: >-
+              {{ health_summary | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'equalto', 'FAIL') | list }}
+
+        - name: "Phase 05: Configure the postvalidation report"
+          set_fact:
+            report_type: "postvalidation"
+            report_title: "Post-Upgrade Validation Report{{ ' (dry-run audit)' if (dry_run | default(false) | bool) else '' }}"
+            report_template: "health-overview.j2"
+            checks: "{{ health_summary }}"
+            autofix_items: []
+            output_file: "{{ p05_report_file }}"
+
+        - name: "Phase 05: Write the postvalidation report"
+          include_role:
+            name: report
+
+        - name: "Phase 05: Record that the report is written"
+          set_fact:
+            p05_report_written: true
+
+        - name: "Phase 05: HARD gate — Checks 01-06 must pass"
+          fail:
+            msg: >-
+              [HARD GATE FAILURE] Postvalidation failed on '{{ cluster_name }}' ({{ _p05_hard_failures | length }} HARD check(s)):
+              {% for item in _p05_hard_failures %}Check {{ '%02d' | format(item.num | int) }} {{ item.name }}: {{ item.observed | truncate(300) }}{% if not loop.last %} | {% endif %}{% endfor %}
+          when:
+            - p05_gate_enforced | bool
+            - _p05_hard_failures | length > 0
+
+        - name: "Phase 05: Record the phase result"
+          set_fact:
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{
+                   'phase': '05',
+                   'name': 'Postvalidation' ~ (' (dry-run audit)' if (dry_run | default(false) | bool) else ''),
+                   'status': ('FAIL' if (_p05_hard_failures | length > 0)
+                              else ('WARN' if (health_summary | selectattr('status', 'equalto', 'WARN') | list | length > 0) else 'PASS')),
+                   'detail': ((health_summary | length) ~ ' checks: ' ~ (health_summary | selectattr('status', 'equalto', 'PASS') | list | length) ~ ' pass, '
+                              ~ (health_summary | selectattr('status', 'equalto', 'WARN') | list | length) ~ ' warn, '
+                              ~ (_p05_hard_failures | length) ~ ' HARD fail; cluster at ' ~ run_final_version)
+                 }] }}
+
+        - name: "Phase 05: Log the phase result"
+          include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+          vars:
+            event_status: "{{ run_phase_results[-1].status }}"
+            event_gate: "HARD"
+            event_task: "Phase 05 Postvalidation"
+            event_reason: "{{ run_phase_results[-1].detail }}"
+            event_observed: "Report: {{ p05_report_file }}"
+
+        - name: "Phase 05: Display completion banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 05 COMPLETE: {{ run_phase_results[-1].status }}"
+              - "============================================================================"
+              - "Result               : {{ run_phase_results[-1].detail }}"
+              - "Report               : {{ p05_report_file }}"
+              - "============================================================================"
+
+        # Why: when Phase 06 does not run in this invocation (dry run, post-check, stop
+        #      after Phase 05) the Developer perspective state is reported, never changed.
+        - name: "Phase 05: Report the web console Developer perspective (read-only)"
+          when: (dry_run | default(false) | bool) or (standalone_phase | default(false) | bool) or (stop_after_phase is defined and (stop_after_phase | int) < 6)
+          block:
+            - name: "Phase 05: Read the Developer perspective state"
+              include_role:
+                name: console
+              vars:
+                console_report_only: true
+          rescue:
+            - name: "Phase 05: Developer perspective state could not be read"
+              set_fact:
+                developer_perspective_status: "Not checked: {{ ansible_failed_result.msg | default('console query failed') | truncate(200) }}"
+
+        - name: "Phase 05: Prepare the closing mail (standalone run)"
+          set_fact:
+            run_summary_event: "postvalidation"
+            run_summary_tag: "POSTVALIDATION"
+            run_summary_title: "{{ 'Postvalidation Audit (dry run)' if (dry_run | default(false) | bool) else 'Post-check Report' }}"
+            run_summary_intro: >-
+              Cluster {{ cluster_name }} is on {{ run_final_version }}. {{ run_phase_results[-1].detail }}.
+              {{ 'Read-only audit; the HARD gate is reported, not enforced.' if (dry_run | default(false) | bool) else '' }}
+            run_summary_checks: "{{ health_summary }}"
+          when: standalone_phase | default(false) | bool
+
+        - name: "Phase 05: Send the closing mail (standalone run)"
+          include_tasks: "{{ playbook_dir }}/tasks/send_run_summary.yml"
+          when: standalone_phase | default(false) | bool
+
+        - name: "Phase 05: End the session (standalone run or stop after Phase 05)"
+          include_role:
+            name: logout
+          when: (standalone_phase | default(false) | bool) or (stop_after_phase is defined and (stop_after_phase | int) == 5)
+
+      # ----------------------------------------------------------------------
+      # Rescue: report, one alert (exit 25), clean logout
+      # ----------------------------------------------------------------------
+      rescue:
+        - name: "Phase 05: Resolve the error for this failure"
+          set_fact:
+            phase_05_failed: true
+            resolved_error: >-
+              {{ (ansible_failed_result.stderr | default('') | string | trim)
+                 or (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 or (ansible_failed_result.msg | default('') | string | trim)
+                 or 'Unknown error - inspect the run log' }}
+
+        - name: "Phase 05: List all 10 checks for the failure report"
+          set_fact:
+            _p05_failure_checks: >-
+              {%- set canon = [
+                {'num': 1, 'name': 'Final ClusterVersion', 'gate': 'HARD'},
+                {'num': 2, 'name': 'ClusterOperators Status', 'gate': 'HARD'},
+                {'num': 3, 'name': 'MachineConfigPool Status', 'gate': 'HARD'},
+                {'num': 4, 'name': 'Node Readiness & Version', 'gate': 'HARD'},
+                {'num': 5, 'name': 'Node Pressures', 'gate': 'HARD'},
+                {'num': 6, 'name': 'etcd Cluster Health', 'gate': 'HARD'},
+                {'num': 7, 'name': 'PersistentVolume Status', 'gate': 'WARN'},
+                {'num': 8, 'name': 'Core Namespace Pods', 'gate': 'WARN'},
+                {'num': 9, 'name': 'Firing Critical Alerts', 'gate': 'WARN'},
+                {'num': 10, 'name': 'Baseline Diff Audit', 'gate': 'WARN'}
+              ] -%}
+              {%- set res = [] -%}
+              {%- set missing = [] -%}
+              {%- for c in canon -%}
+              {%- set matched = [] -%}
+              {%- for h in health_summary | default([]) -%}
+              {%- if (h.num | default(0) | int) == c.num -%}{%- set _ = matched.append(h) -%}{%- endif -%}
+              {%- endfor -%}
+              {%- if matched | length > 0 -%}
+              {%- set _ = res.append(matched[-1]) -%}
+              {%- else -%}
+              {%- set _ = res.append({'num': c.num, 'name': c.name, 'gate': c.gate,
+                    'status': ('FAIL' if (missing | length == 0) else 'SKIPPED'),
+                    'observed': (('Stopped with error: ' ~ (resolved_error | truncate(400))) if (missing | length == 0)
+                                 else 'Not evaluated: the contract stopped at an earlier check')}) -%}
+              {%- set _ = missing.append(c.num) -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ res }}
+          when: not (p05_report_written | default(false) | bool)
+
+        - name: "Phase 05: Write the postvalidation failure report"
+          when: not (p05_report_written | default(false) | bool)
+          block:
+            - name: "Phase 05: Configure the failure report"
+              set_fact:
+                report_type: "postvalidation"
+                report_title: "Post-Upgrade Validation Report"
+                report_template: "health-overview.j2"
+                checks: "{{ _p05_failure_checks }}"
+                autofix_items: []
+                output_file: "{{ p05_report_file | default(output_dir | default(playbook_dir ~ '/output') ~ '/' ~ cluster_name ~ '_postvalidation_' ~ run_timestamp ~ '.html') }}"
+
+            - name: "Phase 05: Render the failure report"
+              include_role:
+                name: report
+          rescue:
+            - name: "Phase 05: Report rendering failed (alert is still sent)"
+              debug:
+                msg: "[WARN] The postvalidation report could not be rendered: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: "Phase 05: Set failure context for the alert"
+          set_fact:
+            current_step_no: "Phase 05"
+            current_task_name: "Phase 05 Postvalidation"
+            current_gate_type: "HARD"
+            failure_reason: >-
+              {{ ('Postvalidation HARD gate: ' ~ (_p05_hard_failures | map(attribute='name') | join(', ')))
+                 if (_p05_hard_failures | default([]) | length > 0)
+                 else 'Phase 05 stopped on an error' }}
+            failure_observed: "{{ resolved_error }}"
+            phase_exit_code: 25
+            failure_attachments:
+              - "{{ p05_report_file | default('') }}"
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{'phase': '05', 'name': 'Postvalidation', 'status': 'FAIL',
+                   'detail': (resolved_error | regex_replace('[\r\n]+', ' ') | truncate(200))}] }}
+
+        - name: "Phase 05: Record the failure and send the alert"
+          include_role:
+            name: error_handle
+
+        - name: "Phase 05: End the session after the failure"
+          include_role:
+            name: logout
+
+        - name: "Phase 05: Stop the run"
+          fail:
+            msg: "Phase 05 Postvalidation failed: {{ resolved_error | truncate(1000) }}"
+
+      always:
+        - name: "Phase 05: Guarantee logout after a failure"
+          include_role:
+            name: logout
+          when:
+            - phase_05_failed | default(false) | bool
+            - cluster_session_active | default(false) | bool

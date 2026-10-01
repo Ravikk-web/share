@@ -1,0 +1,305 @@
+---
+# ============================================================================
+# Phase 01 Playbook: Policy Check, Baseline Snapshot & Upgrade Path Validation
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: Uses play-level vars_files, include_role / include_tasks and
+#                 block/rescue/always; compatible across Ansible 2.7 and 2.14.
+#
+# Purpose: Logs in (identity-checked), captures the baseline snapshot used by the
+#          Phase 05 diff, and validates the WHOLE upgrade path before anything
+#          changes: every remaining edge against the OpenShift Update Service graph
+#          for the channel of that hop, the first edge also against the cluster's own
+#          offer, hops already reached are skipped (safe --resume), and an update
+#          already in progress to the next hop is monitored instead of re-triggered.
+# Role / Playbook Dependencies: vars/upgrade.yml, vars/secrets.yml, vars/paths.yml,
+#               vars/smtp.yml, vars/report_vars.yml, vars/api_regex.yml,
+#               roles/login, roles/logout, roles/snapshot, roles/report,
+#               roles/error_handle, tasks/validate_upgrade_path.yml,
+#               tasks/log_event.yml, tasks/send_run_summary.yml
+# Gate Type: HARD (session, snapshot, or any FAIL edge stops the run; exit code 5)
+# Outputs: snapshots/<cluster>_<ts>_baseline.json, output/<cluster>_phase01_<ts>.html,
+#          path_validation facts, run_start_version, run_phase_results entry
+# ============================================================================
+
+- name: "Phase 01 — Policy Check & Baseline Capture"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars/upgrade.yml
+    - vars/secrets.yml
+    - vars/paths.yml
+    - vars/smtp.yml
+    - vars/report_vars.yml
+    - vars/api_regex.yml
+
+  tasks:
+    - name: "Phase 01: Session, baseline snapshot and upgrade path validation"
+      when:
+        - skip_to_phase is not defined or (skip_to_phase | int) <= 1
+        - stop_after_phase is not defined or (stop_after_phase | int) >= 1
+      block:
+        # --------------------------------------------------------------------
+        # 1. Context and session
+        # --------------------------------------------------------------------
+        - name: "Phase 01: Initialize phase context"
+          set_fact:
+            phase01_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+            run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"
+            phase_01_failed: false
+            p01_login_succeeded: false
+            p01_report_written: false
+            p01_report_file: "{{ output_dir | default(playbook_dir ~ '/output') }}/{{ cluster_name }}_phase01_{{ run_timestamp }}.html"
+            run_phase_results: []
+            hop_results: []
+            admin_acks_applied: []
+
+        - name: "Phase 01: Log in and verify the cluster identity"
+          include_role:
+            name: login
+
+        - name: "Phase 01: Record successful login"
+          set_fact:
+            p01_login_succeeded: true
+
+        - name: "Phase 01: Log phase start"
+          include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+          vars:
+            event_status: "START"
+            event_gate: "HARD"
+            event_task: "Phase 01 Policy Check"
+            event_reason: "Logged in as {{ active_cluster_user | default(cluster_username | default('unknown')) }} to {{ active_cluster_server | default('cluster') }}; path {{ upgrade_path | join(' -> ') }}"
+
+        # --------------------------------------------------------------------
+        # 2. Baseline snapshot (read by the Phase 05 diff)
+        # --------------------------------------------------------------------
+        - name: "Phase 01: Capture the baseline snapshot"
+          include_role:
+            name: snapshot
+
+        # --------------------------------------------------------------------
+        # 3. Whole-path validation (read-only)
+        # --------------------------------------------------------------------
+        - name: "Phase 01: Validate every edge of the upgrade path"
+          include_tasks: "{{ playbook_dir }}/tasks/validate_upgrade_path.yml"
+
+        - name: "Phase 01: Record the version the run starts from"
+          set_fact:
+            run_start_version: "{{ path_current_version }}"
+
+        # --------------------------------------------------------------------
+        # 4. Report rows (one per step and one per edge)
+        # --------------------------------------------------------------------
+        - name: "Phase 01: Build the report rows"
+          set_fact:
+            phase01_checks: >-
+              {%- set rows = [
+                {'num': 1, 'name': 'Cluster session and identity', 'gate': 'HARD', 'status': 'PASS',
+                 'observed': 'Logged in as ' ~ (active_cluster_user | default('unknown')) ~ ' to ' ~ (active_cluster_server | default('unknown'))
+                             ~ ((' (cluster ID ' ~ active_cluster_id ~ ')') if (active_cluster_id | default('') | length > 0) else '')},
+                {'num': 2, 'name': 'Baseline snapshot', 'gate': 'HARD', 'status': 'PASS',
+                 'observed': (baseline_snapshot_file_path | basename) ~ ' (' ~ baseline_nodes_count ~ ' nodes, ' ~ baseline_operators_count ~ ' operators, ' ~ baseline_routes_count ~ ' routes)'},
+                {'num': 3, 'name': 'Current version and update state', 'gate': 'INFO', 'status': 'PASS',
+                 'observed': path_current_version ~ ' on channel ' ~ (path_live_cv.channel or 'none')
+                             ~ ('; update to ' ~ path_live_cv.desired ~ ' in progress' if (path_live_cv.progressing == 'True' and path_live_cv.desired != path_live_cv.completed) else '; no update in progress')},
+                {'num': 4, 'name': 'Upgrade path', 'gate': 'HARD',
+                 'status': ('FAIL' if (path_validation_problems | length > 0) else 'PASS'),
+                 'observed': (upgrade_path | join(' -> ')) ~ ((' | ' ~ (path_validation_problems | join('; '))) if (path_validation_problems | length > 0)
+                             else (' | ' ~ (path_remaining_hops | length) ~ ' hop(s) to run, ' ~ (path_reached_hops | length) ~ ' already reached'))}
+              ] -%}
+              {%- for r in path_validation -%}
+              {%- set _ = rows.append({'num': rows | length + 1,
+                    'name': ('Hop to ' ~ r.to) if (r['from'] | length == 0) else ('Edge ' ~ r['from'] ~ ' -> ' ~ r.to ~ ((' (' ~ r.channel ~ ')') if (r.channel | length > 0) else '')),
+                    'gate': 'HARD', 'status': r.status,
+                    'observed': r.detail ~ ((' | Risks: ' ~ (r.risks | map(attribute='name') | join(', '))) if (r.risks | default([]) | length > 0) else '')}) -%}
+              {%- endfor -%}
+              {{ rows }}
+
+        - name: "Phase 01: Configure diagnostic details for the report"
+          set_fact:
+            diagnostic_details:
+              - title: "ClusterVersion update state"
+                content: "{{ path_live_cv | to_nice_json }}"
+              - title: "Upgrade path validation"
+                content: "{{ path_validation | to_nice_json }}"
+
+        - name: "Phase 01: Configure the Phase 01 report"
+          set_fact:
+            report_type: "phase01"
+            report_title: "Phase 01 - Policy Check & Baseline Capture Report"
+            report_template: "phase01-policy-check.j2"
+            checks: "{{ phase01_checks }}"
+            autofix_items: []
+            output_file: "{{ p01_report_file }}"
+
+        - name: "Phase 01: Write the Phase 01 report"
+          include_role:
+            name: report
+
+        - name: "Phase 01: Record that the report is written"
+          set_fact:
+            p01_report_written: true
+
+        # --------------------------------------------------------------------
+        # 5. HARD gate
+        # --------------------------------------------------------------------
+        - name: "Phase 01: HARD gate — the upgrade path must be valid"
+          fail:
+            msg: >-
+              [HARD GATE FAILURE] Upgrade path {{ path_current_version }} -> {{ upgrade_path | join(' -> ') }} is not valid for '{{ cluster_name }}':
+              {{ ((path_validation_problems | join('; ')) ~ '; ') if (path_validation_problems | length > 0) else '' }}
+              {%- for r in path_validation | selectattr('status', 'equalto', 'FAIL') | list %} {{ r['from'] }} -> {{ r.to }}{{ (' (' ~ r.channel ~ ')') if (r.channel | length > 0) else '' }}: {{ r.detail }}{% if not loop.last %};{% endif %}{% endfor %}.
+              No cluster change was made.
+          when: path_validation_status == 'FAIL'
+
+        # --------------------------------------------------------------------
+        # 6. Result, logs and mail
+        # --------------------------------------------------------------------
+        - name: "Phase 01: Record the phase result"
+          set_fact:
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{
+                   'phase': '01', 'name': 'Policy check and path validation', 'status': path_validation_status,
+                   'detail': ('Start ' ~ path_current_version ~ '; ' ~ (path_remaining_hops | length) ~ ' hop(s) to run'
+                              ~ ((', ' ~ (path_reached_hops | length) ~ ' already reached') if (path_reached_hops | length > 0) else '')
+                              ~ ((', resuming ' ~ path_in_progress_hop) if (path_in_progress_hop | length > 0) else '')
+                              ~ ((', ' ~ (path_validation | selectattr('status', 'equalto', 'WARN') | list | length) ~ ' edge(s) with warnings')
+                                 if (path_validation_status == 'WARN') else ''))
+                 }] }}
+
+        - name: "Phase 01: Log the phase result"
+          include_tasks: "{{ playbook_dir }}/tasks/log_event.yml"
+          vars:
+            event_status: "{{ path_validation_status }}"
+            event_gate: "HARD"
+            event_task: "Phase 01 Policy Check"
+            event_reason: "{{ run_phase_results[-1].detail }}"
+            event_observed: "Snapshot: {{ baseline_snapshot_file_path }}; report: {{ p01_report_file }}"
+
+        - name: "Phase 01: Display completion banner"
+          debug:
+            msg:
+              - "============================================================================"
+              - "PHASE 01 COMPLETE: {{ path_validation_status }}"
+              - "============================================================================"
+              - "Cluster              : {{ cluster_name }} ({{ active_cluster_server | default('') }})"
+              - "Current Version      : {{ path_current_version }} (channel {{ path_live_cv.channel or 'none' }})"
+              - "Hops To Run          : {{ path_remaining_hops | join(' -> ') or 'none (already at the final target)' }}"
+              - "Already Reached      : {{ path_reached_hops | join(', ') or 'none' }}"
+              - "In Progress          : {{ path_in_progress_hop or 'none' }}"
+              - "Snapshot             : {{ baseline_snapshot_file_path }}"
+              - "Report               : {{ p01_report_file }}"
+              - "============================================================================"
+
+        - name: "Phase 01: Prepare the closing mail (standalone run)"
+          set_fact:
+            run_summary_title: "Policy Check Report"
+            run_summary_tag: "PHASE-01"
+            run_summary_intro: >-
+              Upgrade path {{ path_current_version }} -> {{ upgrade_path | join(' -> ') }}: {{ path_validation_status }}.
+              No cluster change was made.
+            run_summary_checks: "{{ phase01_checks }}"
+          when: standalone_phase | default(false) | bool
+
+        - name: "Phase 01: Send the closing mail (standalone run)"
+          include_tasks: "{{ playbook_dir }}/tasks/send_run_summary.yml"
+          when: standalone_phase | default(false) | bool
+
+        - name: "Phase 01: End the session (standalone run or stop after Phase 01)"
+          include_role:
+            name: logout
+          when: (standalone_phase | default(false) | bool) or (stop_after_phase is defined and (stop_after_phase | int) == 1)
+
+      # ----------------------------------------------------------------------
+      # Rescue: report, one alert (exit 5), clean logout
+      # ----------------------------------------------------------------------
+      rescue:
+        - name: "Phase 01: Resolve the error for this failure"
+          set_fact:
+            phase_01_failed: true
+            resolved_error: >-
+              {{ (ansible_failed_result.stderr | default('') | string | trim)
+                 or (ansible_failed_result.stderr_lines | default([]) | join('\n'))
+                 or (ansible_failed_result.msg | default('') | string | trim)
+                 or 'Unknown error - inspect the run log' }}
+
+        # Why: a path-gate failure already has its full report (written before the gate);
+        #      any earlier failure gets a short report of the steps that ran.
+        - name: "Phase 01: Build report rows for the failure"
+          when: not (p01_report_written | default(false) | bool)
+          set_fact:
+            phase01_checks: >-
+              {{ [
+                   {'num': 1, 'name': 'Cluster session and identity', 'gate': 'HARD',
+                    'status': ('PASS' if (p01_login_succeeded | default(false) | bool) else 'FAIL'),
+                    'observed': (('Logged in as ' ~ (active_cluster_user | default('unknown'))) if (p01_login_succeeded | default(false) | bool)
+                                 else ('Login failed: ' ~ (resolved_error | truncate(400))))},
+                   {'num': 2, 'name': 'Baseline snapshot', 'gate': 'HARD',
+                    'status': ('PASS' if (baseline_snapshot_file_path | default('') | length > 0)
+                               else ('FAIL' if (p01_login_succeeded | default(false) | bool) else 'SKIPPED')),
+                    'observed': ((baseline_snapshot_file_path | default('') | basename) if (baseline_snapshot_file_path | default('') | length > 0)
+                                 else ('Stopped: ' ~ (resolved_error | truncate(400)) if (p01_login_succeeded | default(false) | bool) else 'Not run: login failed'))},
+                   {'num': 3, 'name': 'Upgrade path validation', 'gate': 'HARD',
+                    'status': ('FAIL' if (baseline_snapshot_file_path | default('') | length > 0) else 'SKIPPED'),
+                    'observed': (('Stopped: ' ~ (resolved_error | truncate(400))) if (baseline_snapshot_file_path | default('') | length > 0) else 'Not run')}
+                 ] }}
+
+        - name: "Phase 01: Write the failure report"
+          when: not (p01_report_written | default(false) | bool)
+          block:
+            - name: "Phase 01: Configure the failure report"
+              set_fact:
+                report_type: "phase01"
+                report_title: "Phase 01 - Policy Check & Baseline Capture Report"
+                report_template: "phase01-policy-check.j2"
+                checks: "{{ phase01_checks }}"
+                autofix_items: []
+                output_file: "{{ p01_report_file | default(output_dir | default(playbook_dir ~ '/output') ~ '/' ~ cluster_name ~ '_phase01_' ~ run_timestamp ~ '.html') }}"
+                diagnostic_details:
+                  - title: "Phase 01 failure"
+                    content: "{{ resolved_error }}"
+
+            - name: "Phase 01: Render the failure report"
+              include_role:
+                name: report
+          rescue:
+            - name: "Phase 01: Report rendering failed (alert is still sent)"
+              debug:
+                msg: "[WARN] The Phase 01 report could not be rendered: {{ ansible_failed_result.msg | default('unknown error') }}"
+
+        - name: "Phase 01: Set failure context for the alert"
+          set_fact:
+            current_step_no: "Phase 01"
+            current_task_name: "Phase 01 Policy Check"
+            current_gate_type: "HARD"
+            failure_reason: >-
+              {{ 'Upgrade path validation failed' if (path_validation_status | default('') == 'FAIL')
+                 else ('Cluster login failed' if not (p01_login_succeeded | default(false) | bool) else 'Phase 01 stopped on an error') }}
+            failure_observed: "{{ resolved_error }}"
+            phase_exit_code: 5
+            failure_attachments:
+              - "{{ p01_report_file | default('') }}"
+            run_phase_results: >-
+              {{ (run_phase_results | default([])) + [{'phase': '01', 'name': 'Policy check and path validation', 'status': 'FAIL',
+                   'detail': (resolved_error | regex_replace('[\r\n]+', ' ') | truncate(200))}] }}
+
+        - name: "Phase 01: Record the failure and send the alert"
+          include_role:
+            name: error_handle
+
+        - name: "Phase 01: End the session after the failure"
+          include_role:
+            name: logout
+
+        - name: "Phase 01: Stop the run"
+          fail:
+            msg: "Phase 01 Policy Check failed: {{ resolved_error | truncate(1000) }}"
+
+      always:
+        - name: "Phase 01: Guarantee logout after a failure"
+          include_role:
+            name: logout
+          when:
+            - phase_01_failed | default(false) | bool
+            - cluster_session_active | default(false) | bool
