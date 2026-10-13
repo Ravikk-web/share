@@ -2236,3 +2236,8 @@ Operators that block the cluster upgrade remain Check 15 (HARD): `olm.maxOpenShi
 **Old files removed (2026-10-13).** The Word document, the client PowerPoint, the diagram folder, the
 `scratch/` generators and the original feature specs described the previous design and were deleted.
 They remain in git history. `WORKFLOW.md` and `context/` are the current documentation.
+
+**Original mail templates and log cleanup (2026-10-13).**
+- The earlier mail templates (`email-summary.j2`, `progress-mail.j2`, `error-report.j2`) are back in use, unchanged; the code supplies the variable names they read.
+- `00_Run.sh` empties `logs/` before every run. It keeps logs of runs still active on other clusters, and never touches reports or snapshots.
+- `--resume` is accepted as a no-op.

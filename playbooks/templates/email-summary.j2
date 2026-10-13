@@ -1,0 +1,208 @@
+{#
+==============================================================================
+Summary Email Template: email-summary.j2
+==============================================================================
+Targets: Jinja2 / Ansible 2.7.17 & 2.14.18
+
+Context: Compact report / run-summary email for notify_event 'prevalidation',
+         'postvalidation' and 'summary' (the single closing mail of every run).
+         The full HTML reports are attached, never embedded as the body.
+Dependencies (facts set by the calling phase / tasks/send_run_summary.yml):
+  - cluster_name, run_timestamp, run_mode, upgrade_path, notify_event
+  - summary_title (string), summary_verdict (PASS|WARN|FAIL|AUTO-FIXED|INFO)
+  - summary_intro (string)
+  - summary_checks (list of {num, name, gate, status, observed}, optional)
+  - run_phase_results (list of {phase, name, status, detail}, optional)
+  - hop_results (list of {hop_label, target, status, duration}, optional)
+  - admin_acks_applied (list of {key, hop}, optional)
+  - preval_autofix_items (list of {name, action}, optional)
+  - developer_perspective_status (string, optional)
+  - operator_summary_text (string, optional)
+  - run_start_version / run_final_version (strings, optional)
+  - notification_ledger (list, shown for notify_event 'summary')
+  - notify_attachments (list of attached file paths)
+Constraints:
+  - Max-width 580px, inline CSS, table layout, no JavaScript
+  - All cluster-provided text is HTML-escaped
+==============================================================================
+#}
+{%- set verdict = summary_verdict | default('INFO') | upper -%}
+{%- if verdict == 'FAIL' or verdict == 'FIX-FAILED' -%}
+  {%- set v_fg, v_bg, v_border, v_label = (color_fail | default('#b42318')), (bg_fail | default('#fdecea')), '#fecdca', 'FAIL &#10006;' -%}
+{%- elif verdict == 'WARN' -%}
+  {%- set v_fg, v_bg, v_border, v_label = (color_warn | default('#9a6700')), (bg_warn | default('#fff8e1')), '#fedf89', 'PASSED WITH WARNINGS !' -%}
+{%- elif verdict == 'AUTO-FIXED' -%}
+  {%- set v_fg, v_bg, v_border, v_label = (color_autofix | default('#1d4ed8')), (bg_autofix | default('#eff6ff')), '#bfdbfe', 'PASS (AUTO-FIXED) &#9881;' -%}
+{%- elif verdict == 'PASS' -%}
+  {%- set v_fg, v_bg, v_border, v_label = (color_pass | default('#1a7f37')), (bg_pass | default('#e6f4ea')), '#b7e1cd', 'PASS &#10004;' -%}
+{%- else -%}
+  {%- set v_fg, v_bg, v_border, v_label = (color_info | default('#344054')), (bg_info | default('#f2f4f7')), (color_border | default('#e4e7ec')), 'INFO &#8505;' -%}
+{%- endif -%}
+{%- set checks = summary_checks | default([]) -%}
+{%- set non_pass = checks | rejectattr('status', 'equalto', 'PASS') | list -%}
+{%- set attachments = notify_attachments | default([]) | map('basename') | list -%}
+{%- macro pill(status) -%}
+  {%- set s = status | default('INFO') | string | upper -%}
+  {%- if s in ['FAIL', 'FIX-FAILED'] -%}<span style="color: {{ color_fail | default('#b42318') }}; font-weight: 700;">{{ s }}</span>
+  {%- elif s == 'WARN' -%}<span style="color: {{ color_warn | default('#9a6700') }}; font-weight: 700;">WARN</span>
+  {%- elif s == 'AUTO-FIXED' -%}<span style="color: {{ color_autofix | default('#1d4ed8') }}; font-weight: 700;">AUTO-FIXED</span>
+  {%- elif s in ['PASS', 'COMPLETE', 'SKIPPED-DONE'] -%}<span style="color: {{ color_pass | default('#1a7f37') }}; font-weight: 700;">{{ s }}</span>
+  {%- else -%}<span style="color: #667085; font-weight: 700;">{{ s | e }}</span>
+  {%- endif -%}
+{%- endmacro -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ cluster_name | default('Cluster') | e }} {{ summary_title | default('Summary') | e }}</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: {{ color_page_bg | default('#f8f9fb') }}; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.5; color: {{ color_heading | default('#101828') }};">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: {{ color_page_bg | default('#f8f9fb') }}; padding: 20px 0;">
+    <tr>
+      <td align="center">
+        <table border="0" cellspacing="0" cellpadding="0" style="max-width: {{ email_max_width | default('580px') }}; width: 100%; margin: 0 auto; background-color: {{ color_surface | default('#ffffff') }}; border: 1px solid {{ color_border | default('#e4e7ec') }}; border-top: 4px solid {{ v_fg }}; border-radius: 6px; border-collapse: separate;">
+
+          <!-- Header -->
+          <tr>
+            <td style="padding: 24px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">
+              <span style="display: inline-block; padding: 4px 10px; font-size: 12px; font-weight: 700; border-radius: 12px; background-color: {{ v_bg }}; color: {{ v_fg }}; border: 1px solid {{ v_border }};">{{ v_label }}</span>
+              <h1 style="margin: 12px 0 4px 0; font-size: 20px; font-weight: 700;">{{ cluster_name | default('Cluster') | e }} &bull; {{ summary_title | default('Summary') | e }}</h1>
+              {% if summary_intro | default('') | length > 0 %}
+              <p style="margin: 0; font-size: 13px; color: #667085;">{{ summary_intro | e }}</p>
+              {% endif %}
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding: 20px 24px;">
+
+              <!-- Run facts -->
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 13px; margin-bottom: 20px; border-collapse: collapse;">
+                <tr>
+                  <td style="width: 34%; font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Run</td>
+                  <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ run_timestamp | default('N/A') | e }} &bull; {{ run_mode | default('full-upgrade') | e }}</td>
+                </tr>
+                <tr>
+                  <td style="font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Upgrade path</td>
+                  <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ upgrade_path | default([]) | join(' &rarr; ') if (upgrade_path | default([]) | length > 0) else 'N/A' }}</td>
+                </tr>
+                {% if (run_start_version | default('') | length > 0) or (run_final_version | default('') | length > 0) %}
+                <tr>
+                  <td style="font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px;">Cluster version</td>
+                  <td style="padding: 8px 12px;">{{ run_start_version | default('?', true) | e }} &rarr; <strong>{{ run_final_version | default('?', true) | e }}</strong></td>
+                </tr>
+                {% endif %}
+              </table>
+
+              <!-- Phase results -->
+              {% if run_phase_results | default([]) | length > 0 %}
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Phases</div>
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; margin-bottom: 20px; border-collapse: collapse;">
+                {% for ph in run_phase_results %}
+                <tr>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; font-weight: 600; white-space: nowrap;">{{ ph.phase | default('') | e }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ ph.name | default('') | e }}{% if ph.detail | default('') | length > 0 %}<div style="color: #667085;">{{ ph.detail | truncate(200) | e }}</div>{% endif %}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; text-align: right;">{{ pill(ph.status) }}</td>
+                </tr>
+                {% endfor %}
+              </table>
+              {% endif %}
+
+              <!-- Hop results -->
+              {% if hop_results | default([]) | length > 0 %}
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Hops</div>
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; margin-bottom: 20px; border-collapse: collapse;">
+                {% for hop in hop_results %}
+                <tr>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; font-weight: 600;">{{ hop.hop_label | default('') | e }} &rarr; {{ hop.target | default('') | e }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ hop.duration | default('') | e }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; text-align: right;">{{ pill(hop.status) }}</td>
+                </tr>
+                {% endfor %}
+              </table>
+              {% endif %}
+
+              <!-- Check results (report mails) -->
+              {% if checks | length > 0 %}
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Checks</div>
+              <p style="margin: 0 0 8px 0; font-size: 13px;">
+                {{ checks | length }} checks:
+                <span style="color: {{ color_pass | default('#1a7f37') }};">{{ checks | selectattr('status', 'equalto', 'PASS') | list | length }} passed</span>,
+                <span style="color: {{ color_autofix | default('#1d4ed8') }};">{{ checks | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length }} auto-fixed</span>,
+                <span style="color: {{ color_warn | default('#9a6700') }};">{{ checks | selectattr('status', 'equalto', 'WARN') | list | length }} warnings</span>,
+                <span style="color: {{ color_fail | default('#b42318') }};">{{ (checks | selectattr('status', 'equalto', 'FAIL') | list | length) + (checks | selectattr('status', 'equalto', 'FIX-FAILED') | list | length) }} failed</span>.
+              </p>
+              {% if non_pass | length > 0 %}
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; margin-bottom: 20px; border-collapse: collapse;">
+                {% for c in non_pass[:20] %}
+                <tr>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; vertical-align: top; white-space: nowrap;">#{{ c.num | default('') }}</td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};"><strong>{{ c.name | default('Check') | e }}</strong><div style="color: #667085;">{{ c.observed | default('') | string | truncate(220) | e }}</div></td>
+                  <td style="padding: 6px 10px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; text-align: right; vertical-align: top;">{{ pill(c.status) }}</td>
+                </tr>
+                {% endfor %}
+              </table>
+              {% endif %}
+              {% endif %}
+
+              <!-- Changes made by the automation -->
+              {% if (admin_acks_applied | default([]) | length > 0) or (preval_autofix_items | default([]) | length > 0) or (developer_perspective_status | default('') | length > 0) or (operator_summary_text | default('') | length > 0) %}
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Changes and results</div>
+              <ul style="margin: 0 0 20px 0; padding-left: 18px; font-size: 13px; color: #344054;">
+                {% for fix in preval_autofix_items | default([]) %}
+                <li style="margin-bottom: 4px;"><strong>{{ fix.name | default('Remediation') | e }}:</strong> {{ fix.action | default('') | e }}</li>
+                {% endfor %}
+                {% for ack in admin_acks_applied | default([]) %}
+                <li style="margin-bottom: 4px;"><strong>Admin-ack applied</strong> before {{ ack.hop | default('hop') | e }}: <code>{{ ack.key | default('') | e }}</code></li>
+                {% endfor %}
+                {% if operator_summary_text | default('') | length > 0 %}
+                <li style="margin-bottom: 4px;"><strong>Operators:</strong> {{ operator_summary_text | e }}</li>
+                {% endif %}
+                {% if developer_perspective_status | default('') | length > 0 %}
+                <li style="margin-bottom: 4px;"><strong>Developer console perspective:</strong> {{ developer_perspective_status | e }}</li>
+                {% endif %}
+              </ul>
+              {% endif %}
+
+              <!-- Attachments -->
+              {% if attachments | length > 0 %}
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Attached</div>
+              <ul style="margin: 0 0 20px 0; padding-left: 18px; font-size: 13px; color: #475467;">
+                {% for att in attachments %}
+                <li style="margin-bottom: 4px;"><code>{{ att | e }}</code></li>
+                {% endfor %}
+              </ul>
+              {% endif %}
+
+              <!-- Notification ledger (closing summary only) -->
+              {% if (notify_event | default('')) == 'summary' and (notification_ledger | default([]) | length > 0) %}
+              <div style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Notifications sent in this run</div>
+              <table width="100%" style="width: 100%; border: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 11px; margin-bottom: 8px; border-collapse: collapse;">
+                {% for n in notification_ledger %}
+                <tr>
+                  <td style="padding: 4px 8px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; white-space: nowrap;">{{ n.time | default('') | e }}</td>
+                  <td style="padding: 4px 8px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ n.event | default('') | e }}</td>
+                  <td style="padding: 4px 8px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }}; text-align: right;">{{ pill('PASS' if n.status == 'SENT' else ('WARN' if n.status == 'SKIPPED' else 'FAIL')) }}</td>
+                </tr>
+                {% endfor %}
+              </table>
+              {% endif %}
+
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 16px 24px; background-color: #f9fafb; border-top: 1px solid {{ color_border | default('#e4e7ec') }}; font-size: 12px; color: #667085; line-height: 1.4;">
+              <div><strong>Generated:</strong> {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }} &bull; <strong>Host:</strong> {{ ansible_hostname | default('localhost') | e }}</div>
+              <div style="margin-top: 4px;">Automated message from the ARO Cluster Upgrade automation. Full reports are attached. Do not reply.</div>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

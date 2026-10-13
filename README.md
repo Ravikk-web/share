@@ -41,7 +41,7 @@ If a run stops, fix the cause and run the same command again: hops that are alre
 | `playbooks/01_*.yaml` … `06_*.yaml` | One file per phase, read top to bottom |
 | `playbooks/steps/<phase>/` | The steps each phase uses (one file per check) |
 | `playbooks/steps/common/` | Login, logout, run log, mail, report, failure handler |
-| `playbooks/templates/` | `report.j2` (one report per run) and three mail templates |
+| `playbooks/templates/` | `report.j2` (one report per run) and the mail templates `email-summary.j2`, `progress-mail.j2`, `error-report.j2` |
 | `playbooks/vars/` | All settings: `upgrade.yml`, `smtp.yml`, `secrets.yml`, `paths.yml`, `report_vars.yml`, `api_regex.yml` |
 | `playbooks/logs/`, `output/`, `snapshots/` | What each run writes |
 | `context/` | Architecture, standards and progress notes for developers |
@@ -51,6 +51,7 @@ If a run stops, fix the cause and run the same command again: hops that are alre
 - `output/<cluster>_<ts>_report.html`: one report with a section per phase.
 - `logs/<cluster>_<ts>.txt` and `.csv`: the console log and the events. On failure there is also `.status`, which holds the exit code.
 - `snapshots/<cluster>_<ts>_baseline.json`: the Phase 01 baseline.
+- `logs/` is emptied at the start of every run, so it only holds the latest run. Logs of a run still active on another cluster are kept.
 
 ## Exit codes
 `0` OK · `1` bad option, missing tool or cluster locked · `2` cancelled · `5` login or Phase 01 · `10` Phase 02 · `20` hop failed · `30` hop stopped progressing or timed out · `25` Phase 05 · `35` Phase 06 · `99` other.

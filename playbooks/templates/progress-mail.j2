@@ -1,13 +1,28 @@
 {#
 ==============================================================================
-mail-progress.j2 - heartbeat and degradation mails (sent from steps/04/poll.yml)
+Progress Notification Template: progress-mail.j2
 ==============================================================================
-mail_kind 'heartbeat' (every heartbeat_minutes) or 'degradation' (once per new problem).
-Reads the progress_* facts set by the poll, degradation_new_items, progress_open_issues,
-upgrade_path and hop_results. Max width 580px, inline CSS, no JavaScript.
+Targets: Jinja2 / Ansible 2.7.17 & 2.14.18
+
+Context: In-flight emails while a hop (or a remediation node rollout) runs:
+         notify_event 'heartbeat' (every heartbeat_minutes) or 'degradation'
+         (immediate alert after the grace period, once per condition).
+Dependencies (facts set by roles/monitor before tasks/notify.yml):
+  - cluster_name, run_timestamp, upgrade_path, notify_event
+  - progress_label (string), progress_target_version, progress_percent (int)
+  - progress_hop_elapsed (HH:MM:SS), progress_cv_version, progress_cv_message
+  - progress_mcp_list: [{name, ready_count, total_count, updated_count, updating, degraded}]
+  - progress_active_nodes: [{name, role, action}]
+  - progress_degraded_nodes: [{name, role, condition, message}]
+  - progress_open_issues: [{title, detail, minutes}]   (conditions currently open)
+  - degradation_new_items: [{title, detail, minutes}] (new in this alert)
+  - hop_results: [{hop_label, target, status, duration}]
+  - UI color tokens from vars/report_vars.yml
+Constraints:
+  - Max-width 580px, inline CSS, table layout, no JavaScript
 ==============================================================================
 #}
-{%- set is_degradation = (mail_kind | default('heartbeat')) == 'degradation' -%}
+{%- set is_degradation = (notify_event | default('heartbeat')) == 'degradation' -%}
 {%- set accent = (color_warn | default('#9a6700')) if is_degradation else (color_autofix | default('#1d4ed8')) -%}
 {%- set pct = progress_percent | default(0) | int -%}
 <!DOCTYPE html>
@@ -55,7 +70,7 @@ upgrade_path and hop_results. Max width 580px, inline CSS, no JavaScript.
                   <li style="margin-bottom: 4px;"><strong>{{ item.title | default('Condition') | e }}</strong> for {{ item.minutes | default(0) }} min &mdash; {{ item.detail | default('') | e }}</li>
                   {% endfor %}
                 </ul>
-                <div style="margin-top: 6px; color: #475467;">The upgrade continues; the hop fails only if it stops progressing or reaches its time limit.</div>
+                <div style="margin-top: 6px; color: #475467;">The upgrade continues; monitoring fails the hop only if it stops progressing or its time limit is reached.</div>
               </div>
               {% endif %}
 

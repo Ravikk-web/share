@@ -2,7 +2,7 @@
 
 There is no web UI. "UI" means:
 1. **The run report:** `output/<cluster>_<ts>_report.html` from `templates/report.j2`.
-2. **Mails:** `mail-summary.j2`, `mail-progress.j2` (heartbeat / degradation) and `mail-alert.j2`, sent by `steps/common/send_mail.yml`.
+2. **Mails:** `email-summary.j2` (summary), `progress-mail.j2` (heartbeat / degradation) and `error-report.j2` (alert), sent by `steps/common/send_mail.yml`.
 3. **The terminal:** `00_Run.sh` (plain text prompts) and Ansible's console output.
 
 Templates only render facts; statuses and colours are never decided inside a template.
@@ -44,7 +44,7 @@ Page `#f8f9fb`, surface `#ffffff`, border `#e4e7ec`, heading `#101828`. System f
   - the phase, exit code and error text
   - an RBAC callout with `oc auth can-i` and the grant command
   - a note that a started update keeps running
-  - next step: run the same command again
+  - next step: re-run (`--resume`; finished hops are skipped)
 
   The report and log are attached.
 

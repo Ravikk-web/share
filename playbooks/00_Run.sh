@@ -8,8 +8,9 @@
 #   3. shows what will happen and asks for confirmation
 #      (PROD runs that change the cluster need the word UPGRADE typed in)
 #   4. locks the cluster so only one run can touch it at a time
-#   5. runs main.yml, keeping the console in logs/<cluster>_<timestamp>.txt
-#   6. exits with the code the playbook wrote (see --help)
+#   5. empties logs/ (except logs of a run still active on another cluster)
+#   6. runs main.yml, keeping the console in logs/<cluster>_<timestamp>.txt
+#   7. exits with the code the playbook wrote (see --help)
 #
 # Run modes:
 #   upgrade     (default) the full upgrade: phases 01, 02, 03 (+04), 05, 06
@@ -33,6 +34,7 @@ Usage: ./00_Run.sh [options]
       --pre-check        phases 01-02 only (auto-fixes can reboot nodes), no upgrade
       --post-check       phase 05 only, against the current cluster version
   -y, --yes              do not ask for confirmation (PROD changes still need UPGRADE typed)
+  -r, --resume           accepted for habit; every run resumes on its own (finished hops are skipped)
   -m, --mail-to LIST     send the summary/heartbeat mails to these addresses (comma-separated);
                          alerts still also go to alert_mail_to
   -v, --verbose          verbose Ansible output
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --pre-check)   MODE="pre-check"; shift ;;
         --post-check)  MODE="post-check"; shift ;;
         -y|--yes)      YES=true; shift ;;
+        -r|--resume)   echo "Note: every run resumes on its own - hops already done are skipped."; shift ;;
         -m|--mail-to)  MAIL_TO="${2:-}"; [[ -n "$MAIL_TO" ]] || die "--mail-to needs an address"; shift 2 ;;
         -v|--verbose)  VERBOSE=(-v); shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -183,7 +186,23 @@ flock -n 9 || die "cluster '$CLUSTER' is already being worked on by PID $(cat "$
 echo "$$" > "$LOCK_FILE"
 
 # ----------------------------------------------------------------------------
-# 6. Run main.yml
+# 6. Start with an empty logs/ folder
+# ----------------------------------------------------------------------------
+# Why: logs/ only ever holds the latest run. A log whose cluster has a run going on
+#      right now (its lock is held) belongs to that run and is left alone.
+#      Reports (output/) and baseline snapshots (snapshots/) are kept.
+for old_log in logs/*; do
+    [[ -f "$old_log" ]] || continue
+    owner=""
+    [[ "$(basename "$old_log")" =~ ^(.+)_[0-9]{8}_[0-9]{6}\.[a-z]+$ ]] && owner="${BASH_REMATCH[1]}"
+    if [[ -n "$owner" && "$owner" != "$CLUSTER" ]] && ! flock -n "/tmp/aro-upgrade-${owner}.lock" -c true 2>/dev/null; then
+        continue
+    fi
+    rm -f -- "$old_log"
+done
+
+# ----------------------------------------------------------------------------
+# 7. Run main.yml
 # ----------------------------------------------------------------------------
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="logs/${CLUSTER}_${TIMESTAMP}.txt"
@@ -214,7 +233,7 @@ RC="${PIPESTATUS[0]}"
 set -e
 
 # ----------------------------------------------------------------------------
-# 7. Result and exit code
+# 8. Result and exit code
 # ----------------------------------------------------------------------------
 echo
 if [[ "$RC" -eq 0 ]]; then

@@ -620,3 +620,15 @@ During v1 development and testing, 20+ critical operational and syntax issues we
   `ARO_Cluster_Upgrade_Diagrams/` (18 figures + index), `scratch/` (generators and old verification scripts),
   `context/feature-spec/` (original build specs), an empty top-level `output/` folder and a stale Word lock file.
 - Earlier session notes that mention these files are kept as history; the current design is in `WORKFLOW.md` and `context/`.
+
+### Session: Original mail templates, log cleanup (2026-10-13)
+- **User request**: use the earlier mail templates; delete all log files before every run.
+- `templates/email-summary.j2`, `progress-mail.j2`, `error-report.j2` restored unchanged from `f0a315a`; `mail-summary.j2`, `mail-progress.j2`, `mail-alert.j2` removed. The code now supplies the names those templates read:
+  - `notify_event` and `notify_attachments`, as block vars in `send_mail.yml`
+  - `summary_title`, `summary_verdict`, `summary_intro` and `summary_checks`, as include vars in `main.yml`
+  - `resolved_error` (renamed from `failure_error`), `current_step_no`, `failed_task_name`, `failed_gate_type`, `rbac_missing_group`, `rbac_check_command` and `rbac_remediation_cmd`, set in `handle_failure.yml`
+  - `hop_results[].hop_label` (renamed from `label`)
+
+  Subject tags are back to COMPLETE / DRY-RUN / PRE-CHECK / POSTVALIDATION.
+- `00_Run.sh` empties `logs/` after taking the lock and before every run (any mode). Logs of a run still active on another cluster are kept; `output/` and `snapshots/` are untouched. `--resume` is accepted again (no-op) because the alert template tells people to use it.
+- Verified offline: all checks pass (0 problems); 35 behaviour tests with the restored templates rendered under strict undefined; cleanup loop tested on sample logs.

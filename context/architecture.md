@@ -38,7 +38,7 @@ playbooks/
   steps/04/                     poll_if_needed, poll
   steps/05/                     run_all_checks, check_01..check_10
   steps/06/                     approve_operators, validate_operators, developer_console
-  templates/                    report.j2, mail-summary.j2, mail-progress.j2, mail-alert.j2
+  templates/                    report.j2, email-summary.j2, progress-mail.j2, error-report.j2
   vars/                         upgrade.yml, smtp.yml, secrets.yml, paths.yml, report_vars.yml, api_regex.yml
   logs/ output/ snapshots/      run artifacts (git-ignored)
 ```
@@ -84,7 +84,7 @@ There are no Ansible roles and no role defaults.
 
 - **Run facts** live only for the run: `run_phase_results`, `preval_checks`, `postval_checks`, `installed_operators`, `hop_results`, `admin_acks_applied`, `operator_checks`, `operators`, `path_validation`, and so on.
 - **Snapshot:** `snapshots/<cluster>_<ts>_baseline.json` is the only state saved for later. Phase 05 Check 10 reads this run's snapshot, or in post-check mode the newest one for the cluster.
-- **Logs:** `logs/<cluster>_<ts>.txt` holds the console plus events, and `.csv` holds the events. Only `steps/common/log_event.yml` writes them, and only by appending.
+- **Logs:** `logs/<cluster>_<ts>.txt` holds the console plus events, and `.csv` holds the events. Only `steps/common/log_event.yml` writes them, and only by appending. `00_Run.sh` empties `logs/` before every run, after taking the lock; logs of a run still active on another cluster (lock held) are kept.
 - **Lock:** `/tmp/aro-upgrade-<cluster>.lock` is a `flock` held by `00_Run.sh`. The kernel releases it when the script exits.
 - **Kubeconfig:** `playbooks/.kubeconfig-<cluster>` is written at login and deleted at logout. `~/.kube/config` is never used.
 

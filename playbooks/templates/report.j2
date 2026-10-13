@@ -71,7 +71,7 @@ Standalone page: max-width 1080px, no external resources, details expand when pr
 <section>
   <h2>Why the run stopped</h2>
   <div class="box fail"><b>{{ failure_reason | default('') | e }}</b> (exit code {{ failure_exit_code | default('') }})</div>
-  <pre>{{ failure_error | default('') | string | truncate(4000) | e }}</pre>
+  <pre>{{ resolved_error | default('') | string | truncate(4000) | e }}</pre>
 </section>
 {% endif %}
 
@@ -128,7 +128,7 @@ Standalone page: max-width 1080px, no external resources, details expand when pr
   <table>
     <tr><th>Hop</th><th>Target</th><th>Result</th><th>Duration</th></tr>
     {%- for h in hop_results %}
-    <tr><td>{{ h.label | e }}</td><td class="mono">{{ h.target | e }}</td><td>{{ pill(h.status) }}</td><td>{{ h.duration | e }}</td></tr>
+    <tr><td>{{ h.hop_label | e }}</td><td class="mono">{{ h.target | e }}</td><td>{{ pill(h.status) }}</td><td>{{ h.duration | e }}</td></tr>
     {%- endfor %}
   </table>
   {% if admin_acks_applied | length > 0 %}

@@ -152,8 +152,13 @@
           include_tasks: "{{ playbook_dir }}/steps/common/send_mail.yml"
           vars:
             mail_kind: "summary"
-            mail_headline: "{{ run_mode | upper }} - {{ run_verdict }}"
+            mail_headline: "{{ summary_title }} - {{ run_verdict }}"
             mail_attachments: ["{{ report_file }}", "{{ log_file }}", "{{ csv_file }}"]
+            # Read by templates/email-summary.j2. The check list is the last phase that ran checks.
+            summary_title: "{{ {'upgrade': 'Upgrade Complete', 'dry-run': 'Dry Run Summary', 'pre-check': 'Pre-check Summary', 'post-check': 'Post-check Summary'}[run_mode] }}"
+            summary_verdict: "{{ run_verdict }}"
+            summary_intro: "{{ run_summary_text }}"
+            summary_checks: "{{ postval_checks if (postval_checks | length > 0) else preval_checks }}"
           when: send_email | default(true) | bool
 
         - name: "Finish: Show the result"
@@ -171,7 +176,7 @@
 
         - name: "Failure: Stop the run"
           fail:
-            msg: "Run stopped in {{ phase_names[current_phase] | default(current_phase) }} (exit code {{ failure_exit_code }}): {{ failure_error | truncate(1500) }}"
+            msg: "Run stopped in {{ phase_names[current_phase] | default(current_phase) }} (exit code {{ failure_exit_code }}): {{ resolved_error | truncate(1500) }}"
 
       # ----------------------------------------------------------------------
       # 4. Always log out

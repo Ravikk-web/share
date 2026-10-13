@@ -10,6 +10,8 @@
 #   mail_kind         summary | alert | heartbeat | degradation
 #   mail_headline     short ASCII text for the subject
 #   mail_attachments  list of files (missing files are skipped)
+# Templates: summary -> email-summary.j2, alert -> error-report.j2,
+#            heartbeat / degradation -> progress-mail.j2
 #
 # Who gets it:
 #   summary, heartbeat   -> --mail-to if given, else mail_to
@@ -27,8 +29,13 @@
     _mail_info_to: "{{ mail_to_cli if (mail_to_cli | default([]) | length > 0) else (mail_to | default([])) }}"
     _mail_to: >-
       {{ (((alert_mail_to | default([])) + _mail_info_to) if mail_kind in ['alert', 'degradation'] else _mail_info_to) | unique | list }}
-    _mail_tag: "{{ {'summary': run_mode | upper, 'alert': 'ALERT', 'heartbeat': 'HEARTBEAT', 'degradation': 'DEGRADED'}[mail_kind] }}"
-    _mail_template: "{{ {'summary': 'mail-summary.j2', 'alert': 'mail-alert.j2', 'heartbeat': 'mail-progress.j2', 'degradation': 'mail-progress.j2'}[mail_kind] }}"
+    _mail_tag: >-
+      {{ {'summary': {'upgrade': 'COMPLETE', 'dry-run': 'DRY-RUN', 'pre-check': 'PRE-CHECK', 'post-check': 'POSTVALIDATION'}[run_mode],
+          'alert': 'ALERT', 'heartbeat': 'HEARTBEAT', 'degradation': 'DEGRADED'}[mail_kind] }}
+    _mail_template: "{{ {'summary': 'email-summary.j2', 'alert': 'error-report.j2', 'heartbeat': 'progress-mail.j2', 'degradation': 'progress-mail.j2'}[mail_kind] }}"
+    # Why: the templates read these two names.
+    notify_event: "{{ mail_kind }}"
+    notify_attachments: "{{ mail_attachments | default([]) | select('exists') | list }}"
     _mail_subject: "{{ mail_subject_prefix | default('[ARO Upgrade]') }}[{{ cluster_name }}][{{ _mail_tag }}] {{ mail_headline }} (run {{ run_timestamp }})"
   block:
     - name: "Mail: Send '{{ mail_headline }}'"
@@ -41,7 +48,7 @@
         body: "{{ lookup('template', playbook_dir ~ '/templates/' ~ _mail_template) }}"
         subtype: html
         charset: "utf-8"
-        attach: "{{ mail_attachments | default([]) | select('exists') | list }}"
+        attach: "{{ notify_attachments }}"
         # Why: stable headers let mail rules group every mail of one run.
         headers:
           - "X-ARO-Run-ID={{ run_timestamp }}"

@@ -80,7 +80,7 @@
 
 - name: "{{ current_hop_label }} -> {{ hop_target }}: Record a hop that is already done"
   set_fact:
-    hop_results: "{{ hop_results + [{'label': current_hop_label, 'target': hop_target, 'status': 'ALREADY DONE', 'duration': ''}] }}"
+    hop_results: "{{ hop_results + [{'hop_label': current_hop_label, 'target': hop_target, 'status': 'ALREADY DONE', 'duration': ''}] }}"
   when: hop_action == 'skip'
 
 # ----------------------------------------------------------------------------
@@ -157,7 +157,7 @@
   set_fact:
     hop_results: >-
       {%- set s = (lookup('pipe', 'date +%s') | int) - (hop_start_epoch | int) -%}
-      {{ hop_results + [{'label': current_hop_label, 'target': hop_target,
+      {{ hop_results + [{'hop_label': current_hop_label, 'target': hop_target,
            'status': 'COMPLETE (resumed)' if hop_action == 'resume' else 'COMPLETE',
            'duration': '%02d:%02d:%02d' | format(s // 3600, (s % 3600) // 60, s % 60)}] }}
   when: hop_action in ['start', 'resume']

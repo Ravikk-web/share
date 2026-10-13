@@ -18,7 +18,7 @@
 - name: "Failure: Work out what failed"
   set_fact:
     run_failed: true
-    failure_error: >-
+    resolved_error: >-
       {{ (ansible_failed_result.stderr | default('') | string | trim)
          or (ansible_failed_result.stderr_lines | default([]) | join('\n'))
          or (ansible_failed_result.msg | default('') | string | trim)
@@ -33,17 +33,31 @@
 # Why: Kubernetes denials read "... cannot <verb> resource "<resource>" in API group "<group>" ...".
 - name: "Failure: Check whether it was a permission problem"
   set_fact:
-    is_rbac_error: "{{ (failure_error | lower) is search('forbidden|unauthorized|cannot (get|list|watch|create|update|patch|delete) resource') }}"
-    rbac_missing_verb: "{{ (failure_error | regex_search('cannot [a-z]+ resource') | default('', true)) | regex_replace('^cannot | resource$', '') }}"
-    rbac_missing_resource: "{{ (failure_error | regex_search('resource \"[^\"]+\"') | default('', true)) | regex_replace('^resource \"|\"$', '') }}"
+    is_rbac_error: "{{ (resolved_error | lower) is search('forbidden|unauthorized|cannot (get|list|watch|create|update|patch|delete) resource') }}"
+    rbac_missing_verb: "{{ (resolved_error | regex_search('cannot [a-z]+ resource') | default('', true)) | regex_replace('^cannot | resource$', '') }}"
+    rbac_missing_resource: "{{ (resolved_error | regex_search('resource \"[^\"]+\"') | default('', true)) | regex_replace('^resource \"|\"$', '') }}"
+    rbac_missing_group: "{{ (resolved_error | regex_search('API group \"[^\"]*\"') | default('', true)) | regex_replace('^API group \"|\"$', '') }}"
+
+# Why: templates/error-report.j2 (the alert mail) reads these names.
+- name: "Failure: Fill in the alert mail details"
+  set_fact:
+    current_step_no: "{{ 'Login' if current_phase == 'login' else ('Phase ' ~ current_phase) }}"
+    failed_task_name: >-
+      {{ (current_hop_label ~ ' -> ' ~ current_hop_target)
+         if (current_phase == '03' and (current_hop_target | default('') | length > 0))
+         else (phase_names[current_phase] | default(current_phase)) }}
+    failed_gate_type: "HARD"
+    rbac_check_command: >-
+      oc auth can-i {{ rbac_missing_verb or '*' }} {{ (rbac_missing_resource or '*') ~ (('.' ~ rbac_missing_group) if (rbac_missing_group | length > 0) else '') }} --all-namespaces
+    rbac_remediation_cmd: "oc adm policy add-cluster-role-to-user cluster-admin {{ cluster_username | default('<npid>', true) }}"
 
 - name: "Failure: Record it in the phase and hop results"
   set_fact:
     run_phase_results: >-
       {{ run_phase_results + [{'phase': current_phase, 'name': phase_names[current_phase] | default(current_phase),
-                               'status': 'FAIL', 'detail': failure_error | regex_replace('[\r\n]+', ' ') | truncate(300)}] }}
+                               'status': 'FAIL', 'detail': resolved_error | regex_replace('[\r\n]+', ' ') | truncate(300)}] }}
     hop_results: >-
-      {{ hop_results + ([{'label': current_hop_label, 'target': current_hop_target, 'status': 'FAILED', 'duration': ''}]
+      {{ hop_results + ([{'hop_label': current_hop_label, 'target': current_hop_target, 'status': 'FAILED', 'duration': ''}]
                         if (current_phase == '03' and (current_hop_target | default('') | length > 0)) else []) }}
 
 - name: "Failure: Log it"
@@ -52,7 +66,7 @@
     event_status: "FAIL"
     event_task: "{{ failure_reason }}"
     event_reason: "exit code {{ failure_exit_code }}"
-    event_observed: "{{ failure_error }}"
+    event_observed: "{{ resolved_error }}"
 
 # Why: plain key=value lines so 00_Run.sh can read them with grep (no Python needed).
 - name: "Failure: Write the status file for 00_Run.sh"
@@ -60,7 +74,7 @@
     content: |
       exit_code={{ failure_exit_code }}
       phase={{ current_phase }}
-      reason={{ (failure_reason ~ ': ' ~ failure_error) | regex_replace('[\r\n]+', ' ') | truncate(500) }}
+      reason={{ (failure_reason ~ ': ' ~ resolved_error) | regex_replace('[\r\n]+', ' ') | truncate(500) }}
     dest: "{{ status_file }}"
     mode: "0640"
   failed_when: false

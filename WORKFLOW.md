@@ -29,7 +29,7 @@ main.yml                        ONE play, ONE block / rescue / always
 | pre-check | `./00_Run.sh --cluster cluster_d01 --pre-check` | 01 02 | only the Phase 02 auto-fixes (nodes may reboot) |
 | post-check | `./00_Run.sh --cluster cluster_d01 --post-check` | 05 | no |
 
-There is no separate "resume" mode. If a run stops, fix the cause and run the same command again: hops the cluster already finished are skipped, and an update that is still running is watched instead of being started again.
+There is no separate "resume" mode. If a run stops, fix the cause and run the same command again: hops the cluster already finished are skipped, and an update that is still running is watched instead of being started again. (`--resume` is accepted but not needed.)
 
 ## Step by step
 
@@ -39,8 +39,9 @@ There is no separate "resume" mode. If a run stops, fix the cause and run the sa
 3. Takes the cluster, mode and path from the flags, or asks for them with numbered prompts.
 4. Shows the cluster, mode, path and whether the cluster will change, then asks for confirmation. A PROD run that changes the cluster needs the word `UPGRADE` typed in; `--yes` never skips that.
 5. Locks the cluster (`/tmp/aro-upgrade-<cluster>.lock`) so only one run can work on it.
-6. Runs `main.yml`, copying the console into `logs/<cluster>_<timestamp>.txt`.
-7. Exits with the code the playbook wrote to `logs/<cluster>_<timestamp>.status`, and prints the report path.
+6. Empties `logs/`, so it only ever holds the latest run. Logs of a run still active on another cluster are kept; reports and snapshots are never deleted.
+7. Runs `main.yml`, copying the console into `logs/<cluster>_<timestamp>.txt`.
+8. Exits with the code the playbook wrote to `logs/<cluster>_<timestamp>.status`, and prints the report path.
 
 ### 1. `main.yml`: start
 - Checks the inputs and picks the phases for the mode.
@@ -157,6 +158,7 @@ Then `always:` logs out.
 | summary | once, at the end of a successful run | `mail_to` |
 | alert | once, when a run fails | `alert_mail_to` + `mail_to` |
 
+Templates: summary `email-summary.j2`, alert `error-report.j2`, heartbeat and degradation `progress-mail.j2`.
 `--mail-to` replaces `mail_to` for one run. `send_email: false` in `vars/smtp.yml` turns all mails off.
 
 ## Every change the automation can make to the cluster
@@ -179,7 +181,7 @@ playbooks/
   00_Run.sh, main.yml, 01..06       the flow (read in this order)
   steps/common/                     login, logout, log, mail, report, failure handler
   steps/01 .. steps/06/             the steps of each phase (one file per check)
-  templates/                        report.j2, mail-summary.j2, mail-progress.j2, mail-alert.j2
+  templates/                        report.j2, email-summary.j2, progress-mail.j2, error-report.j2
   vars/                             all settings (upgrade.yml, smtp.yml, secrets.yml, ...)
   logs/ output/ snapshots/          what each run writes
 ```
