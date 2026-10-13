@@ -1,0 +1,36 @@
+---
+# Precheck 14 - cgroup mode (HARD, auto-fixable)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: OpenShift 4.19+ cannot run on cgroup v1, so when any hop of the path is 4.19
+#       or later, nodes.config/cluster must be cgroupMode v2. An empty cgroupMode means
+#       the historical default, which is v1 on clusters installed before 4.14.
+# Auto-fix: steps/02/fix_cgroup_v2.yml (all nodes reboot before the first hop).
+# skip_cgroup_check: true turns the check into a WARN (not recommended).
+
+- name: "Check 14: Read the cluster cgroup mode"
+  shell: |
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "") | tostring'
+  args:
+    executable: /bin/bash
+  register: c14_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: c14_raw.rc == 0
+
+# Why: versions are compared with split('.') - regex backreferences inside YAML-quoted
+#      Jinja turn into control characters (the old check never required v2).
+- name: "Check 14: Record the result"
+  set_fact:
+    preval_checks: >-
+      {{ preval_checks + [{'num': 14, 'name': 'cgroup mode', 'gate': 'HARD',
+           'status': 'PASS' if (not (_needs_v2 | bool) or _mode == 'v2') else ('WARN' if (skip_cgroup_check | default(false) | bool) else 'FAIL'),
+           'observed': 'Cluster cgroupMode is ' ~ _mode ~ ('' if (c14_raw.stdout | trim | length > 0) else ' (not set: historical default)')
+                       ~ ('; the highest hop ' ~ preval_max_target_version ~ (' needs v2' if (_needs_v2 | bool) else ' does not need v2'))
+                       ~ ('; skip_cgroup_check is true' if ((skip_cgroup_check | default(false) | bool) and (_needs_v2 | bool) and _mode != 'v2') else '')}] }}
+  vars:
+    _mode: "{{ (c14_raw.stdout | trim) if (c14_raw.stdout | trim | length > 0) else 'v1' }}"
+    _p: "{{ (preval_max_target_version | string).split('.') }}"
+    _needs_v2: "{{ (_p | length >= 2) and (((_p[0] | int) > 4) or (((_p[0] | int) == 4) and ((_p[1] | int) >= 19))) }}"

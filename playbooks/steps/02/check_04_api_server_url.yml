@@ -1,0 +1,23 @@
+---
+# Precheck 04 - API server URL (HARD)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: the session's API server matches desired_cluster_api_regex (vars/api_regex.yml).
+
+- name: "Check 04: Read the API server URL of the session"
+  command: "oc whoami --show-server"
+  register: c04_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: c04_raw.rc == 0
+
+- name: "Check 04: Record the result"
+  set_fact:
+    preval_checks: >-
+      {{ preval_checks + [{'num': 4, 'name': 'API server URL', 'gate': 'HARD',
+           'status': 'PASS' if (_ok | bool) else 'FAIL',
+           'observed': ('Session uses ' ~ _url) if (_ok | bool) else ('Session uses ' ~ (_url or 'nothing') ~ ', which does not match ' ~ desired_cluster_api_regex)}] }}
+  vars:
+    _url: "{{ c04_raw.stdout | trim }}"
+    _ok: "{{ (_url | length > 0) and (_url is match(desired_cluster_api_regex)) }}"

@@ -5,10 +5,10 @@ Update this file after **every meaningful implementation change**.
 ---
 
 ## Current Phase
-- **Phase 3 — Review Remediation (deep review findings + admin-ack, Developer perspective, mail de-duplication)**
+- **Phase 4 - Simplification (one flow)** (2026-10-13)
 
 ## Current Goal
-- **Code complete and verified offline** (2026-10-01): all review findings fixed, admin-ack per minor hop, Developer perspective, mail rework. Next: jump-host validation on Ansible 2.7.17 / 2.14.18 (see Next Up). Nothing committed — the user commits when ready.
+- The workflow is simplified to one flow (`00_Run.sh -> main.yml -> 01..06`, one failure handler) and verified offline. Next: jump-host validation (see Next Up). Nothing committed - the user commits when ready.
 
 ---
 
@@ -379,34 +379,24 @@ During v1 development and testing, 20+ critical operational and syntax issues we
 ---
 
 ## In Progress
-- None. Review-remediation units 1–10 are complete and verified offline; awaiting jump-host validation and the user's commit decision.
+- None.
 
 ---
 
 ## Next Up
-1. **Jump-host validation** (in order): `ansible-playbook --syntax-check` on every playbook with Ansible 2.7.17 and 2.14.18; confirm the `mail` module is available on 2.14 (community.general); `jq --version` is 1.5+; `curl` reaches `upgrade_graph_url` (or set `upgrade_graph_proxy`); `./00_Run.sh --cluster <dev> --dry-run`; `--pre-check` on DEV; a full DEV upgrade (one minor hop) watching the heartbeat / degradation mails and the admin-ack step.
-2. Non-Production staging soak test (multi-hop with workloads).
-3. SRE operational handover and runbook drills; CAB submission.
-4. Regenerate the Unit 18 Word / PowerPoint / diagram deliverables from the updated context docs (they describe the previous design).
-
+1. Jump host, in order: `ansible-playbook --syntax-check main.yml` on Ansible 2.7.17 and 2.14.18; `ansible-doc -t module mail` (community.general on 2.14); `jq --version`; `curl` reaches `upgrade_graph_url`.
+2. `./00_Run.sh --cluster <dev> --dry-run`, then `--pre-check`, then a one-hop DEV upgrade (watch the heartbeat / degradation mails and the admin-ack step).
+3. Non-production multi-hop soak; SRE handover; CAB.
 
 ## Architecture Decisions (Locked)
-
-1. **One-Touch Automation with Verified Auto-Remediation**:
-   - Phase 02 (default ON): cgroup v2 migration, unpause allow-listed MCPs; (default OFF) degraded operator pod restart. Node rollouts are monitored, then all 15 checks re-run; AUTO-FIXED only if the check passes.
-   - Phase 03, per minor hop: removed-API usage check, then admin-ack, then wait for `Upgradeable=True`.
-   - Phase 04 (default OFF): machine-config daemon force on a daemon-Degraded node.
-   - Phase 06: one operator Deployment restart for a Failed CSV of an approved operator (CSVs are never deleted).
-   - Hard stop with the exact reason for everything else (conditional-update risks, removed APIs in use, foreign update in progress).
-2. **Seven-File Process Surface**: Exactly seven main files: `00_Run.sh`, `main.yml`, and `01`–`06` playbooks. Operator upgrade is Phase 06 (`06_Operator_Upgrade.yaml`).
-3. **No AI in Runtime**: 100% rule-based and deterministic (`when:`, `fail:`, deterministic `oc patch`).
-4. **Dual-Version Runtime Compatibility**: Single codebase runs unmodified on Ansible 2.7.17 and 2.14.18.
-5. **Concurrency Safety**: flock-based lock (`/tmp/aro-upgrade-<cluster>.lock`, atomic mkdir fallback) prevents concurrent runs against the same cluster; only the owner releases it.
-6. **Native SMTP Notification through one composer**: `tasks/notify.yml` → `roles/sendmail`; prevalidation mail (full runs), 20-min heartbeat, degradation alerts, one failure alert, one closing summary; SMTP failures never fail the run.
-7. **Fail-Safe Session Teardown**: identity-checked login in Phase 01; later phases log in only without an active session; the `main.yml` close-out play logs out after success; every rescue and `always:` guard logs out on failure.
-9. **Whole-Path Validation**: every remaining edge validated against the OpenShift Update Service graph of the hop's channel before any change (TLS verification skipped by configuration, per the user).
-10. **Run Status File**: `logs/<cluster>_<ts>.status` carries the failure exit class to the CLI (5 / 10 / 20 / 25 / 30 / 35 / 99).
-8. **Ephemeral Cluster State**: All cluster state is queried live; only `snapshots/<cluster>_<ts>_baseline.json` is persisted across phases.
+1. **One flow**: `00_Run.sh -> main.yml` (one play, one block / rescue / always) -> phase files `01..06` -> `steps/<phase>/`. No roles, no single-phase entry points. Run modes: upgrade, dry-run, pre-check, post-check (`mode_phases` in `main.yml`).
+2. **One failure handler** (`steps/common/handle_failure.yml`): report, `.status` exit code, one alert; `always:` logs out.
+3. **Checks only record; phases gate.** 16 prechecks (Check 16 installed operator health, WARN), 10 postchecks.
+4. **Auto-fixes** (Phase 02, never in dry run): cgroup v2, unpause allow-listed pools; rollout watched; full re-check decides AUTO-FIXED / FIX-FAILED. Admin-ack per minor hop after the removed-API check. One restart of a Failed approved operator (Phase 06).
+5. **Mails**: heartbeat + degradation during updates, then one summary or one alert; lists `mail_to` / `alert_mail_to`; switch `send_email`.
+6. **One report per run** (`templates/report.j2`).
+7. **No AI in runtime**; Ansible 2.7.17 / 2.14.18 single codebase; flock lock per cluster; snapshot is the only saved state.
+8. **Removed on request (2026-10-13)**: single-phase / skip-to / stop-after runs, opt-in degraded-operator pod restart, opt-in machine-config-daemon force, forced-image upgrade, decorated CLI and `--clean`, prevalidation mail, per-type mail lists / switches, notification ledger.
 
 ---
 
@@ -607,3 +597,26 @@ During v1 development and testing, 20+ critical operational and syntax issues we
 - **Verification (offline, in the session scratchpad)**: YAML parse + Jinja compile of every file and template; all 75 embedded jq programs compiled with libjq and scanned for post-1.5 syntax; 45 jq behaviour tests on sample cluster JSON; 16 path-validation scenarios; 27 monitor state-machine scenarios (settle, heartbeat cadence, degradation alert-once, no-progress / outage / release / Failing aborts, rollout mode, dry run); 70 phase-flow checks (Phase 02 remediation and gate, hop plan, hop + Phase 03 single alert and exit codes, operator validation, console, report, routing, summaries, close-out); report templates rendered under strict undefined. Issues found by these tests and fixed: Ansible 2.7 attribute access on an undefined `poll_cv`, console `visibility` access, fact-vs-vars precedence for the Phase 06 compatibility target.
 - **Not verified here**: execution on a real cluster and on Ansible itself (the workstation is Windows; Ansible cannot run on a Windows control node). See Next Up item 1.
 
+### Session: Simplification - One Flow (2026-10-13)
+- **User request**: the workflow was hard to follow; make it one simple, durable flow that a new engineer can read top to bottom.
+- **User decisions**: keep modes upgrade / dry-run / pre-check / post-check; mails = alert + summary + heartbeat + degradation; one report per run; remove the opt-in operator pod restart, node force, forced-image upgrade and CLI extras; add a prehealth check for installed operators (blocker stops, unhealthy warns); layout = phase-numbered step folders (no roles).
+- **What changed**:
+  - `main.yml`: one play, one `block / rescue / always`; `KUBECONFIG` set once on the play; phases chosen by `mode_phases`.
+  - Phase files `01..06` are plain task lists (no guards, rescues, login/logout or mail).
+  - 26 roles + `tasks/` + `scripts/` replaced by `steps/common`, `steps/01..06` (one file per check). Check names and numbers fixed in each file.
+  - New Check 16 (installed operator health) and a richer Check 15 (reads subscriptions, CSVs, OperatorConditions, OLM ClusterOperator and package channels once).
+  - Templates: `report.j2` (one per run), `mail-summary.j2`, `mail-progress.j2`, `mail-alert.j2` (6 old templates removed).
+  - `00_Run.sh` rewritten (~240 lines, plain prompts, flock, exit code from `key=value` status file); `scripts/cli_helpers.sh` removed.
+  - `vars/upgrade.yml` and `vars/smtp.yml` trimmed to the settings still used; `vars/paths.yml` and `vars/api_regex.yml` trimmed.
+  - Path shape rules (ascending, same major, no skipped minor) moved from the CLI into Phase 01.
+  - Docs: new `WORKFLOW.md`; `README.md` and every `context/*.md` rewritten; `Documentation.md` appended.
+- **Verified offline** (session scratchpad): 60 YAML files parse; 1378 templated strings parse with known filters/tests; 80 include paths exist; 68 jq programs compile (libjq) and pass a jq 1.5 syntax scan; `bash -n` on 48 rendered shell blocks and `00_Run.sh`; 35 behaviour tests (checks 02/03/08/14/15/16, Phase 02 AUTO-FIXED merge, path shape, postchecks 04/10, snapshot jq, all four templates rendered with escaping).
+- **Not verified here**: Ansible itself (Windows workstation) and a real cluster - see Next Up 1-2.
+
+
+### Session: Old files removed (2026-10-13)
+- Deleted (all recoverable from git history with `git checkout <commit> -- <path>`):
+  `ARO_Cluster_Upgrade_Production_Documentation.docx`, `ARO_Cluster_Upgrade_Client_Presentation.pptx`,
+  `ARO_Cluster_Upgrade_Diagrams/` (18 figures + index), `scratch/` (generators and old verification scripts),
+  `context/feature-spec/` (original build specs), an empty top-level `output/` folder and a stale Word lock file.
+- Earlier session notes that mention these files are kept as history; the current design is in `WORKFLOW.md` and `context/`.

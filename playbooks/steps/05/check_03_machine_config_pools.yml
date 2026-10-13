@@ -1,0 +1,34 @@
+---
+# Postcheck 03 - MachineConfigPools (HARD)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: every pool Updated=True, not Updating, not Degraded.
+
+- name: "Check 03: Read MachineConfigPools"
+  shell: |
+    set -o pipefail
+    oc get mcp -o json | jq -c '
+      def cstat(t; d): (((.status.conditions // []) | map(select(.type == t)) | .[0].status) // d | tostring);
+      {total: (.items | length),
+       degraded: [.items[] | select(cstat("Degraded"; "True") == "True") | .metadata.name],
+       not_updated: [.items[] | select(cstat("Updated"; "False") != "True") | .metadata.name],
+       updating: [.items[] | select(cstat("Updating"; "False") == "True") | .metadata.name]}'
+  args:
+    executable: /bin/bash
+  register: p03_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: p03_raw.rc == 0
+
+- name: "Check 03: Record the result"
+  set_fact:
+    postval_checks: >-
+      {{ postval_checks + [{'num': 3, 'name': 'MachineConfigPools', 'gate': 'HARD',
+           'status': 'PASS' if (_bad | length == 0) else 'FAIL',
+           'observed': ('All ' ~ _p.total ~ ' pools updated') if (_bad | length == 0)
+                       else ('Degraded: ' ~ (_p.degraded | join(', ') or 'none') ~ '; not updated: ' ~ (_p.not_updated | join(', ') or 'none')
+                             ~ '; updating: ' ~ (_p.updating | join(', ') or 'none'))}] }}
+  vars:
+    _p: "{{ p03_raw.stdout | from_json }}"
+    _bad: "{{ (_p.degraded + _p.not_updated + _p.updating) | unique }}"

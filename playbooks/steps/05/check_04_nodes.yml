@@ -1,0 +1,44 @@
+---
+# Postcheck 04 - Nodes and kubelet version (HARD)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: every node Ready=True (Unknown counts as not ready) and every kubelet on the
+#       Kubernetes minor that ships with the cluster version: OpenShift 4.Y runs
+#       Kubernetes 1.(Y+13), e.g. 4.16 -> v1.29.
+# Why: the minor is read with split('.'); a regex backreference inside YAML-quoted
+#      Jinja becomes a control character (the old check expected v1.13. every time).
+
+- name: "Check 04: Read nodes and kubelet versions"
+  shell: |
+    set -o pipefail
+    oc get nodes -o json | jq -c '[.items[] | {
+      name: .metadata.name,
+      ready: (([.status.conditions[]? | select(.type == "Ready") | .status] | first) // "False" | tostring),
+      kubelet: (.status.nodeInfo.kubeletVersion // "unknown")}] | sort_by(.name)'
+  args:
+    executable: /bin/bash
+  register: p04_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: p04_raw.rc == 0
+
+- name: "Check 04: Record the result"
+  set_fact:
+    postval_checks: >-
+      {{ postval_checks + [{'num': 4, 'name': 'Nodes and kubelet version', 'gate': 'HARD',
+           'status': 'PASS' if ((_unready | length == 0) and (_wrong | length == 0)) else 'FAIL',
+           'observed': (_nodes | length) ~ ' nodes; not Ready: ' ~ (_unready | join(', ') or 'none')
+                       ~ '; kubelet not on ' ~ (_prefix or 'n/a') ~ '*: ' ~ (_wrong | join(', ') or 'none')}] }}
+  vars:
+    _nodes: "{{ p04_raw.stdout | from_json }}"
+    _prefix: >-
+      {{ ('v1.' ~ (((postval_expected_version | string).split('.')[1] | int) + 13) ~ '.')
+         if ((postval_expected_version | string) is match('^[0-9]+[.][0-9]+')) else '' }}
+    _unready: "{{ _nodes | rejectattr('ready', 'equalto', 'True') | map(attribute='name') | list }}"
+    _wrong: >-
+      {%- set out = [] -%}
+      {%- for n in _nodes if (_prefix | length > 0) and not n.kubelet.startswith(_prefix) -%}
+      {%- set _ = out.append(n.name ~ ' (' ~ n.kubelet ~ ')') -%}
+      {%- endfor -%}
+      {{ out }}

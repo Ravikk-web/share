@@ -1,0 +1,13 @@
+---
+# steps/04/poll_if_needed.yml - one loop iteration of Phase 04
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Why: a `when` on a looped include is evaluated for every item before the first one
+#      runs; here it is evaluated when this iteration starts, so polling stops as soon
+#      as the cluster settles or monitoring aborts.
+
+- name: "Poll {{ poll_number }} of {{ monitor_max_polls }} ({{ monitor_label }})"
+  include_tasks: "{{ playbook_dir }}/steps/04/poll.yml"
+  when:
+    - not (monitor_settled | bool)
+    - not (monitor_abort | bool)

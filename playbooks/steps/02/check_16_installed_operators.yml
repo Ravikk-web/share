@@ -1,0 +1,46 @@
+---
+# Precheck 16 - Installed operator health (WARN)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Uses `installed_operators`, read by Check 15 (so Check 15 must run first).
+#
+# For every installed operator (one OLM subscription each) it looks at:
+#   - CSV phase: anything other than Succeeded (Failed, Installing, Missing ...)
+#   - subscription problems: ResolutionFailed, CatalogSourcesUnhealthy,
+#     InstallPlanFailed, InstallPlanMissing, BundleUnpackFailed
+#   - its own OperatorCondition Upgradeable=False (OLM will not upgrade it in Phase 06)
+#   - a channel made for the target minor that the subscription is not on yet
+# Any of these makes the check WARN: it is reported, the run continues.
+# Operators that block the cluster upgrade itself are Check 15 (HARD).
+
+- name: "Check 16: Judge each installed operator"
+  set_fact:
+    installed_operators: >-
+      {%- set rows = [] -%}
+      {%- for o in installed_operators -%}
+      {%- set issues = [] -%}
+      {%- if o.phase != 'Succeeded' -%}{%- set _ = issues.append('CSV ' ~ o.phase ~ ((' (' ~ o.phase_detail ~ ')') if (o.phase_detail | length > 0) else '')) -%}{%- endif -%}
+      {%- for p in o.problems -%}{%- set _ = issues.append(p) -%}{%- endfor -%}
+      {%- if o.own_upgrade_blocked | length > 0 -%}{%- set _ = issues.append('its own upgrade is blocked: ' ~ o.own_upgrade_blocked) -%}{%- endif -%}
+      {%- if o.channel_hint | length > 0 -%}{%- set _ = issues.append('channel ' ~ o.channel_hint ~ ' is available (now on ' ~ (o.channel or 'default') ~ ')') -%}{%- endif -%}
+      {%- set _ = rows.append(o | combine({
+            'issues': issues,
+            'status': ('FAIL' if (o.blocks_upgrade | bool) else ('WARN' if (issues | length > 0) else 'PASS'))})) -%}
+      {%- endfor -%}
+      {{ rows }}
+
+- name: "Check 16: Record the result"
+  set_fact:
+    preval_checks: >-
+      {{ preval_checks + [{'num': 16, 'name': 'Installed operator health', 'gate': 'WARN',
+           'status': 'PASS' if (_unhealthy | length == 0) else 'WARN',
+           'observed': ('No OLM operators installed' if (installed_operators | length == 0)
+                        else ((installed_operators | length) ~ ' installed, ' ~ ((installed_operators | length) - (_unhealthy | length)) ~ ' healthy'
+                              ~ (('; needs attention: ' ~ (_unhealthy | join('; ') | truncate(600))) if (_unhealthy | length > 0) else '')))}] }}
+  vars:
+    _unhealthy: >-
+      {%- set out = [] -%}
+      {%- for o in installed_operators if o.issues | length > 0 -%}
+      {%- set _ = out.append(o.namespace ~ '/' ~ o.package ~ ': ' ~ (o.issues | join(', '))) -%}
+      {%- endfor -%}
+      {{ out }}

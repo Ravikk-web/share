@@ -1,0 +1,63 @@
+---
+# Postcheck 10 - Baseline diff (WARN)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: every node, ClusterOperator and route in the Phase 01 baseline snapshot still
+#       exists. Uses this run's snapshot, or the newest one of the cluster (post-check).
+
+- name: "Check 10: Find the baseline snapshot"
+  shell: |
+    wanted={{ baseline_snapshot_file_path | default('') | quote }}
+    if [ -n "$wanted" ] && [ -f "$wanted" ]; then
+      printf '%s\n' "$wanted"
+    else
+      ls -1t {{ snapshot_dir | quote }}/{{ cluster_name | quote }}_*_baseline.json 2>/dev/null | head -n 1
+    fi
+  args:
+    executable: /bin/bash
+  register: p10_file
+  changed_when: false
+  failed_when: false
+
+- name: "Check 10: Read the baseline snapshot"
+  slurp:
+    src: "{{ p10_file.stdout | trim }}"
+  register: p10_snapshot
+  when: p10_file.stdout | trim | length > 0
+
+- name: "Check 10: Read today's nodes, ClusterOperators and routes"
+  shell: |
+    set -o pipefail
+    oc get nodes,clusteroperators -o json | jq -c '{
+      nodes: [(.items // [])[] | select(.kind == "Node") | .metadata.name],
+      operators: [(.items // [])[] | select(.kind == "ClusterOperator") | .metadata.name]}'
+    oc get routes -A -o json | jq -c '[(.items // [])[] | "\(.metadata.namespace)/\(.metadata.name)"]'
+  args:
+    executable: /bin/bash
+  register: p10_live
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: p10_live.rc == 0
+
+- name: "Check 10: Record the result"
+  set_fact:
+    postval_checks: >-
+      {{ postval_checks + [{'num': 10, 'name': 'Baseline diff', 'gate': 'WARN',
+           'status': 'PASS' if ((_base | length > 0) and (_missing | length == 0)) else 'WARN',
+           'observed': ('No baseline snapshot found for ' ~ cluster_name ~ '; diff skipped') if (_base | length == 0)
+                       else ('Compared with ' ~ (p10_file.stdout | trim | basename) ~ ' (' ~ _base.cluster_metadata.current_version ~ '): '
+                             ~ (('missing ' ~ (_missing | join(', ') | truncate(400))) if (_missing | length > 0)
+                                else ('nothing missing - ' ~ (_live.nodes | length) ~ ' nodes, ' ~ (_live.operators | length) ~ ' operators, ' ~ (_routes | length) ~ ' routes')))}] }}
+  vars:
+    _base: "{{ (p10_snapshot.content | b64decode | from_json) if (p10_snapshot.content is defined) else {} }}"
+    _live: "{{ p10_live.stdout_lines[0] | from_json }}"
+    _routes: "{{ p10_live.stdout_lines[1] | from_json }}"
+    _missing: >-
+      {%- set out = [] -%}
+      {%- if _base | length > 0 -%}
+      {%- for n in _base.nodes | map(attribute='name') | list if n not in _live.nodes -%}{%- set _ = out.append('node ' ~ n) -%}{%- endfor -%}
+      {%- for o in _base.cluster_operators | map(attribute='name') | list if o not in _live.operators -%}{%- set _ = out.append('operator ' ~ o) -%}{%- endfor -%}
+      {%- for r in _base.routes if (r.namespace ~ '/' ~ r.name) not in _routes -%}{%- set _ = out.append('route ' ~ r.namespace ~ '/' ~ r.name) -%}{%- endfor -%}
+      {%- endif -%}
+      {{ out }}

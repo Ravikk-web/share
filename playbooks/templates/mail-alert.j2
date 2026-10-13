@@ -1,0 +1,58 @@
+{#
+==============================================================================
+mail-alert.j2 - the one alert mail of a failed run (sent by steps/common/handle_failure.yml)
+==============================================================================
+Reads: failure_reason, failure_error, failure_exit_code, current_phase, phase_names,
+is_rbac_error, rbac_missing_verb, rbac_missing_resource, cluster_username, log_file.
+Max width 580px, inline CSS, no JavaScript, cluster text escaped.
+==============================================================================
+#}
+{%- set td = 'padding: 6px 10px; border-bottom: 1px solid ' ~ color_border ~ ';' -%}
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>{{ cluster_name | e }} run stopped</title></head>
+<body style="margin: 0; padding: 20px 0; background-color: {{ color_page_bg }}; font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.5; color: {{ color_heading }};">
+<table border="0" cellspacing="0" cellpadding="0" align="center" style="max-width: {{ email_max_width }}; width: 100%; background-color: {{ color_surface }}; border: 1px solid {{ color_border }}; border-top: 4px solid {{ color_fail }}; border-radius: 6px;">
+  <tr><td style="padding: 24px; border-bottom: 1px solid {{ color_border }};">
+    <span style="display: inline-block; padding: 4px 10px; font-size: 12px; font-weight: 700; border-radius: 12px; background-color: {{ bg_fail }}; color: {{ color_fail }};">RUN STOPPED</span>
+    <h1 style="margin: 12px 0 4px 0; font-size: 20px;">{{ cluster_name | e }}: {{ failure_reason | default('a step failed') | e }}</h1>
+    <p style="margin: 0; font-size: 13px; color: #667085;">Run {{ run_timestamp | e }} ({{ run_mode | e }}) &bull; exit code {{ failure_exit_code | default('') }}</p>
+  </td></tr>
+  <tr><td style="padding: 20px 24px;">
+
+    {% if is_rbac_error | default(false) | bool %}
+    <div style="border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; background-color: {{ bg_warn }}; color: #7a4f01;">
+      <b>Permission denied for the automation account.</b> Missing: <code>{{ rbac_missing_verb | default('?', true) | e }}</code>
+      on <code>{{ rbac_missing_resource | default('?', true) | e }}</code>. The account is expected to be cluster-admin.<br>
+      Check: <code>oc auth can-i {{ rbac_missing_verb | default('*', true) | e }} {{ rbac_missing_resource | default('*', true) | e }} --all-namespaces</code><br>
+      Grant: <code>oc adm policy add-cluster-role-to-user cluster-admin {{ cluster_username | default('&lt;account&gt;') | e }}</code>
+    </div>
+    {% endif %}
+
+    {% if current_phase in ['03'] %}
+    <div style="border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; background-color: {{ bg_info }}; color: {{ color_info }};">
+      An update that was already started keeps running on the cluster. Check <code>oc get clusterversion</code> before running again.
+    </div>
+    {% endif %}
+
+    <table width="100%" style="border-collapse: collapse; font-size: 13px; margin-bottom: 16px; border: 1px solid {{ color_border }};">
+      <tr><td style="{{ td }} font-weight: 600; width: 30%;">Phase</td><td style="{{ td }}">{{ current_phase | e }} - {{ phase_names[current_phase] | default('') | e }}</td></tr>
+      <tr><td style="{{ td }} font-weight: 600;">Path</td><td style="{{ td }}">{{ (upgrade_path | default([]) | join(' &rarr; ')) or 'current version' }}</td></tr>
+    </table>
+
+    <div style="font-size: 13px; font-weight: 700; color: #475467;">Error</div>
+    <div style="background-color: #0f172a; color: #f8fafc; font-family: Consolas, monospace; font-size: 12px; padding: 12px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; margin: 6px 0 16px 0;">{{ failure_error | default('No error text captured.') | string | truncate(4000) | e }}</div>
+
+    <div style="font-size: 13px; font-weight: 700; color: #475467;">Next steps</div>
+    <ol style="margin: 4px 0 0 0; padding-left: 18px; font-size: 13px; color: #475467;">
+      <li>Read the attached report and the run log <code>{{ log_file | e }}</code>.</li>
+      <li>Fix the cause shown above.</li>
+      <li>Run the same command again: hops already done are skipped and a running update is watched, not restarted.</li>
+    </ol>
+  </td></tr>
+  <tr><td style="padding: 16px 24px; background-color: #f9fafb; border-top: 1px solid {{ color_border }}; font-size: 12px; color: #667085;">
+    The cluster session was logged out after this alert. Automated alert from the ARO Cluster Upgrade automation on {{ ansible_hostname | default('localhost') | e }}.
+  </td></tr>
+</table>
+</body>
+</html>

@@ -1,0 +1,29 @@
+---
+# Precheck 10 - PersistentVolumes (WARN)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: every PersistentVolume is Bound or Available.
+
+- name: "Check 10: Read PersistentVolumes"
+  shell: |
+    set -o pipefail
+    oc get pv -o json | jq -c '{
+      total: ((.items // []) | length),
+      bad: [(.items // [])[] | select(((.status.phase // "") != "Bound") and ((.status.phase // "") != "Available")) | "\(.metadata.name) (\(.status.phase // "Unknown"))"]}'
+  args:
+    executable: /bin/bash
+  register: c10_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: c10_raw.rc == 0
+
+- name: "Check 10: Record the result"
+  set_fact:
+    preval_checks: >-
+      {{ preval_checks + [{'num': 10, 'name': 'PersistentVolumes', 'gate': 'WARN',
+           'status': 'PASS' if (_pv.bad | length == 0) else 'WARN',
+           'observed': ('All ' ~ _pv.total ~ ' PersistentVolumes Bound or Available') if (_pv.bad | length == 0)
+                       else ((_pv.bad | length) ~ ' of ' ~ _pv.total ~ ' not Bound/Available: ' ~ (_pv.bad | join(', ') | truncate(300)))}] }}
+  vars:
+    _pv: "{{ c10_raw.stdout | from_json }}"

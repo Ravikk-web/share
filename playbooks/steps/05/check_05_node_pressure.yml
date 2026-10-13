@@ -1,0 +1,31 @@
+---
+# Postcheck 05 - Node pressure (HARD)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: no Disk/Memory/PID pressure, and no more cordoned nodes than
+#       allowed_unschedulable_nodes.
+
+- name: "Check 05: Read node pressure and cordons"
+  shell: |
+    set -o pipefail
+    oc get nodes -o json | jq -c '
+      def cstat(t): (((.status.conditions // []) | map(select(.type == t)) | .[0].status) // "False" | tostring);
+      {pressured: [.items[] | select((cstat("DiskPressure") == "True") or (cstat("MemoryPressure") == "True") or (cstat("PIDPressure") == "True")) | .metadata.name],
+       cordoned: [.items[] | select((.spec.unschedulable // false) == true) | .metadata.name]}'
+  args:
+    executable: /bin/bash
+  register: p05_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: p05_raw.rc == 0
+
+- name: "Check 05: Record the result"
+  set_fact:
+    postval_checks: >-
+      {{ postval_checks + [{'num': 5, 'name': 'Node pressure', 'gate': 'HARD',
+           'status': 'PASS' if ((_n.pressured | length == 0) and ((_n.cordoned | length) <= (allowed_unschedulable_nodes | default(0) | int))) else 'FAIL',
+           'observed': 'Under pressure: ' ~ (_n.pressured | join(', ') or 'none') ~ '; cordoned: ' ~ (_n.cordoned | join(', ') or 'none')
+                       ~ ' (allowed ' ~ (allowed_unschedulable_nodes | default(0)) ~ ')'}] }}
+  vars:
+    _n: "{{ p05_raw.stdout | from_json }}"

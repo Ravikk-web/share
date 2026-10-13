@@ -1,0 +1,76 @@
+---
+# ============================================================================
+# steps/02/run_all_checks.yml - run the 16 prechecks in order
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Every check file reads the cluster and appends one record to preval_checks:
+#   {num, name, gate, status, observed}
+#   gate:   HARD (a FAIL stops the run) or WARN (reported only)
+#   status: PASS, WARN or FAIL
+# No check stops the run by itself; 02_Pre_upgrade_check.yaml applies the gate.
+#
+#   01 ClusterOperators          HARD     09 Pending CSRs               WARN
+#   02 Nodes                     HARD     10 PersistentVolumes          WARN
+#   03 MachineConfigPools        HARD     11 PersistentVolumeClaims     WARN
+#   04 API server URL            HARD     12 PodDisruptionBudgets       WARN (HARD if fail_on_zero_disruption_pdb)
+#   05 API server readiness      HARD     13 Platform pods              WARN
+#   06 etcd                      HARD     14 cgroup mode                HARD
+#   07 Admin-acks / removed APIs HARD     15 Operator upgrade blockers  HARD
+#   08 Capacity headroom         HARD     16 Installed operator health  WARN
+# ============================================================================
+
+# Why: the highest hop decides what the whole path needs (cgroup v2 for 4.19+,
+#      operator compatibility, API removals).
+- name: "Prechecks: Start a fresh list"
+  set_fact:
+    preval_checks: []
+    preval_max_target_version: >-
+      {%- set best = [] -%}
+      {%- for v in upgrade_path if v is match('^[0-9]+[.][0-9]+[.][0-9]+$') -%}
+      {%- if (best | length == 0) or (v is version(best[-1], '>')) -%}{%- set _ = best.append(v) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ best[-1] if (best | length > 0) else '' }}
+
+- name: "Precheck 01 - ClusterOperators"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_01_cluster_operators.yml"
+- name: "Precheck 02 - Nodes"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_02_nodes.yml"
+- name: "Precheck 03 - MachineConfigPools"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_03_machine_config_pools.yml"
+- name: "Precheck 04 - API server URL"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_04_api_server_url.yml"
+- name: "Precheck 05 - API server readiness"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_05_api_readiness.yml"
+- name: "Precheck 06 - etcd"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_06_etcd.yml"
+- name: "Precheck 07 - Admin-acks and removed APIs"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_07_admin_acks.yml"
+- name: "Precheck 08 - Capacity headroom"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_08_capacity.yml"
+- name: "Precheck 09 - Pending CSRs"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_09_pending_csrs.yml"
+- name: "Precheck 10 - PersistentVolumes"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_10_persistent_volumes.yml"
+- name: "Precheck 11 - PersistentVolumeClaims"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_11_persistent_volume_claims.yml"
+- name: "Precheck 12 - PodDisruptionBudgets"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_12_pod_disruption_budgets.yml"
+- name: "Precheck 13 - Platform pods"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_13_platform_pods.yml"
+- name: "Precheck 14 - cgroup mode"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_14_cgroup_mode.yml"
+- name: "Precheck 15 - Operator upgrade blockers"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_15_operator_blockers.yml"
+- name: "Precheck 16 - Installed operator health"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_16_installed_operators.yml"
+
+- name: "Prechecks: Results"
+  debug:
+    msg: >-
+      {%- set out = [] -%}
+      {%- for c in preval_checks -%}
+      {%- set _ = out.append('%02d %-4s %-4s %s - %s' | format(c.num, c.gate, c.status, c.name, c.observed | truncate(160))) -%}
+      {%- endfor -%}
+      {{ out }}

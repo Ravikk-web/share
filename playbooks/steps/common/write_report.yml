@@ -1,0 +1,50 @@
+---
+# ============================================================================
+# steps/common/write_report.yml - write the run's single HTML report
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Used by: main.yml (end of a successful run) and handle_failure.yml (failed run).
+# Output:  output/<cluster>_<ts>_report.html (templates/report.j2), one section per
+#          phase that ran. Also sets run_verdict and run_summary_text, which the
+#          summary mail uses too.
+# ============================================================================
+
+- name: "Report: Work out the verdict and the one-line summary"
+  set_fact:
+    run_verdict: >-
+      {{ 'FAIL' if ((run_failed | bool) or (run_phase_results | selectattr('status', 'equalto', 'FAIL') | list | length > 0))
+         else ('WARN' if (run_phase_results | selectattr('status', 'equalto', 'WARN') | list | length > 0)
+         else ('AUTO-FIXED' if (run_phase_results | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length > 0)
+         else 'PASS')) }}
+    run_duration: >-
+      {%- set s = (lookup('pipe', 'date +%s') | int) - (run_start_epoch | int) -%}
+      {{ '%02d:%02d:%02d' | format(s // 3600, (s % 3600) // 60, s % 60) }}
+    run_summary_text: >-
+      {%- if run_failed | bool -%}
+      Stopped in {{ phase_names[current_phase] | default(current_phase) }}: {{ failure_reason | default('see the error below') }}.
+      {%- elif run_mode == 'upgrade' -%}
+      Upgraded from {{ run_start_version | default('?') }} to {{ run_final_version | default('?') }}
+      ({{ hop_results | selectattr('status', 'match', '^COMPLETE') | list | length }} hop(s) run,
+      {{ hop_results | selectattr('status', 'equalto', 'ALREADY DONE') | list | length }} already done).
+      Postchecks and the operator closeout finished.
+      {%- elif run_mode == 'dry-run' -%}
+      Dry run of {{ run_start_version | default('?') }} -> {{ upgrade_path | join(' -> ') }}: every check ran and nothing on the cluster was changed.
+      {%- elif run_mode == 'pre-check' -%}
+      Prechecks passed{{ (' after auto-fix: ' ~ (preval_autofix_items | map(attribute='name') | join(', '))) if (preval_autofix_items | length > 0) else '' }}. No upgrade was started.
+      {%- else -%}
+      Postchecks of the cluster at {{ run_final_version | default('?') }} finished.
+      {%- endif -%}
+
+- name: "Report: Make sure the output folder exists"
+  file:
+    path: "{{ output_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: "Report: Write {{ report_file | basename }}"
+  template:
+    src: "{{ playbook_dir }}/templates/report.j2"
+    dest: "{{ report_file }}"
+    mode: "0644"

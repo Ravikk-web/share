@@ -1,0 +1,71 @@
+---
+# Precheck 08 - Capacity headroom (HARD)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: the CPU and memory requested by running pods stay at or below max_cpu_percent /
+#       max_memory_percent of what the nodes can allocate, so pods have room to move
+#       while nodes are drained one by one.
+
+# Why: requests and allocatable come in units (m, Ki, Mi, Gi ...); parse_cpu turns CPU into
+#      millicores and parse_mem turns memory into bytes. jq 1.5 has no round(), so rnd2
+#      (two decimals) is defined by hand and its name must not start with "round".
+- name: "Check 08: Sum node allocatable and pod requests"
+  shell: |
+    set -o pipefail
+    defs='
+      def parse_cpu:
+        if . == null then 0
+        elif (tostring | endswith("m")) then (tostring | sub("m$"; "") | tonumber)
+        elif (tostring | endswith("u")) then (tostring | sub("u$"; "") | tonumber / 1000)
+        elif (tostring | endswith("n")) then (tostring | sub("n$"; "") | tonumber / 1000000)
+        else ((tostring | tonumber) * 1000) end;
+      def parse_mem:
+        if . == null then 0
+        elif (tostring | endswith("Ki")) then ((tostring | sub("Ki$"; "") | tonumber) * 1024)
+        elif (tostring | endswith("Mi")) then ((tostring | sub("Mi$"; "") | tonumber) * 1048576)
+        elif (tostring | endswith("Gi")) then ((tostring | sub("Gi$"; "") | tonumber) * 1073741824)
+        elif (tostring | endswith("Ti")) then ((tostring | sub("Ti$"; "") | tonumber) * 1099511627776)
+        elif (tostring | endswith("Pi")) then ((tostring | sub("Pi$"; "") | tonumber) * 1125899906842624)
+        elif (tostring | endswith("m")) then ((tostring | sub("m$"; "") | tonumber) / 1000)
+        elif (tostring | endswith("k")) then ((tostring | sub("k$"; "") | tonumber) * 1000)
+        elif (tostring | endswith("M")) then ((tostring | sub("M$"; "") | tonumber) * 1000000)
+        elif (tostring | endswith("G")) then ((tostring | sub("G$"; "") | tonumber) * 1000000000)
+        elif (tostring | endswith("T")) then ((tostring | sub("T$"; "") | tonumber) * 1000000000000)
+        elif (tostring | endswith("P")) then ((tostring | sub("P$"; "") | tonumber) * 1000000000000000)
+        else (tostring | tonumber) end;
+      def rnd2: . * 100 | floor / 100;'
+    alloc="$(oc get nodes -o json | jq -c "$defs"'
+      {cpu: ([.items[]? | .status.allocatable.cpu | parse_cpu] | add // 0),
+       mem: ([.items[]? | .status.allocatable.memory | parse_mem] | add // 0),
+       nodes: ((.items // []) | length)}')"
+    req="$(oc get pods -A --field-selector=status.phase=Running -o json | jq -c "$defs"'
+      {cpu: ([.items[]? | .spec.containers[]? | .resources.requests.cpu // null | parse_cpu] | add // 0),
+       mem: ([.items[]? | .spec.containers[]? | .resources.requests.memory // null | parse_mem] | add // 0),
+       pods: ((.items // []) | length)}')"
+    jq -nc --argjson a "$alloc" --argjson r "$req" "$defs"'
+      {cpu_percent: (if $a.cpu > 0 then (($r.cpu / $a.cpu * 100) | rnd2) else 0 end),
+       mem_percent: (if $a.mem > 0 then (($r.mem / $a.mem * 100) | rnd2) else 0 end),
+       cpu_cores: "\(($r.cpu / 1000) | rnd2)/\(($a.cpu / 1000) | rnd2)",
+       mem_gib: "\(($r.mem / 1073741824) | rnd2)/\(($a.mem / 1073741824) | rnd2)",
+       nodes: $a.nodes, pods: $r.pods}'
+  args:
+    executable: /bin/bash
+  register: c08_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: c08_raw.rc == 0
+
+- name: "Check 08: Record the result"
+  set_fact:
+    preval_checks: >-
+      {{ preval_checks + [{'num': 8, 'name': 'Capacity headroom', 'gate': 'HARD',
+           'status': 'PASS' if (_ok | bool) else 'FAIL',
+           'observed': 'Requested CPU ' ~ _u.cpu_percent ~ '% (' ~ _u.cpu_cores ~ ' cores, max ' ~ (max_cpu_percent | default(90)) ~ '%), memory '
+                       ~ _u.mem_percent ~ '% (' ~ _u.mem_gib ~ ' GiB, max ' ~ (max_memory_percent | default(90)) ~ '%) across '
+                       ~ _u.nodes ~ ' nodes and ' ~ _u.pods ~ ' running pods'}] }}
+  vars:
+    _u: "{{ c08_raw.stdout | from_json }}"
+    _ok: >-
+      {{ (_u.cpu_percent | float) <= (max_cpu_percent | default(90) | float)
+         and (_u.mem_percent | float) <= (max_memory_percent | default(90) | float) }}

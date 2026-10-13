@@ -4,13 +4,13 @@
 
 Read the following files in order before implementing or making any architectural decision:
 
+0. `WORKFLOW.md` — how one run works, step by step, in file order
 1. `context/project-overview.md` — product definition, goals, one-touch automation flow, features, and scope
-2. `context/architecture.md` — system structure, seven-file process surface, 24 roles, boundaries, storage model, and invariants
+2. `context/architecture.md` — system structure (00_Run.sh → main.yml → phase files 01–06 → steps/), boundaries, storage model, and invariants
 3. `context/ui-context.md` — theme, colors, typography, report/email templates, status pills (`AUTO-FIXED`/`FIX-FAILED`), and CLI display conventions
 4. `context/code-standards.md` — implementation rules, exception handling hierarchy, auto-remediation standards, Jinja2/shell anti-patterns, and developer comment requirements
 5. `context/ai-workflow-rules.md` — development workflow, rebuild scoping rules, auto-remediation rules, and pre-unit checklist
 6. `context/progress-tracker.md` — current phase, completed work, anti-patterns catalog, open questions, and next steps
-7. `context/feature-spec/` — read the cross-cutting specs (`15-exception-handling-patterns.md`, `16-developer-comments-and-documentation.md`, `17-verification-and-testing.md`) before writing any role, and read the specific feature spec for the current unit before implementing it.
 
 If implementation changes the architecture, scope, or standards documented in the context files, update the relevant file **before** continuing.
 

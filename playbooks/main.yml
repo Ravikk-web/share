@@ -1,109 +1,181 @@
 ---
 # ============================================================================
-# Master Orchestrator — ARO Cluster Upgrade Automation
+# main.yml - the whole upgrade flow on one page
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
-# MIGRATION 2.14: Uses import_playbook; compatible across Ansible 2.7 and 2.14.
+# MIGRATION 2.14: No changes needed.
 #
-# Purpose: Chains Phases 01, 02, 03 (with Phase 04 per hop), 05 and 06. Each phase
-#          play guards itself with skip_to_phase / stop_after_phase (and its own
-#          dry-run rules), so a run that stops early simply skips the later plays.
-# Mails:   exactly one closing summary per successful run, sent by the last play
-#          below (full upgrade, dry run, pre-check or partial run). A failed run
-#          never reaches it: Ansible drops a failed host from later plays, and the
-#          failing phase already sent the single failure alert. Isolated phases
-#          (--phase NN) run their own playbook and send their own closing mail.
-# Role / Playbook Dependencies: vars/*.yml, 01_Policy_Check.yaml, 02_Pre_upgrade_check.yaml,
-#               03_Initiate_upgrade.yaml, 05_post_Upgrade_Checks.yaml,
-#               06_Operator_Upgrade.yaml, tasks/send_run_summary.yml, roles/logout
-# Gate Type: N/A (Master Orchestrator)
-# Outputs: End-to-end run, one closing summary mail
+# Started by 00_Run.sh, which passes: cluster_name, upgrade_path, run_mode,
+# run_timestamp and (optionally) mail_to_cli.
+#
+# Read it top to bottom:
+#   1. Start   - check the inputs and pick the phases for this run mode
+#   2. Block   - log in, run the phases in order, write the report, send the summary
+#   3. Rescue  - the ONLY failure handler: report, status file, one alert mail
+#   4. Always  - log out
+#
+# Each phase is a plain task file next to this one (01_Policy_Check.yaml ...).
+# The steps they use live in steps/<phase>/.
+#
+#   Phase                              upgrade   dry-run      pre-check  post-check
+#   01 Policy check & baseline           yes      yes            yes        -
+#   02 Prechecks & auto-fix              yes      yes (no fix)   yes        -
+#   03 Upgrade hops (04 watches each)    yes      plan only      -          -
+#   05 Postchecks & baseline diff        yes      audit only     -          yes
+#   06 Operators & developer console     yes      plan only      -          -
+#
+# A dry run never changes the cluster: every cluster write checks `dry_run`.
 # ============================================================================
 
-- name: "ARO Upgrade Automation — Initialization"
+- name: "ARO cluster upgrade"
   hosts: localhost
   connection: local
-  gather_facts: false
+  gather_facts: true
+  gather_subset: min
   vars_files:
     - vars/upgrade.yml
     - vars/secrets.yml
-    - vars/paths.yml
     - vars/smtp.yml
+    - vars/paths.yml
     - vars/report_vars.yml
     - vars/api_regex.yml
+
+  # Why: every oc command in the run uses the run's own kubeconfig, written by
+  #      steps/common/login.yml. ~/.kube/config is never read or changed.
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  vars:
+    mode_phases:
+      upgrade: [1, 2, 3, 5, 6]
+      dry-run: [1, 2, 3, 5, 6]
+      pre-check: [1, 2]
+      post-check: [5]
+    phase_names:
+      login: "Login"
+      "01": "Policy check & baseline"
+      "02": "Prechecks & auto-fix"
+      "03": "Upgrade hops"
+      "05": "Postchecks & baseline diff"
+      "06": "Operators & developer console"
+    # Exit code written to the status file when a phase fails (read by 00_Run.sh).
+    # The monitor uses 30 instead of 20 when a hop stops progressing or times out.
+    phase_exit_codes:
+      login: 5
+      "01": 5
+      "02": 10
+      "03": 20
+      "05": 25
+      "06": 35
+
   tasks:
-    - name: "Validate mandatory execution variables"
+    # ------------------------------------------------------------------------
+    # 1. Start
+    # ------------------------------------------------------------------------
+    - name: "Start: Check the inputs from 00_Run.sh"
       assert:
         that:
-          - cluster_name is defined
-          - cluster_name | length > 0
-          - upgrade_path is defined
-          - upgrade_path | length > 0
-        fail_msg: "Mandatory parameters 'cluster_name' and 'upgrade_path' must be defined and non-empty."
+          - cluster_name | default('') | length > 0
+          - cluster_name in clusters
+          - run_mode | default('') in mode_phases
+          - (run_mode == 'post-check') or (upgrade_path | default([]) | length > 0)
+        fail_msg: >-
+          Start the run with 00_Run.sh. Needed: cluster_name (one of {{ clusters.keys() | list | join(', ') }}),
+          run_mode (upgrade, dry-run, pre-check or post-check) and, except for post-check, upgrade_path.
 
-    - name: "Establish the run timestamp shared by logs, snapshots and reports"
+    - name: "Start: Set up the run"
       set_fact:
         run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"
+        run_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+        dry_run: "{{ run_mode == 'dry-run' }}"
+        run_phases: "{{ mode_phases[run_mode] }}"
+        current_phase: "login"
+        run_failed: false
+        run_phase_results: []
+        hop_results: []
+        admin_acks_applied: []
+        preval_checks: []
+        preval_autofix_items: []
+        postval_checks: []
+        operator_checks: []
+        operators: []
+        installed_operators: []
 
-    - name: "Display run banner"
+    - name: "Start: Name the run's report and log files"
+      set_fact:
+        report_file: "{{ output_dir }}/{{ cluster_name }}_{{ run_timestamp }}_report.html"
+        log_file: "{{ log_dir }}/{{ cluster_name }}_{{ run_timestamp }}.txt"
+        csv_file: "{{ log_dir }}/{{ cluster_name }}_{{ run_timestamp }}.csv"
+        status_file: "{{ log_dir }}/{{ cluster_name }}_{{ run_timestamp }}.status"
+
+    - name: "Start: Show what this run will do"
       debug:
         msg:
-          - "========================================================"
-          - "  ARO Cluster Upgrade Automation"
-          - "========================================================"
-          - "Cluster        : {{ cluster_name }}"
-          - "Upgrade Path   : {{ upgrade_path | join(' -> ') }}"
-          - "Run Mode       : {{ run_mode | default('full-upgrade') }}"
-          - "Dry Run        : {{ dry_run | default(false) | bool }}"
-          - "Auto-Remediate : {{ auto_remediation_enabled | default(true) | bool }}"
-          - "Phases         : {{ skip_to_phase | default('01') }} to {{ stop_after_phase | default('06') }}"
-          - "========================================================"
+          - "Cluster : {{ cluster_name }} ({{ clusters[cluster_name].tier | default('DEV') }})"
+          - "Mode    : {{ run_mode }}{{ ' - no cluster changes' if (dry_run | bool) else '' }}"
+          - "Path    : {{ upgrade_path | default([]) | join(' -> ') if (upgrade_path | default([]) | length > 0) else 'current version (post-check)' }}"
+          - "Phases  : {{ run_phases | map('string') | map('regex_replace', '^', '0') | join(', ') }}"
+          - "Report  : {{ report_file }}"
 
-# --- Phase 01: Policy check, baseline snapshot, whole-path validation ---
-- import_playbook: 01_Policy_Check.yaml
+    # ------------------------------------------------------------------------
+    # 2. The phases, in order
+    # ------------------------------------------------------------------------
+    - name: "Run"
+      block:
+        - name: "Log in to the cluster"
+          include_tasks: "{{ playbook_dir }}/steps/common/login.yml"
 
-# --- Phase 02: 15-check prevalidation, auto-remediation, HARD gate ---
-- import_playbook: 02_Pre_upgrade_check.yaml
+        - name: "Phase 01 - Policy check, baseline snapshot, upgrade path"
+          include_tasks: "{{ playbook_dir }}/01_Policy_Check.yaml"
+          when: 1 in run_phases
 
-# --- Phase 03 (+ Phase 04 per hop): upgrade hops and live monitoring ---
-- import_playbook: 03_Initiate_upgrade.yaml
+        - name: "Phase 02 - Prechecks and auto-fix"
+          include_tasks: "{{ playbook_dir }}/02_Pre_upgrade_check.yaml"
+          when: 2 in run_phases
 
-# --- Phase 05: postvalidation and baseline diff ---
-- import_playbook: 05_post_Upgrade_Checks.yaml
+        - name: "Phase 03 - Upgrade hops (Phase 04 watches each hop)"
+          include_tasks: "{{ playbook_dir }}/03_Initiate_upgrade.yaml"
+          when: 3 in run_phases
 
-# --- Phase 06: operator upgrades, Developer perspective, closeout ---
-- import_playbook: 06_Operator_Upgrade.yaml
+        - name: "Phase 05 - Postchecks and baseline diff"
+          include_tasks: "{{ playbook_dir }}/05_post_Upgrade_Checks.yaml"
+          when: 5 in run_phases
 
-# --- Close-out: the run's single summary mail and logout ---
-- name: "Run close-out — summary mail and logout"
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  vars_files:
-    - vars/upgrade.yml
-    - vars/secrets.yml
-    - vars/paths.yml
-    - vars/smtp.yml
-    - vars/report_vars.yml
-    - vars/api_regex.yml
-  tasks:
-    - name: "Close-out: Describe the outcome"
-      set_fact:
-        run_summary_intro: >-
-          {% if (run_mode | default('full-upgrade')) == 'full-upgrade' %}Cluster {{ cluster_name }} was upgraded from {{ run_start_version | default('?') }} to {{ run_final_version | default('?') }}{{ (' in ' ~ (hop_results | default([]) | selectattr('status', 'match', '^COMPLETE') | list | length) ~ ' hop(s)') }}. Postvalidation and the operator closeout finished.
-          {%- elif (run_mode | default('')) == 'dry-run' %}Dry run of {{ run_start_version | default('?') }} -> {{ upgrade_path | join(' -> ') }}: all read-only checks ran; no change was made to the cluster.
-          {%- elif (run_mode | default('')) == 'pre-check' %}Prevalidation {{ 'passed after auto-remediation' if (preval_autofix_items | default([]) | length > 0) else 'passed' }}; no upgrade was started.
-          {%- else %}Phases {{ skip_to_phase | default('01') }} to {{ stop_after_phase | default('06') }} completed{{ (' (cluster now at ' ~ run_final_version ~ ')') if (run_final_version | default('') | length > 0) else '' }}.
-          {%- endif %}
-        run_summary_checks: "{{ health_summary | default([]) }}"
+        - name: "Phase 06 - Operators and developer console"
+          include_tasks: "{{ playbook_dir }}/06_Operator_Upgrade.yaml"
+          when: 6 in run_phases
 
-    - name: "Close-out: Send the run summary"
-      include_tasks: "{{ playbook_dir }}/tasks/send_run_summary.yml"
+        - name: "Finish: Write the run report"
+          include_tasks: "{{ playbook_dir }}/steps/common/write_report.yml"
 
-    - name: "Close-out: End the cluster session"
-      include_role:
-        name: logout
+        - name: "Finish: Send the summary mail"
+          include_tasks: "{{ playbook_dir }}/steps/common/send_mail.yml"
+          vars:
+            mail_kind: "summary"
+            mail_headline: "{{ run_mode | upper }} - {{ run_verdict }}"
+            mail_attachments: ["{{ report_file }}", "{{ log_file }}", "{{ csv_file }}"]
+          when: send_email | default(true) | bool
 
-    - name: "Close-out: Display run completion"
-      debug:
-        msg: "Run {{ run_timestamp }} ({{ run_mode | default('full-upgrade') }}) finished: {{ run_phase_results | default([]) | map(attribute='phase') | join(', ') }} ran; summary mail {{ 'sent' if (send_summary_email | default(true) | bool) else 'disabled' }}."
+        - name: "Finish: Show the result"
+          debug:
+            msg:
+              - "RUN {{ run_verdict }}: {{ run_summary_text }}"
+              - "Report: {{ report_file }}"
+
+      # ----------------------------------------------------------------------
+      # 3. The only failure handler
+      # ----------------------------------------------------------------------
+      rescue:
+        - name: "Failure: Record it, write the report, send one alert"
+          include_tasks: "{{ playbook_dir }}/steps/common/handle_failure.yml"
+
+        - name: "Failure: Stop the run"
+          fail:
+            msg: "Run stopped in {{ phase_names[current_phase] | default(current_phase) }} (exit code {{ failure_exit_code }}): {{ failure_error | truncate(1500) }}"
+
+      # ----------------------------------------------------------------------
+      # 4. Always log out
+      # ----------------------------------------------------------------------
+      always:
+        - name: "Log out of the cluster"
+          include_tasks: "{{ playbook_dir }}/steps/common/logout.yml"

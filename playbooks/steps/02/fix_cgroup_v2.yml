@@ -1,0 +1,49 @@
+---
+# ============================================================================
+# steps/02/fix_cgroup_v2.yml - auto-fix for Check 14: move the cluster to cgroup v2
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Cluster write: nodes.config/cluster spec.cgroupMode = v2.
+# Effect:        the Machine Config Operator rolls the change to every pool and
+#                reboots every node. Phase 02 waits for that rollout, then re-checks.
+# Records:       remediation_attempted_nums (+14), remediation_rollout_needed,
+#                preval_autofix_items. Whether it worked is decided by the re-check.
+# ============================================================================
+
+- name: "Fix cgroup v2: Set spec.cgroupMode to v2 (all nodes will reboot)"
+  command: "oc patch nodes.config/cluster --type=merge -p '{\"spec\":{\"cgroupMode\":\"v2\"}}'"
+  register: fix_cgroup_patch
+  changed_when: fix_cgroup_patch.rc == 0
+  failed_when: false
+
+- name: "Fix cgroup v2: Read the setting back"
+  shell: |
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "") | tostring'
+  args:
+    executable: /bin/bash
+  register: fix_cgroup_verify
+  changed_when: false
+  failed_when: false
+
+- name: "Fix cgroup v2: Record the attempt"
+  set_fact:
+    remediation_attempted_nums: "{{ remediation_attempted_nums + [14] }}"
+    remediation_rollout_needed: "{{ (remediation_rollout_needed | bool) or (_applied | bool) }}"
+    preval_autofix_items: >-
+      {{ preval_autofix_items + ([{'name': 'cgroup v2',
+           'action': 'Set nodes.config/cluster spec.cgroupMode to v2; every node rebooted with cgroup v2 before the first hop.',
+           'reference': 'https://docs.openshift.com/container-platform/latest/nodes/clusters/nodes-cluster-cgroups-2.html'}]
+          if (_applied | bool) else []) }}
+  vars:
+    _applied: "{{ (fix_cgroup_verify.stdout | default('') | trim) == 'v2' }}"
+
+- name: "Fix cgroup v2: Log it"
+  include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
+  vars:
+    event_status: "{{ 'AUTO-FIX' if (fix_cgroup_verify.stdout | default('') | trim) == 'v2' else 'FIX-FAILED' }}"
+    event_task: "cgroup v2 (Check 14)"
+    event_reason: "{{ 'cgroupMode set to v2; waiting for the node rollout' if (fix_cgroup_verify.stdout | default('') | trim) == 'v2' else 'cgroupMode could not be set' }}"
+    event_observed: "{{ (fix_cgroup_patch.stderr | default('') | trim) or ('cgroupMode now: ' ~ (fix_cgroup_verify.stdout | default('unknown') | trim)) }}"

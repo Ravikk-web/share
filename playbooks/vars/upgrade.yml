@@ -1,261 +1,128 @@
 # ============================================================================
-# Global Upgrade Configuration & Auto-Remediation Controls
+# vars/upgrade.yml - upgrade settings (paths, checks, timeouts, auto-fixes)
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
-# MIGRATION 2.14: No changes needed. Simple scalar, list, and dictionary values.
+# MIGRATION 2.14: No changes needed.
 #
-# Purpose: Defines the target cluster name, target sequential upgrade path,
-#          per-cluster pre-configured paths, upgrade-path validation, health check
-#          & capacity thresholds, monitoring cadences and timeouts, degradation
-#          alert grace periods, auto-remediation toggles, admin-ack policy, and
-#          post-upgrade (Phase 06) settings.
-# Role / Playbook Dependencies: None (base input configuration)
-# Gate Type: N/A
-# Outputs: Global upgrade configuration facts, thresholds, cadences, and toggles
+# The cluster, run mode and path of a run come from 00_Run.sh; everything else is here.
 # ============================================================================
 
-# Target cluster identifier (string, required).
-# Can be set here, passed via CLI flag (--cluster <name>), or selected interactively.
-cluster_name: ""
+# ----------------------------------------------------------------------------
+# Upgrade paths offered by 00_Run.sh for each cluster (override with --path)
+# ----------------------------------------------------------------------------
+# Never skip a minor version: 4.14 -> 4.15 -> 4.16, one hop each.
+cluster_upgrade_paths:
+  cluster_d01: ["4.14.40", "4.15.35", "4.16.18"]
+  cluster_s01: ["4.14.40", "4.15.35", "4.16.18"]
+  cluster_p01: ["4.14.40", "4.15.35"]
 
-# Target sequential upgrade path (list of strings, e.g. ["4.14.40", "4.15.35"]).
-# Must adhere to strict minor version sequential hops (never skip Y-stream versions).
-upgrade_path: []
-
-# Whether to bypass TLS certificate verification for cluster API calls and the
-# OpenShift Update Service graph query. Kept true by design for the ARO clusters.
+# Skip TLS verification for the cluster API and the update graph (kept true for ARO).
 insecure_skip_tls_verify: true
 
-# Pre-configured upgrade paths per cluster.
-# Consumed by the CLI interactive menu to suggest default or recommended hop journeys.
-cluster_upgrade_paths:
-  cluster_d01:
-    - "4.14.40"
-    - "4.15.35"
-    - "4.16.18"
-  cluster_s01:
-    - "4.14.40"
-    - "4.15.35"
-    - "4.16.18"
-  cluster_p01:
-    - "4.14.40"
-    - "4.15.35"
+# Password for `oc login` goes on stdin (not visible in the process list).
+# Set false only if the identity provider does not accept that.
+login_password_via_stdin: true
 
 # ----------------------------------------------------------------------------
-# Upgrade Path Validation (Phase 01, read-only)
+# Phase 01 - upgrade path validation (read-only)
 # ----------------------------------------------------------------------------
-# Validate every hop of the path up front against the public OpenShift Update
-# Service graph before any change is made. If the graph cannot be reached, Phase 01
-# validates hop 1 against the live cluster and later hops are validated at hop time.
+# Every hop is checked against the OpenShift Update Service graph before anything
+# changes. If the graph cannot be reached, those edges become WARN and each hop is
+# verified on the cluster right before it starts.
 upgrade_graph_validation_enabled: true
 upgrade_graph_url: "https://api.openshift.com/api/upgrades_info/v1/graph"
 upgrade_graph_arch: "amd64"
 upgrade_graph_timeout_seconds: 30
+upgrade_graph_proxy: ""            # optional HTTPS proxy for the graph query
 
-# Optional HTTPS proxy for the graph query (empty = use the environment / direct).
-upgrade_graph_proxy: ""
-
-# Channel family used for each hop: <prefix>-<major.minor> (e.g. stable-4.16).
+# Channel used for each hop: <prefix>-<major.minor>, e.g. stable-4.16
 target_channel_prefix: "stable"
 
-# Conditional update edges carry known risks (Recommended=False). They are refused
-# unless explicitly allowed; when allowed, the hop passes --allow-not-recommended
-# and the risks are listed in the reports and emails.
+# Conditional updates (known risks that apply to this cluster) are refused unless true.
 allow_conditional_updates: false
 
-# Seconds a hop waits, after setting its channel, for the cluster to offer the
-# target version before the hop is failed (the CVO refreshes its graph periodically).
-upgrade_edge_wait_seconds: 300
-
 # ----------------------------------------------------------------------------
-# Health Check & Capacity Thresholds
+# Phase 02 - prechecks
 # ----------------------------------------------------------------------------
-# Maximum node CPU utilization percentage allowed before flagging a warning
-max_cpu_percent: 90
+max_cpu_percent: 90                # Check 08: requested CPU vs allocatable
+max_memory_percent: 90             # Check 08: requested memory vs allocatable
+allowed_unschedulable_nodes: 0     # Checks 02 / 05: cordoned nodes allowed
+fail_on_zero_disruption_pdb: false # Check 12: true makes blocking PDBs a HARD stop
+co_allow_list: []                  # ClusterOperators ignored by every check, e.g. ["insights"]
 
-# Maximum node memory utilization percentage allowed before flagging a warning
-max_memory_percent: 90
-
-# PodDisruptionBudget Health Check Policy (Check 12):
-# Default: WARN advisory (audits zero-disruption PDBs for visibility without blocking).
-# Strict: Set to true if zero-disruption PDBs should halt upgrades.
-fail_on_zero_disruption_pdb: false
-
-# Storage Volumes (PV/PVC) Health Check Policy:
-# Enforced strictly as non-blocking WARN advisories (never a HARD gate).
-pv_enforce_gate: false
-pvc_enforce_gate: false
-
-# ClusterOperators Health Check Allow-List:
-# List of non-critical operators excluded from degraded, unavailable, or progressing checks.
-# Configure operator names (e.g. ["insights", "samples"]) to exclude known non-critical components.
-co_allow_list: []
-
-# CGroup Mode Compatibility Policy (Check 14):
-# OpenShift 4.19+ cannot run on cgroup v1, so when any hop in the path is >= 4.19
-# a cgroup v1 cluster is a HARD blocker (auto-fixed when auto_fix_cgroup_v2 is true).
-# Set to true only to bypass the check entirely (not recommended).
+# Check 14: true turns a cgroup v1 blocker into a warning (not recommended:
+# OpenShift 4.19+ cannot run on cgroup v1).
 skip_cgroup_check: false
 
-# Master toggle for enforcing HARD gate failure on residual postvalidation failures (default: true).
-# Overridden dynamically to false in dry-run mode so health audits complete without halting.
-postval_enforce_gate: true
-
-# Seconds Phase 05 waits for ClusterOperators to finish settling before judging them.
-postval_co_settle_seconds: 300
-
-# Timeout in seconds for the Phase 05 firing-alerts query.
-alerts_query_timeout_seconds: 20
-
 # ----------------------------------------------------------------------------
-# Monitoring Cadences & Timeout Protection (Phase 04)
+# Phase 02 - auto-fixes (never in a dry run)
 # ----------------------------------------------------------------------------
-# Polling interval in minutes between clusterversion/MCP/node health queries
-poll_interval_minutes: 2
+auto_remediation_enabled: true     # master switch for the two fixes below
 
-# No-progress timeout in minutes: a hop fails only when nothing advances (version,
-# updated machines, node rollout) for this long. Progress resets the timer.
-hop_timeout_minutes: 90
-
-# Absolute cap in minutes for a single hop (large worker pools need several hours).
-hop_max_minutes: 480
-
-# Cadence in minutes for progress heartbeat emails (continuous across all hops)
-heartbeat_minutes: 20
-
-# Cluster API outage tolerated during monitoring (control-plane upgrades restart
-# the API server) before the hop is declared failed.
-monitor_api_outage_minutes: 10
-
-# A hop counts as settled only after this many consecutive fully settled polls.
-settle_consecutive_polls: 2
-
-# Minutes to wait before failing a hop whose release the cluster did not accept
-# (ReleaseAccepted=False, e.g. failed preconditions).
-release_not_accepted_fail_minutes: 10
-
-# Minutes ClusterVersion may report Failing=True before the hop is failed.
-cv_failing_fail_minutes: 30
-
-# Minutes to wait before re-checking the pre-hop stable state (e.g. pools still
-# finishing an earlier rollout) before failing the hop.
-prehop_settle_wait_minutes: 10
-
-# ----------------------------------------------------------------------------
-# Degradation Alerts (grace periods so normal node reboots do not alert)
-# ----------------------------------------------------------------------------
-# Node NotReady while cordoned for an update (expected briefly during a reboot)
-degradation_node_notready_minutes: 15
-
-# Node NotReady while NOT cordoned (unexpected)
-degradation_uncordoned_notready_minutes: 5
-
-# Node Disk/Memory/PID pressure
-degradation_pressure_minutes: 5
-
-# ClusterOperator Degraded=True (operators can flap briefly during an upgrade)
-degradation_co_minutes: 10
-
-# ClusterVersion Failing=True
-degradation_cv_failing_minutes: 10
-
-# Minutes a node may stay in its update (drain / reboot / apply) before a degradation
-# alert names it (often a PodDisruptionBudget blocking the drain). Also the time a
-# node's machine-config daemon must stay Degraded before the Tier 2 force applies.
-node_stall_threshold_minutes: 30
-
-# ----------------------------------------------------------------------------
-# Auto-Remediation Engine Controls (One-Touch Automation)
-# ----------------------------------------------------------------------------
-# Master toggle: enables automated blocker detection and remediation
-auto_remediation_enabled: true
-
-# Tier 1 Auto-Fix: Automatically patch nodes.config/cluster to spec.cgroupMode: "v2"
-# when any hop is OpenShift 4.19 or higher and the cluster is on cgroup v1.
-# NOTE: this reboots every node before the first hop; Phase 02 waits for the
-# rollout to finish. Set false to make cgroup v1 a hard stop instead.
+# Check 14: set cgroupMode v2 when a hop reaches 4.19+ (every node reboots; Phase 02
+# waits for the rollout before the first hop).
 auto_fix_cgroup_v2: true
 
-# Tier 1 Auto-Fix: Automatically unpause MachineConfigPools present in the allow-list.
-# Phase 02 waits for any resulting node rollout to finish before continuing.
+# Check 03: unpause paused pools that are on this list.
 auto_unpause_mcp: true
-
-# Allow-list of MachineConfigPool names permitted for automated unpausing.
-mcp_auto_unpause_list:
-  - "worker"
-  - "master"
-
-# Tier 2 Guided: Attempt restart of degraded ClusterOperator pods during prevalidation
-# (Default false; requires explicit cluster-level opt-in).
-auto_restart_degraded_operators: false
-
-# Tier 2 Guided: create /run/machine-config-daemon-force on a node whose machine-config
-# daemon has been Degraded for node_stall_threshold_minutes (once per node per hop).
-# (Default false; requires explicit cluster-level opt-in.)
-auto_force_stalled_node: false
+mcp_auto_unpause_list: ["worker", "master"]
 
 # ----------------------------------------------------------------------------
-# Administrator Acknowledgements (Admin-Acks) & Removed API Gate
+# Phase 03 - hops
 # ----------------------------------------------------------------------------
-# Before each minor-version hop, apply the required admin-ack keys (read from
-# openshift-config-managed/admin-gates) to openshift-config/admin-acks.
+prehop_settle_wait_minutes: 10     # wait for a stable cluster before starting a hop
+upgrade_edge_wait_seconds: 300     # wait for the cluster to offer the hop target
+
+# Before each minor hop: check APIRequestCount for APIs the update removes, then set
+# the admin-ack. Any non-ignored caller in the last 24 h stops the run before the hop.
 auto_apply_admin_acks: true
-
-# Before acknowledging, check APIRequestCount for APIs the target release removes.
-# Any non-ignored usage in the last 24 hours stops the run before that hop.
 api_usage_check_enabled: true
-
-# Users Red Hat documents as safe to ignore in APIRequestCount results (they walk
-# every registered API). Extend only after confirming a user is not a workload.
+admin_ack_clear_timeout_seconds: 300
+# Users Red Hat documents as safe to ignore (they walk every API).
 api_usage_ignore_users:
   - "system:serviceaccount:kube-system:generic-garbage-collector"
   - "system:serviceaccount:kube-system:namespace-controller"
   - "system:kube-controller-manager"
   - "system:cluster-policy-controller"
 
-# Seconds to wait for ClusterVersion to clear the AdminAckRequired condition after
-# the acknowledgement is applied.
-admin_ack_clear_timeout_seconds: 300
+# ----------------------------------------------------------------------------
+# Phase 04 - watching a hop
+# ----------------------------------------------------------------------------
+poll_interval_minutes: 2
+heartbeat_minutes: 20              # heartbeat mail cadence
+settle_consecutive_polls: 2        # settled polls in a row needed
+hop_timeout_minutes: 90            # fail when nothing progresses this long
+hop_max_minutes: 480               # fail when a hop takes longer than this in total
+monitor_api_outage_minutes: 10     # API unreadable this long = fail
+release_not_accepted_fail_minutes: 10
+cv_failing_fail_minutes: 30
+
+# Degradation mail grace periods (minutes a problem must last before it is mailed)
+degradation_node_notready_minutes: 15          # node NotReady while cordoned (normal reboot)
+degradation_uncordoned_notready_minutes: 5     # node NotReady while NOT cordoned
+degradation_pressure_minutes: 5                # Disk/Memory/PID pressure
+degradation_co_minutes: 10                     # ClusterOperator / pool Degraded
+degradation_cv_failing_minutes: 10             # ClusterVersion Failing
+node_stall_threshold_minutes: 30               # node stuck in its update (often a PDB)
 
 # ----------------------------------------------------------------------------
-# Phase 06: Operators & Post-Upgrade Configuration
+# Phase 05 - postchecks
 # ----------------------------------------------------------------------------
-# When true, skips InstallPlan approvals in Phase 06 while still performing the
-# compatibility scan, validation, report, Developer perspective step, and closeout.
-skip_operator_upgrade: false
+postval_co_settle_seconds: 300     # wait for operators to settle before judging them
+alerts_query_timeout_seconds: 20
 
-# Seconds to wait for approved operators' CSVs to reach Succeeded
+# ----------------------------------------------------------------------------
+# Phase 06 - operators and console
+# ----------------------------------------------------------------------------
+skip_operator_upgrade: false             # true = report only, approve nothing
 operator_upgrade_timeout_seconds: 600
-
-# Seconds between CSV rollout polls
 operator_upgrade_poll_interval_seconds: 15
-
-# One-shot recovery: restart (once) the operator Deployments of an approved operator
-# whose CSV reports Failed. CSVs are never deleted (a deleted CSV on a Manual-approval
-# subscription stays uninstalled until someone approves a new InstallPlan).
-operator_upgrade_auto_recover: true
-
-# Enable the web console Developer perspective after the upgrade (Phase 06) when it
-# is not already enabled. OpenShift 4.19+ disables it by default.
-enable_developer_perspective: true
-
-# Minutes to wait for the console operator to settle after the perspective change
+operator_upgrade_auto_recover: true      # one restart of a Failed CSV's Deployments
+enable_developer_perspective: true       # disabled by default from OpenShift 4.19
 console_settle_timeout_minutes: 10
 
-# When true, dry run mode executes Phase 01, Phase 02, and Phase 05 (read-only postvalidation
-# and baseline diff against current version) without mutating cluster state.
-dry_run_include_postval: true
-
-
 # ----------------------------------------------------------------------------
-# Transient Fault Tolerance & Command Retries
+# oc retries for transient API errors
 # ----------------------------------------------------------------------------
-# Maximum retries for oc CLI queries to absorb transient network / API server hiccups
 oc_command_retries: 3
-
-# Delay in seconds between oc CLI retry attempts
 oc_command_retry_delay: 10
-
-# Password for `oc login` is passed on stdin (not visible in the process list).
-# Set false only if the cluster's identity provider does not accept it.
-login_password_via_stdin: true

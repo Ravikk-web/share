@@ -2169,3 +2169,70 @@ The development workstation is Windows (Ansible cannot run on a Windows control 
 4. `./00_Run.sh --cluster <dev> --dry-run` → one DRY-RUN summary mail, Phase 01 report with one row per edge.
 5. `./00_Run.sh --cluster <dev> --pre-check` → remediations (if any) with rollout monitoring, one PRE-CHECK summary.
 6. A full DEV upgrade of one minor hop: prevalidation mail, heartbeats every 20 minutes, the admin-ack step in the log, one COMPLETE summary; check that the Developer perspective is enabled on 4.19+.
+
+---
+
+## Simplification - one flow (2026-10-13)
+
+**Why.** The workflow had grown hard to follow:
+- two ways in (`main.yml` or a single phase playbook), with 35 lines of skip/stop/standalone guards
+- about 15 run modes
+- 12 rescue blocks with 16 logout calls
+- mail sent from 8 places
+- 26 roles with gate switches toggled on and off
+- a 1,680-line CLI
+
+The logic itself (path validation, admin-acks, auto-fixes, monitor, operator approvals) was sound and has been kept.
+
+**The new shape.**
+- `00_Run.sh` asks for the cluster, mode and path, confirms, locks the cluster and runs `main.yml`.
+- `main.yml` is one play: log in, then the phase files `01..06` in order, then the report and summary mail. A single `rescue:` handles every failure (report, `.status` exit code, one alert). `always:` logs out.
+- Phase files are plain task lists. The work is in `steps/<phase>/`, one file per check or step. Shared steps are in `steps/common/`.
+- Run modes:
+  - **upgrade:** all phases
+  - **dry-run:** all phases, no writes
+  - **pre-check:** 01 and 02
+  - **post-check:** 05
+
+  A re-run resumes automatically.
+- There is one report per run (`templates/report.j2`).
+- Mails: heartbeat and degradation while the cluster updates, then one summary or one alert. Recipients are `mail_to` and `alert_mail_to`; `send_email` switches all mail.
+- Every `oc` command gets `KUBECONFIG` once, from the play's `environment`.
+
+**New check.** Precheck 16, Installed operator health (WARN). For every OLM subscription it reports:
+- the CSV phase
+- subscription problems (`ResolutionFailed`, `CatalogSourcesUnhealthy`, `InstallPlanFailed`, `InstallPlanMissing`, `BundleUnpackFailed`)
+- the operator's own `OperatorCondition` `Upgradeable=False`
+- a better channel for the target minor
+
+Operators that block the cluster upgrade remain Check 15 (HARD): `olm.maxOpenShiftVersion` below the highest hop, or OLM `Upgradeable=False`. Check 15 now reads all operator data in one task, which both checks and the report use.
+
+**Removed (user decision).**
+- single-phase, skip-to and stop-after runs
+- the opt-in degraded ClusterOperator pod restart (Phase 02)
+- the opt-in machine-config-daemon force (Phase 04)
+- the forced-image upgrade path
+- the decorated CLI (box menus, risk/journey/scope boxes, `--clean`, mock mode)
+- the prevalidation mail
+- per-type mail lists and switches
+- the notification ledger
+- the Phase 06 "compatibility with reached version" row
+- the `--resume` flag (a re-run resumes on its own)
+- the `--skip-cgroup` and `--skip-operator-upgrade` flags: the settings stay in `vars/upgrade.yml`
+
+**Moved.** The path shape rules (ascending, same major, no skipped minor) moved from the CLI's Python into Phase 01 (`steps/01/validate_path.yml`).
+
+**Status file.** It is now plain `key=value` lines (`exit_code`, `phase`, `reason`), read by `00_Run.sh` with `grep`.
+
+**Verification (offline).**
+- YAML parse of all files.
+- A Jinja parse of every templated string, with known filters and tests only.
+- Every include path exists.
+- All 68 jq programs compile, plus a jq 1.5 syntax scan.
+- `bash -n` on every rendered shell block and on `00_Run.sh`.
+- 35 behaviour tests on sample cluster data, including Checks 15 and 16, the AUTO-FIXED merge, the path rules, the baseline diff and the template rendering.
+- Still to do on the jump host: `--syntax-check` on Ansible 2.7.17 and 2.14.18, then a dry run.
+
+**Old files removed (2026-10-13).** The Word document, the client PowerPoint, the diagram folder, the
+`scratch/` generators and the original feature specs described the previous design and were deleted.
+They remain in git history. `WORKFLOW.md` and `context/` are the current documentation.

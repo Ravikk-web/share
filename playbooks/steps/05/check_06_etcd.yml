@@ -1,0 +1,37 @@
+---
+# Postcheck 06 - etcd (HARD)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: at least 3 etcd pods Running and Ready (or all of them on a smaller control
+#       plane) and ClusterOperator etcd Available=True, Degraded=False.
+
+- name: "Check 06: Read the etcd pods and the etcd ClusterOperator"
+  shell: |
+    set -o pipefail
+    oc get pods -n openshift-etcd -l app=etcd -o json | jq -c '{
+      total: ((.items // []) | length),
+      ready: ([(.items // [])[] | select((.status.phase == "Running")
+               and ((((.status.conditions // []) | map(select(.type == "Ready")) | .[0].status) // "False" | tostring) == "True"))] | length)}'
+    oc get clusteroperator etcd -o json | jq -c '{
+      available: (((.status.conditions // []) | map(select(.type == "Available")) | .[0].status) // "False" | tostring),
+      degraded: (((.status.conditions // []) | map(select(.type == "Degraded")) | .[0].status) // "True" | tostring)}'
+  args:
+    executable: /bin/bash
+  register: p06_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: p06_raw.rc == 0
+
+- name: "Check 06: Record the result"
+  set_fact:
+    postval_checks: >-
+      {{ postval_checks + [{'num': 6, 'name': 'etcd', 'gate': 'HARD',
+           'status': 'PASS' if (_ok | bool) else 'FAIL',
+           'observed': 'etcd pods ready: ' ~ _pods.ready ~ '/' ~ _pods.total ~ '; ClusterOperator etcd Available=' ~ _co.available ~ ', Degraded=' ~ _co.degraded}] }}
+  vars:
+    _pods: "{{ p06_raw.stdout_lines[0] | from_json }}"
+    _co: "{{ p06_raw.stdout_lines[1] | from_json }}"
+    _ok: >-
+      {{ (((_pods.ready | int) >= 3) or ((_pods.total | int) >= 1 and (_pods.ready | int) == (_pods.total | int)))
+         and (_co.available | lower == 'true') and (_co.degraded | lower != 'true') }}
