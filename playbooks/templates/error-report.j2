@@ -67,7 +67,7 @@ Constraints:
               <div style="border-radius: 6px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; background-color: {{ bg_info | default('#f2f4f7') }}; border: 1px solid {{ color_border | default('#e4e7ec') }}; color: {{ color_info | default('#344054') }};">
                 The automation's cluster session is logged out and its temporary kubeconfig removed immediately after this alert.
                 {% if (current_step_no | default('') | string) is search('03|04') %}
-                An upgrade that was already triggered keeps running on the cluster; check <code>oc get clusterversion</code> before re-running.
+                An upgrade or node rollout that was already started keeps running on the cluster; check <code>oc get clusterversion</code> and <code>oc get mcp</code> before re-running.
                 {% endif %}
               </div>
 

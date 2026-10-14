@@ -1,6 +1,6 @@
 ---
 # ============================================================================
-# Phase 06 - Operators and developer console
+# Phase 07 - Operators and developer console
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
@@ -16,54 +16,54 @@
 # A failure here never rolls back the cluster upgrade.
 # ============================================================================
 
-- name: "Phase 06: Start"
+- name: "Phase 07: Start"
   set_fact:
-    current_phase: "06"
+    current_phase: "07"
     approved_installplans: []
     skipped_installplans: []
     operator_csv_baseline: []
     recovered_csvs: []
 
-- name: "Phase 06: Approve pending operator upgrades"
-  include_tasks: "{{ playbook_dir }}/steps/06/approve_operators.yml"
+- name: "Phase 07: Approve pending operator upgrades"
+  include_tasks: "{{ playbook_dir }}/steps/07/approve_operators.yml"
   when: not (skip_operator_upgrade | default(false) | bool)
 
-- name: "Phase 06: Judge operator health"
-  include_tasks: "{{ playbook_dir }}/steps/06/validate_operators.yml"
+- name: "Phase 07: Judge operator health"
+  include_tasks: "{{ playbook_dir }}/steps/07/validate_operators.yml"
 
 # Why: the Developer perspective is a convenience; a problem here is a WARN only.
-- name: "Phase 06: Developer perspective"
+- name: "Phase 07: Developer perspective"
   block:
-    - name: "Phase 06: Enable the Developer perspective if it is Disabled"
-      include_tasks: "{{ playbook_dir }}/steps/06/developer_console.yml"
+    - name: "Phase 07: Enable the Developer perspective if it is Disabled"
+      include_tasks: "{{ playbook_dir }}/steps/07/developer_console.yml"
   rescue:
-    - name: "Phase 06: The Developer perspective step could not run"
+    - name: "Phase 07: The Developer perspective step could not run"
       set_fact:
         developer_perspective_state: "WARN"
         developer_perspective_status: "Not checked: {{ ansible_failed_result.msg | default('console query failed') | truncate(200) }}"
 
-- name: "Phase 06: Record the result"
+- name: "Phase 07: Record the result"
   set_fact:
     operator_checks: >-
       {{ operator_checks + [{'num': 5, 'name': 'Web console Developer perspective', 'gate': 'WARN',
                              'status': developer_perspective_state, 'observed': developer_perspective_status}] }}
     run_phase_results: >-
       {{ run_phase_results + [{
-           'phase': '06', 'name': phase_names['06'] ~ (' (plan only)' if (dry_run | bool) else ''),
+           'phase': '07', 'name': phase_names['07'] ~ (' (plan only)' if (dry_run | bool) else ''),
            'status': ('FAIL' if (operator_validate_status == 'FAIL' and not (dry_run | bool))
                       else ('WARN' if (operator_validate_status != 'PASS' or developer_perspective_state == 'WARN')
                       else ('AUTO-FIXED' if developer_perspective_state == 'AUTO-FIXED' else 'PASS'))),
            'detail': operator_summary_text ~ '; Developer perspective: ' ~ developer_perspective_status
          }] }}
 
-- name: "Phase 06: Log the result"
+- name: "Phase 07: Log the result"
   include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
   vars:
     event_status: "{{ run_phase_results[-1].status }}"
     event_task: "Operators and developer console"
     event_reason: "{{ run_phase_results[-1].detail }}"
 
-- name: "Phase 06: GATE - approved operators healthy, no regressions"
+- name: "Phase 07: GATE - approved operators healthy, no regressions"
   fail:
     msg: >-
       {% for c in operator_checks | selectattr('status', 'equalto', 'FAIL') | list %}{{ c.name }}: {{ c.observed }}{% if not loop.last %} | {% endif %}{% endfor %}.

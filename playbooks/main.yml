@@ -17,14 +17,18 @@
 # Each phase is a plain task file next to this one (01_Policy_Check.yaml ...).
 # The steps they use live in steps/<phase>/.
 #
-#   Phase                              upgrade   dry-run      pre-check  post-check
-#   01 Policy check & baseline           yes      yes            yes        -
-#   02 Prechecks & auto-fix              yes      yes (no fix)   yes        -
-#   03 Upgrade hops (04 watches each)    yes      plan only      -          -
-#   05 Postchecks & baseline diff        yes      audit only     -          yes
-#   06 Operators & developer console     yes      plan only      -          -
+#   Phase                                     upgrade   dry-run      pre-check  post-check
+#   01 Policy check & baseline                  yes      yes            yes        -
+#   02 Prechecks (read-only)                    yes      yes            yes        -
+#   03 Pre-upgrade implementation (05 watches)  yes      plan only      yes        -
+#   04 Upgrade hops (05 watches each)           yes      plan only      -          -
+#   06 Postchecks & baseline diff               yes      audit only     -          yes
+#   07 Operators & developer console            yes      plan only      -          -
+#   05 Live monitoring never runs on its own: Phases 03 and 04 include it.
 #
 # A dry run never changes the cluster: every cluster write checks `dry_run`.
+# While testing, a phase include below can be commented out: each phase reads
+# what it needs from the cluster itself.
 # ============================================================================
 
 - name: "ARO cluster upgrade"
@@ -47,26 +51,30 @@
 
   vars:
     mode_phases:
-      upgrade: [1, 2, 3, 5, 6]
-      dry-run: [1, 2, 3, 5, 6]
-      pre-check: [1, 2]
-      post-check: [5]
+      upgrade: [1, 2, 3, 4, 6, 7]
+      dry-run: [1, 2, 3, 4, 6, 7]
+      pre-check: [1, 2, 3]
+      post-check: [6]
     phase_names:
       login: "Login"
       "01": "Policy check & baseline"
-      "02": "Prechecks & auto-fix"
-      "03": "Upgrade hops"
-      "05": "Postchecks & baseline diff"
-      "06": "Operators & developer console"
+      "02": "Prechecks"
+      "03": "Pre-upgrade implementation"
+      "04": "Upgrade hops"
+      "05": "Live monitoring"
+      "06": "Postchecks & baseline diff"
+      "07": "Operators & developer console"
     # Exit code written to the status file when a phase fails (read by 00_Run.sh).
-    # The monitor uses 30 instead of 20 when a hop stops progressing or times out.
+    # Phase 05 has no code of its own: it runs inside Phase 03 or 04 and keeps their
+    # code, except that it uses 30 instead of 20 when a hop stops progressing or times out.
     phase_exit_codes:
       login: 5
       "01": 5
       "02": 10
-      "03": 20
-      "05": 25
-      "06": 35
+      "03": 15
+      "04": 20
+      "06": 25
+      "07": 35
 
   tasks:
     # ------------------------------------------------------------------------
@@ -95,11 +103,23 @@
         hop_results: []
         admin_acks_applied: []
         preval_checks: []
+        preval_deferred: []
+        preval_rechecked: false
         preval_autofix_items: []
+        preimpl_tasks: []
         postval_checks: []
         operator_checks: []
         operators: []
         installed_operators: []
+        # Why: the highest hop decides what the whole path needs (cgroup v2 for 4.19+,
+        #      operator compatibility). Worked out once here so every phase can use it,
+        #      even when an earlier phase is commented out for a test.
+        target_max_version: >-
+          {%- set best = [] -%}
+          {%- for v in upgrade_path | default([]) if v is match('^[0-9]+[.][0-9]+[.][0-9]+$') -%}
+          {%- if (best | length == 0) or (v is version(best[-1], '>')) -%}{%- set _ = best.append(v) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ best[-1] if (best | length > 0) else '' }}
 
     - name: "Start: Name the run's report and log files"
       set_fact:
@@ -129,21 +149,25 @@
           include_tasks: "{{ playbook_dir }}/01_Policy_Check.yaml"
           when: 1 in run_phases
 
-        - name: "Phase 02 - Prechecks and auto-fix"
+        - name: "Phase 02 - Prechecks (read-only)"
           include_tasks: "{{ playbook_dir }}/02_Pre_upgrade_check.yaml"
           when: 2 in run_phases
 
-        - name: "Phase 03 - Upgrade hops (Phase 04 watches each hop)"
-          include_tasks: "{{ playbook_dir }}/03_Initiate_upgrade.yaml"
+        - name: "Phase 03 - Pre-upgrade implementation (Phase 05 watches any node rollout)"
+          include_tasks: "{{ playbook_dir }}/03_Pre_upgrade_Implementation.yaml"
           when: 3 in run_phases
 
-        - name: "Phase 05 - Postchecks and baseline diff"
-          include_tasks: "{{ playbook_dir }}/05_post_Upgrade_Checks.yaml"
-          when: 5 in run_phases
+        - name: "Phase 04 - Upgrade hops (Phase 05 watches each hop)"
+          include_tasks: "{{ playbook_dir }}/04_Initiate_upgrade.yaml"
+          when: 4 in run_phases
 
-        - name: "Phase 06 - Operators and developer console"
-          include_tasks: "{{ playbook_dir }}/06_Operator_Upgrade.yaml"
+        - name: "Phase 06 - Postchecks and baseline diff"
+          include_tasks: "{{ playbook_dir }}/06_post_Upgrade_Checks.yaml"
           when: 6 in run_phases
+
+        - name: "Phase 07 - Operators and developer console"
+          include_tasks: "{{ playbook_dir }}/07_Operator_Upgrade.yaml"
+          when: 7 in run_phases
 
         - name: "Finish: Write the run report"
           include_tasks: "{{ playbook_dir }}/steps/common/write_report.yml"

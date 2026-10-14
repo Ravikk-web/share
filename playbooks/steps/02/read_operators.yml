@@ -1,0 +1,100 @@
+---
+# ============================================================================
+# steps/02/read_operators.yml - read every installed OLM operator (read-only)
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Used by: Precheck 15 (steps/02/check_15_operator_blockers.yml) and Phase 03 task 3
+#          (steps/03/task_3_operator_upgrades.yml, before and after its approvals).
+# Input:   target_max_version (set in main.yml)
+# Outputs: operators_scan - one row per subscription:
+#            {subscription, package, namespace, channel, approval, csv, version, phase,
+#             phase_detail, problems, max_ocp, blocks_upgrade, own_upgrade_blocked,
+#             channel_hint, pending}
+#          olm_upgradeable - {status, reason, message} of the OLM ClusterOperator
+# blocks_upgrade: the CSV declares olm.maxOpenShiftVersion below the highest hop.
+# pending: the subscription is UpgradePending (an InstallPlan is waiting).
+# ============================================================================
+
+# Why: one task, five JSON lines - subscriptions, CSVs, OperatorConditions, the OLM
+#      ClusterOperator and the channels each package offers. -l '!olm.copiedFrom'
+#      skips the copies OLM makes of all-namespace operators in every namespace.
+#      olm.properties is a JSON string; try/catch keeps a malformed one from
+#      breaking the scan.
+- name: "Operators: Read subscriptions, CSVs, OperatorConditions and OLM"
+  shell: |
+    set -o pipefail
+    subs="$(oc get subscriptions.operators.coreos.com -A -o json | jq -c '[.items[]? | {
+      name: .metadata.name, namespace: .metadata.namespace,
+      package: (.spec.name // .metadata.name), channel: (.spec.channel // ""),
+      source_namespace: (.spec.sourceNamespace // "openshift-marketplace"),
+      approval: (.spec.installPlanApproval // "Automatic"),
+      installed_csv: (.status.installedCSV // .status.currentCSV // ""),
+      state: (.status.state // ""),
+      problems: [(.status.conditions // [])[]
+                 | select(((.type == "ResolutionFailed") or (.type == "CatalogSourcesUnhealthy") or (.type == "InstallPlanFailed")
+                           or (.type == "InstallPlanMissing") or (.type == "BundleUnpackFailed")) and ((.status | tostring) == "True"))
+                 | "\(.type): \((.message // "") | .[0:150])"]}]')"
+    printf '%s\n' "$subs"
+    oc get clusterserviceversions.operators.coreos.com -A -l '!olm.copiedFrom' -o json | jq -c '[.items[]? | {
+      name: .metadata.name, namespace: .metadata.namespace,
+      version: (.spec.version // ""), phase: (.status.phase // "Unknown"),
+      reason: (.status.reason // ""), message: ((.status.message // "") | .[0:150]),
+      max_ocp: ((try ((.metadata.annotations["olm.properties"] // "[]") | fromjson) catch [])
+                | map(select(.type == "olm.maxOpenShiftVersion")) | ((.[0].value // "") | tostring))}]'
+    (oc get operatorconditions.operators.coreos.com -A -o json 2>/dev/null || echo '{}') | jq -c '[.items[]? | {
+      name: .metadata.name, namespace: .metadata.namespace,
+      overridden: ([(.spec.overrides // [])[] | select((.type == "Upgradeable") and ((.status | tostring) == "True"))] | length > 0),
+      upgradeable_false: ([(.status.conditions // [])[] | select((.type == "Upgradeable") and ((.status | tostring) == "False"))
+                           | ((.message // "Upgradeable=False") | .[0:150])] | .[0] // "")}]'
+    oc get clusteroperator operator-lifecycle-manager -o json | jq -c '
+      (((.status.conditions // []) | map(select(.type == "Upgradeable")) | .[0]) // {})
+      | {status: ((.status // "True") | tostring), reason: (.reason // ""), message: ((.message // "") | .[0:300])}'
+    printf '%s' "$subs" | jq -r '.[] | "\(.package) \(.source_namespace)"' | sort -u | while read -r pkg ns; do
+      (oc get packagemanifest "$pkg" -n "$ns" -o json 2>/dev/null || echo '{}') | jq -c --arg p "$pkg" '{package: $p, channels: [.status.channels[]?.name]}'
+    done | jq -s -c '.'
+  args:
+    executable: /bin/bash
+  register: operators_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: operators_raw.rc == 0
+
+# Why: one row per subscription. blocks_upgrade compares the declared maximum with the
+#      highest hop's major.minor; channel_hint names a channel made for that minor
+#      (stable-X.Y, then fast-X.Y, then X.Y) when the subscription is not on it yet.
+- name: "Operators: Build the operator list"
+  set_fact:
+    operators_scan: >-
+      {%- set rows = [] -%}
+      {%- for s in _subs | sort(attribute='namespace') -%}
+      {%- set found = _csvs | selectattr('namespace', 'equalto', s.namespace) | selectattr('name', 'equalto', s.installed_csv) | list -%}
+      {%- set c = found[0] if (found | length > 0) else {'version': '', 'phase': 'Missing', 'reason': '', 'message': 'installed CSV not found', 'max_ocp': ''} -%}
+      {%- set cond = _conds | selectattr('namespace', 'equalto', s.namespace) | selectattr('name', 'equalto', s.installed_csv) | list -%}
+      {%- set own_blocked = cond[0].upgradeable_false if ((cond | length > 0) and not (cond[0].overridden | bool)) else '' -%}
+      {%- set blocks = (c.max_ocp | length > 0) and (_minor | length > 0) and (c.max_ocp is version(_minor, '<')) -%}
+      {%- set offered = (_channels | selectattr('package', 'equalto', s.package) | list | first | default({'channels': []})).channels -%}
+      {%- set hint = [] -%}
+      {%- for prefix in ['stable-', 'fast-', ''] -%}
+      {%- if (hint | length == 0) and (_minor | length > 0) and ((prefix ~ _minor) in offered) -%}{%- set _ = hint.append(prefix ~ _minor) -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set _ = rows.append({
+            'subscription': s.name, 'package': s.package, 'namespace': s.namespace, 'channel': s.channel, 'approval': s.approval,
+            'csv': s.installed_csv or 'none', 'version': c.version, 'phase': c.phase,
+            'phase_detail': ((c.reason ~ ': ' ~ c.message) if (c.phase != 'Succeeded' and (c.reason | length > 0)) else ''),
+            'problems': s.problems, 'max_ocp': c.max_ocp or 'not declared',
+            'blocks_upgrade': blocks, 'own_upgrade_blocked': own_blocked,
+            'channel_hint': (hint[0] if ((hint | length > 0) and hint[0] != s.channel) else ''),
+            'pending': s.state == 'UpgradePending'}) -%}
+      {%- endfor -%}
+      {{ rows }}
+    olm_upgradeable: "{{ _olm }}"
+  vars:
+    _subs: "{{ operators_raw.stdout_lines[0] | from_json }}"
+    _csvs: "{{ operators_raw.stdout_lines[1] | from_json }}"
+    _conds: "{{ operators_raw.stdout_lines[2] | from_json }}"
+    _olm: "{{ operators_raw.stdout_lines[3] | from_json }}"
+    _channels: "{{ operators_raw.stdout_lines[4] | default('[]') | from_json }}"
+    _minor: "{{ (target_max_version | string).split('.')[0:2] | join('.') if (target_max_version | length > 0) else '' }}"

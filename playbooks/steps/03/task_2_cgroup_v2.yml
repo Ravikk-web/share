@@ -1,0 +1,116 @@
+---
+# ============================================================================
+# steps/03/task_2_cgroup_v2.yml - Phase 03 task 2: move the cluster to cgroup v2
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Check:   nodes.config/cluster spec.cgroupMode, and whether any hop reaches 4.19+
+#          (OpenShift 4.19+ cannot run on cgroup v1; an empty cgroupMode means the
+#          historical default, which is v1 on clusters installed before 4.14).
+# Change:  spec.cgroupMode=v2 (auto_fix_cgroup_v2, auto_remediation_enabled, not
+#          skip_cgroup_check, not in a dry run).
+# Watch:   the Machine Config Operator rolls the change to every pool and reboots
+#          every node; always watched to the end (steps/03/watch_rollout.yml).
+# Verify:  cgroupMode reads v2 and the rollout settled.
+# Records: one row in preimpl_tasks (Precheck 14 is re-checked afterwards).
+# Cluster write: nodes.config/cluster spec.cgroupMode=v2.
+# ============================================================================
+
+- name: "Task 2: Start"
+  set_fact:
+    preimpl_current_task: {num: 2, name: "cgroup v2"}
+
+- name: "Task 2: Read the cluster cgroup mode"
+  shell: |
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "") | tostring'
+  args:
+    executable: /bin/bash
+  register: t2_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: t2_raw.rc == 0
+
+# Why: versions are compared with split('.'), never regex backreferences.
+- name: "Task 2: Decide"
+  set_fact:
+    t2_mode: "{{ (t2_raw.stdout | trim) if (t2_raw.stdout | trim | length > 0) else 'v1' }}"
+    t2_needs_v2: "{{ (_p | length >= 2) and (((_p[0] | int) > 4) or (((_p[0] | int) == 4) and ((_p[1] | int) >= 19))) }}"
+    t2_enabled: >-
+      {{ (auto_remediation_enabled | default(true) | bool) and (auto_fix_cgroup_v2 | default(true) | bool)
+         and not (skip_cgroup_check | default(false) | bool) }}
+  vars:
+    _p: "{{ (target_max_version | string).split('.') }}"
+
+- name: "Task 2: Decide whether to change it"
+  set_fact:
+    t2_change: "{{ (t2_needs_v2 | bool) and t2_mode != 'v2' and (t2_enabled | bool) and not (dry_run | bool) }}"
+
+- name: "Task 2: Set spec.cgroupMode to v2 (every node will reboot)"
+  command: "oc patch nodes.config/cluster --type=merge -p '{\"spec\":{\"cgroupMode\":\"v2\"}}'"
+  register: t2_patch
+  changed_when: t2_patch.rc == 0
+  failed_when: false
+  when: t2_change | bool
+
+- name: "Task 2: Read the setting back"
+  shell: |
+    set -o pipefail
+    oc get nodes.config/cluster -o json | jq -r '(.spec.cgroupMode // "") | tostring'
+  args:
+    executable: /bin/bash
+  register: t2_verify
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: t2_verify.rc == 0
+  when: t2_change | bool
+
+- name: "Task 2: Remember whether it was set"
+  set_fact:
+    t2_applied: "{{ (t2_change | bool) and ((t2_verify.stdout | default('') | trim) == 'v2') }}"
+
+- name: "Task 2: Watch the node rollout (every node reboots)"
+  include_tasks: "{{ playbook_dir }}/steps/03/watch_rollout.yml"
+  vars:
+    rollout_task: "cgroup v2"
+    rollout_expected: true
+  when: t2_applied | bool
+
+- name: "Task 2: Record the result"
+  include_tasks: "{{ playbook_dir }}/steps/03/record_task.yml"
+  vars:
+    task_num: 2
+    task_name: "cgroup v2"
+    task_check_num: 14
+    task_changed: "{{ t2_applied | bool }}"
+    task_status: >-
+      {%- if not (t2_needs_v2 | bool) or t2_mode == 'v2' -%}PASS
+      {%- elif skip_cgroup_check | default(false) | bool -%}WARN
+      {%- elif not (t2_enabled | bool) -%}SKIPPED
+      {%- elif dry_run | bool -%}WARN
+      {%- elif t2_applied | bool -%}AUTO-FIXED
+      {%- else -%}FIX-FAILED
+      {%- endif -%}
+    task_observed: >-
+      {%- if not (t2_needs_v2 | bool) -%}
+      cgroupMode is {{ t2_mode }}; the highest hop {{ target_max_version or '?' }} does not need v2.
+      {%- elif t2_mode == 'v2' -%}
+      cgroupMode is already v2 (needed for {{ target_max_version }}).
+      {%- elif skip_cgroup_check | default(false) | bool -%}
+      cgroupMode is {{ t2_mode }} and {{ target_max_version }} needs v2, but skip_cgroup_check is true: left unchanged.
+      {%- elif not (t2_enabled | bool) -%}
+      cgroupMode is {{ t2_mode }} and {{ target_max_version }} needs v2; not changed because {{ 'auto_remediation_enabled' if not (auto_remediation_enabled | default(true) | bool) else 'auto_fix_cgroup_v2' }} is false.
+      {%- elif dry_run | bool -%}
+      Dry run: would set cgroupMode v2 ({{ target_max_version }} needs it); every node would reboot.
+      {%- elif t2_applied | bool -%}
+      Set cgroupMode v2 (was {{ t2_mode }}); {{ rollout_result | default('') }}.
+      {%- else -%}
+      Could not set cgroupMode v2: {{ (t2_patch.stderr | default('') | trim | truncate(300)) or ('it reads ' ~ (t2_verify.stdout | default('unknown') | trim)) }}.
+      {%- endif -%}
+    task_autofix:
+      name: "cgroup v2"
+      action: "Set nodes.config/cluster spec.cgroupMode to v2; every node rebooted with cgroup v2 before the first hop ({{ rollout_result | default('') }})."
+      reference: "https://docs.openshift.com/container-platform/latest/nodes/clusters/nodes-cluster-cgroups-2.html"

@@ -1,0 +1,56 @@
+---
+# ============================================================================
+# steps/03/record_task.yml - record one Phase 03 task, stop the run if it failed
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Used by: the end of every steps/03/task_*.yml.
+# Inputs (include vars):
+#   task_num, task_name
+#   task_status     PASS        nothing needed changing
+#                   AUTO-FIXED  changed and verified
+#                   WARN        a dry run would change it, or it was left as is on purpose
+#                   SKIPPED     a change is needed but its switch is off
+#                   FAIL        a change is needed and cannot be made automatically
+#                   FIX-FAILED  the change was made but did not verify
+#   task_observed   what was found, what was done, how the rollout went
+#   task_changed    true when the cluster was changed
+#   task_check_num  the precheck that Phase 03 marks AUTO-FIXED / FIX-FAILED after its
+#                   re-check (0 = none)
+#   task_autofix    optional {name, action, reference} for the report and summary mail
+# Records: preimpl_tasks (+1 row), preimpl_changed, remediation_attempted_nums,
+#          preval_autofix_items.
+# FAIL and FIX-FAILED stop the run here: the next task and the hops never start.
+# ============================================================================
+
+- name: "Task {{ task_num }} ({{ task_name }}): Record {{ task_status }}"
+  set_fact:
+    preimpl_tasks: >-
+      {{ preimpl_tasks + [{'num': task_num | int, 'name': task_name, 'status': task_status,
+                           'observed': task_observed | regex_replace('[ \t\r\n]+', ' ') | trim}] }}
+    preimpl_changed: "{{ (preimpl_changed | bool) or (task_changed | default(false) | bool) }}"
+    remediation_attempted_nums: >-
+      {{ remediation_attempted_nums
+         + ([task_check_num | int] if ((task_changed | default(false) | bool) and ((task_check_num | default(0) | int) > 0)) else []) }}
+    preval_autofix_items: >-
+      {{ preval_autofix_items + ([task_autofix] if ((task_status == 'AUTO-FIXED') and (task_autofix is defined)) else []) }}
+
+# Why: the row just recorded holds the one-line text; the tasks below reuse it.
+- name: "Task {{ task_num }} ({{ task_name }}): Log it"
+  include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
+  vars:
+    event_status: "{{ 'AUTO-FIX' if task_status == 'AUTO-FIXED' else task_status }}"
+    event_task: "Phase 03 task {{ task_num }}: {{ task_name }}"
+    event_reason: "{{ preimpl_tasks[-1].observed }}"
+
+- name: "Task {{ task_num }} ({{ task_name }}): Result"
+  debug:
+    msg: "[{{ task_status }}] Phase 03 task {{ task_num }} - {{ task_name }}: {{ preimpl_tasks[-1].observed }}"
+
+- name: "Task {{ task_num }} ({{ task_name }}): Stop - the change did not work"
+  fail:
+    msg: >-
+      Phase 03 task {{ task_num }} ({{ task_name }}) on '{{ cluster_name }}' [{{ task_status }}]:
+      {{ preimpl_tasks[-1].observed }}. No hop was started.
+  when: task_status in ['FAIL', 'FIX-FAILED']

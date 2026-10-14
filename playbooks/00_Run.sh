@@ -13,10 +13,13 @@
 #   7. exits with the code the playbook wrote (see --help)
 #
 # Run modes:
-#   upgrade     (default) the full upgrade: phases 01, 02, 03 (+04), 05, 06
+#   upgrade     (default) the full upgrade: phases 01, 02, 03, 04, 06, 07
+#               (05 watches the node rollouts of 03 and every hop of 04)
 #   dry-run     the same steps, read-only - nothing on the cluster is changed
-#   pre-check   phases 01 and 02 only, auto-fixes included (nodes may reboot)
-#   post-check  phase 05 only, against the version the cluster is on now
+#   pre-check   phases 01-03: prechecks and the pre-upgrade changes (unpausing
+#               pools, cgroup v2 - nodes may reboot, operator upgrades, admin-ack),
+#               no cluster update
+#   post-check  phase 06 only, against the version the cluster is on now
 # To resume after a failure, run the same command again: hops already done are skipped.
 # ============================================================================
 set -euo pipefail
@@ -31,8 +34,9 @@ Usage: ./00_Run.sh [options]
   -c, --cluster NAME     cluster from vars/secrets.yml (asked if not given)
   -p, --path X.Y.Z,...   upgrade path, e.g. 4.15.35,4.16.18 (default: cluster_upgrade_paths in vars/upgrade.yml)
   -d, --dry-run          read-only run of every phase; nothing on the cluster is changed
-      --pre-check        phases 01-02 only (auto-fixes can reboot nodes), no upgrade
-      --post-check       phase 05 only, against the current cluster version
+      --pre-check        phases 01-03 only: prechecks and the pre-upgrade changes
+                         (cgroup v2 / unpausing pools can reboot nodes), no upgrade
+      --post-check       phase 06 only, against the current cluster version
   -y, --yes              do not ask for confirmation (PROD changes still need UPGRADE typed)
   -r, --resume           accepted for habit; every run resumes on its own (finished hops are skipped)
   -m, --mail-to LIST     send the summary/heartbeat mails to these addresses (comma-separated);
@@ -42,9 +46,9 @@ Usage: ./00_Run.sh [options]
 
 Exit codes:
   0 success   1 bad option, missing tool or cluster already locked   2 cancelled
-  5 login or Phase 01 (path)   10 Phase 02 (prechecks)   20 hop failed
-  30 hop stopped progressing / timed out   25 Phase 05 (postchecks)   35 Phase 06 (operators)
-  99 other error
+  5 login or Phase 01 (path)   10 Phase 02 (prechecks)   15 Phase 03 (pre-upgrade changes)
+  20 hop failed (Phase 04)   30 hop stopped progressing / timed out (Phase 05)
+  25 Phase 06 (postchecks)   35 Phase 07 (operators)   99 other error
 
 Examples:
   ./00_Run.sh
@@ -154,8 +158,8 @@ HOPS="$(tr -d ' ' <<< "$HOPS")"
 # 4. Show what will happen and confirm
 # ----------------------------------------------------------------------------
 case "$MODE" in
-    upgrade)    CHANGES="YES - auto-fixes (nodes may reboot), channel + admin-ack + update per hop, operator approvals, Developer perspective" ;;
-    pre-check)  CHANGES="MAYBE - auto-fixes (cgroup v2, unpausing pools) reboot nodes" ;;
+    upgrade)    CHANGES="YES - pre-upgrade changes (unpause pools, cgroup v2 - nodes may reboot, operator approvals, admin-ack), channel + admin-ack + update per hop, operator approvals, Developer perspective" ;;
+    pre-check)  CHANGES="MAYBE - only what is needed: unpause pools, cgroup v2 (nodes reboot), pending operator approvals, admin-ack; no cluster update" ;;
     *)          CHANGES="no - read-only" ;;
 esac
 echo

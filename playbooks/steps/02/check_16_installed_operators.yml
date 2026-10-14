@@ -8,7 +8,7 @@
 #   - CSV phase: anything other than Succeeded (Failed, Installing, Missing ...)
 #   - subscription problems: ResolutionFailed, CatalogSourcesUnhealthy,
 #     InstallPlanFailed, InstallPlanMissing, BundleUnpackFailed
-#   - its own OperatorCondition Upgradeable=False (OLM will not upgrade it in Phase 06)
+#   - its own OperatorCondition Upgradeable=False (OLM will not upgrade it in Phase 03 or 07)
 #   - a channel made for the target minor that the subscription is not on yet
 # Any of these makes the check WARN: it is reported, the run continues.
 # Operators that block the cluster upgrade itself are Check 15 (HARD).

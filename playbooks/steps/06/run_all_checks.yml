@@ -1,6 +1,6 @@
 ---
 # ============================================================================
-# steps/05/run_all_checks.yml - run the 10 postchecks in order
+# steps/06/run_all_checks.yml - run the 10 postchecks in order
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
@@ -18,25 +18,25 @@
     postval_checks: []
 
 - name: "Postcheck 01 - ClusterVersion"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_01_cluster_version.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_01_cluster_version.yml"
 - name: "Postcheck 02 - ClusterOperators"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_02_cluster_operators.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_02_cluster_operators.yml"
 - name: "Postcheck 03 - MachineConfigPools"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_03_machine_config_pools.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_03_machine_config_pools.yml"
 - name: "Postcheck 04 - Nodes and kubelet version"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_04_nodes.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_04_nodes.yml"
 - name: "Postcheck 05 - Node pressure"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_05_node_pressure.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_05_node_pressure.yml"
 - name: "Postcheck 06 - etcd"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_06_etcd.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_06_etcd.yml"
 - name: "Postcheck 07 - PersistentVolumes"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_07_persistent_volumes.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_07_persistent_volumes.yml"
 - name: "Postcheck 08 - Platform pods"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_08_platform_pods.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_08_platform_pods.yml"
 - name: "Postcheck 09 - Critical alerts"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_09_critical_alerts.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_09_critical_alerts.yml"
 - name: "Postcheck 10 - Baseline diff"
-  include_tasks: "{{ playbook_dir }}/steps/05/check_10_baseline_diff.yml"
+  include_tasks: "{{ playbook_dir }}/steps/06/check_10_baseline_diff.yml"
 
 - name: "Postchecks: Results"
   debug:

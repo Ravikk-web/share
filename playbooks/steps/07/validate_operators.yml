@@ -1,6 +1,6 @@
 ---
 # ============================================================================
-# steps/06/validate_operators.yml - judge operator health after the approvals
+# steps/07/validate_operators.yml - judge operator health after the approvals
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
@@ -8,9 +8,9 @@
 # One row per Subscription in `operators` (for the report) plus four checks:
 #   01 Approved operator upgrades      HARD  every operator approved in this run is on
 #                                            its new CSV and Succeeded
-#   02 Operator health regressions     HARD  no CSV that was Succeeded before Phase 06
+#   02 Operator health regressions     HARD  no CSV that was Succeeded before Phase 07
 #                                            is now in another phase
-#   03 Operators already unhealthy     WARN  not Succeeded before Phase 06 either
+#   03 Operators already unhealthy     WARN  not Succeeded before Phase 07 either
 #   04 Pending upgrades not approved   WARN  stale / unreferenced InstallPlans, or
 #                                            pending upgrades in a dry run
 # Outputs: operators, operator_checks, operator_validate_status, operator_summary_text
@@ -63,11 +63,11 @@
       {%- elif (before | length > 0) and before[0].phase == 'Succeeded' -%}
       {%- set status = 'FAIL' -%}
       {%- set kind = 'regression' -%}
-      {%- set detail = s.installed_csv ~ ' was Succeeded before Phase 06 and is now ' ~ phase -%}
+      {%- set detail = s.installed_csv ~ ' was Succeeded before Phase 07 and is now ' ~ phase -%}
       {%- else -%}
       {%- set status = 'WARN' -%}
       {%- set kind = 'preexisting' -%}
-      {%- set detail = (s.installed_csv or 'no installed CSV') ~ ' is ' ~ phase ~ ' (not Succeeded before Phase 06 either)' -%}
+      {%- set detail = (s.installed_csv or 'no installed CSV') ~ ' is ' ~ phase ~ ' (not Succeeded before Phase 07 either)' -%}
       {%- endif -%}
       {%- set _ = rows.append({'subscription': s.name, 'package': s.package, 'namespace': s.namespace,
             'installed_csv': s.installed_csv or 'None', 'target_channel': s.channel, 'installplan_approval': s.approval,
@@ -96,11 +96,11 @@
         gate: "HARD"
         status: "{{ 'FAIL' if (operators | selectattr('kind', 'equalto', 'regression') | list | length > 0) else 'PASS' }}"
         observed: >-
-          {{ ('No operator became unhealthy during Phase 06')
+          {{ ('No operator became unhealthy during Phase 07')
              if (operators | selectattr('kind', 'equalto', 'regression') | list | length == 0)
              else ('No longer Succeeded: ' ~ (operators | selectattr('kind', 'equalto', 'regression') | map(attribute='details') | join('; '))) }}
       - num: 3
-        name: "Operators already unhealthy before Phase 06"
+        name: "Operators already unhealthy before Phase 07"
         gate: "WARN"
         status: "{{ 'WARN' if (operators | selectattr('kind', 'equalto', 'preexisting') | list | length > 0) else 'PASS' }}"
         observed: >-

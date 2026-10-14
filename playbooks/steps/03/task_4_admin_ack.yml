@@ -1,0 +1,72 @@
+---
+# ============================================================================
+# steps/03/task_4_admin_ack.yml - Phase 03 task 4: removed-API check and admin-ack
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Check:   for every minor hop of the path, no workload still calls an API that the
+#          hop removes (APIRequestCount), and which openshift-config-managed/admin-gates
+#          keys for the minor the cluster is on are not set in openshift-config/admin-acks.
+# Change:  set those keys to "true" (auto_apply_admin_acks, not in a dry run), then wait
+#          for ClusterVersion Upgradeable=True when the first hop is a minor hop.
+#          steps/03/admin_ack.yml does the work and stops the run itself when removed
+#          APIs are still in use, when a key is needed but auto_apply_admin_acks is
+#          false, or when Upgradeable stays False.
+# Later minor hops: OpenShift publishes a hop's key only once the cluster is on that
+#          minor, so steps/04/start_hop.yml runs the same step right before each minor
+#          hop (nothing to do when no key is pending).
+# Watch:   an admin-ack changes no MachineConfig; the rollout check still runs after a
+#          change, like after every Phase 03 change, so that no rollout goes unwatched.
+# Records: one row in preimpl_tasks (Precheck 07 is re-checked after a change).
+# Cluster write: openshift-config/admin-acks key(s).
+# ============================================================================
+
+- name: "Task 4: Start"
+  set_fact:
+    preimpl_current_task: {num: 4, name: "Admin-ack"}
+
+- name: "Task 4: Removed-API check and admin-ack (a dry run only evaluates)"
+  include_tasks: "{{ playbook_dir }}/steps/03/admin_ack.yml"
+  vars:
+    admin_ack_mode: "{{ 'evaluate' if (dry_run | bool) else 'apply' }}"
+    admin_ack_versions: "{{ upgrade_path }}"
+    admin_ack_label: "the upgrade (Phase 03)"
+
+- name: "Task 4: Remember what was set"
+  set_fact:
+    t4_set: "{{ [] if (dry_run | bool) else admin_ack_required_keys }}"
+
+- name: "Task 4: Watch for a node rollout after the change"
+  include_tasks: "{{ playbook_dir }}/steps/03/watch_rollout.yml"
+  vars:
+    rollout_task: "Admin-ack"
+    rollout_expected: false
+  when: t4_set | length > 0
+
+- name: "Task 4: Record the result"
+  include_tasks: "{{ playbook_dir }}/steps/03/record_task.yml"
+  vars:
+    task_num: 4
+    task_name: "Admin-ack"
+    task_check_num: 7
+    task_changed: "{{ t4_set | length > 0 }}"
+    task_status: >-
+      {%- if not (admin_ack_minor_hop | bool) -%}PASS
+      {%- elif dry_run | bool -%}{{ 'FAIL' if (admin_ack_check_status | trim) == 'FAIL' else ('WARN' if ((admin_ack_required_keys | length > 0) or ((admin_ack_check_status | trim) == 'WARN')) else 'PASS') }}
+      {%- elif t4_set | length > 0 -%}AUTO-FIXED
+      {%- else -%}PASS
+      {%- endif -%}
+    task_observed: >-
+      {%- if not (admin_ack_minor_hop | bool) -%}
+      No minor-version hop left in the path; no admin-ack needed.
+      {%- elif dry_run | bool -%}
+      Dry run: {{ ('would set ' ~ (admin_ack_required_keys | join(', ')) ~ ' in openshift-config/admin-acks. ') if (admin_ack_required_keys | length > 0) else 'no admin-ack pending for ' ~ admin_ack_current_minor ~ '. ' }}{{ admin_ack_check_observed | trim }}
+      {%- elif t4_set | length > 0 -%}
+      Set {{ t4_set | join(', ') }} in openshift-config/admin-acks for the {{ admin_ack_current_minor }} minor hop;
+      {{ 'ClusterVersion is Upgradeable=True' if (admin_ack_first_hop_is_minor | bool) else 'Upgradeable is checked again right before the minor hop' }}.
+      Removed-API check: {{ api_usage_summary }}. {{ rollout_result | default('') }}.
+      {%- else -%}
+      No admin-ack pending for {{ admin_ack_current_minor }}. Removed-API check: {{ api_usage_summary }}.
+      {%- endif %}
+      {{ 'An admin-ack a later minor hop needs is applied right before that hop.' if (admin_ack_minor_hop | bool) else '' }}

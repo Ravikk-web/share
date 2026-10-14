@@ -5,7 +5,7 @@
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 #
-# Used by: main.yml (start of every run) and steps/04/poll.yml (expired token).
+# Used by: main.yml (start of every run) and steps/05/poll.yml (expired token).
 # Writes:  the run's own kubeconfig (kubeconfig_path), never ~/.kube/config.
 # Why:     - the password goes to `oc login` on stdin, so it never appears in the
 #            jump server's process list;

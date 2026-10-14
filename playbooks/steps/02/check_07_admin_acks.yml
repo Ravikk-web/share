@@ -3,8 +3,10 @@
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 # Rule: no workload still calls an API that a minor hop of the path removes.
-#       Admin-ack keys still needed are listed here; Phase 03 applies them right
-#       before each minor hop (steps/03/admin_ack.yml, the same step in apply mode).
+#       Admin-ack keys still needed are listed here. Phase 03 task 4 applies them
+#       (steps/03/admin_ack.yml, the same step in apply mode); a later minor hop's key
+#       only appears once the cluster is on that minor, so Phase 04 runs the same step
+#       again right before each minor hop.
 
 - name: "Check 07: Evaluate admin-acks and removed-API usage for the whole path"
   include_tasks: "{{ playbook_dir }}/steps/03/admin_ack.yml"

@@ -6,8 +6,9 @@
 # MIGRATION 2.14: No changes needed.
 #
 # Used by: main.yml `rescue:` - any failed task in any phase lands here.
-# Does:    1. works out what failed (error text, phase, exit code, RBAC hint)
-#          2. records it in the phase results and the run log
+# Does:    1. works out what failed (error text, phase and Phase 03 task or hop,
+#             exit code, RBAC hint)
+#          2. records it in the phase, Phase 03 task and hop results and the run log
 #          3. writes logs/<cluster>_<ts>.status (00_Run.sh turns it into the exit code)
 #          4. writes the run report
 #          5. sends ONE alert mail
@@ -27,8 +28,12 @@
     failure_exit_code: "{{ failure_exit_code | default(phase_exit_codes[current_phase] | default(99), true) | int }}"
     failure_reason: >-
       {{ (current_hop_label ~ ' -> ' ~ current_hop_target ~ ' failed')
-         if (current_phase == '03' and (current_hop_target | default('') | length > 0))
+         if (current_phase == '04' and (current_hop_target | default('') | length > 0))
+         else ((phase_names[current_phase] | default(current_phase)) ~ ' task ' ~ _task.num ~ ' (' ~ _task.name ~ ') failed')
+         if (current_phase == '03' and (_task.num is defined))
          else (phase_names[current_phase] | default(current_phase)) ~ ' failed' }}
+  vars:
+    _task: "{{ preimpl_current_task | default({}) }}"
 
 # Why: Kubernetes denials read "... cannot <verb> resource "<resource>" in API group "<group>" ...".
 - name: "Failure: Check whether it was a permission problem"
@@ -44,21 +49,35 @@
     current_step_no: "{{ 'Login' if current_phase == 'login' else ('Phase ' ~ current_phase) }}"
     failed_task_name: >-
       {{ (current_hop_label ~ ' -> ' ~ current_hop_target)
-         if (current_phase == '03' and (current_hop_target | default('') | length > 0))
+         if (current_phase == '04' and (current_hop_target | default('') | length > 0))
+         else ((phase_names[current_phase] | default(current_phase)) ~ ' - task ' ~ _task.num ~ ' ' ~ _task.name)
+         if (current_phase == '03' and (_task.num is defined))
          else (phase_names[current_phase] | default(current_phase)) }}
     failed_gate_type: "HARD"
     rbac_check_command: >-
       oc auth can-i {{ rbac_missing_verb or '*' }} {{ (rbac_missing_resource or '*') ~ (('.' ~ rbac_missing_group) if (rbac_missing_group | length > 0) else '') }} --all-namespaces
     rbac_remediation_cmd: "oc adm policy add-cluster-role-to-user cluster-admin {{ cluster_username | default('<npid>', true) }}"
+  vars:
+    _task: "{{ preimpl_current_task | default({}) }}"
 
-- name: "Failure: Record it in the phase and hop results"
+# Why: a Phase 03 task that stopped part-way (for example while its node rollout was
+#      watched) has no row yet; it gets a FAIL row so the report shows where it stopped.
+- name: "Failure: Record it in the phase, task and hop results"
   set_fact:
     run_phase_results: >-
       {{ run_phase_results + [{'phase': current_phase, 'name': phase_names[current_phase] | default(current_phase),
                                'status': 'FAIL', 'detail': resolved_error | regex_replace('[\r\n]+', ' ') | truncate(300)}] }}
     hop_results: >-
       {{ hop_results + ([{'hop_label': current_hop_label, 'target': current_hop_target, 'status': 'FAILED', 'duration': ''}]
-                        if (current_phase == '03' and (current_hop_target | default('') | length > 0)) else []) }}
+                        if (current_phase == '04' and (current_hop_target | default('') | length > 0)) else []) }}
+    preimpl_tasks: >-
+      {{ preimpl_tasks | default([]) + ([{'num': _task.num | int, 'name': _task.name, 'status': 'FAIL',
+                                           'observed': resolved_error | regex_replace('[\r\n]+', ' ') | truncate(300)}]
+                                         if (current_phase == '03' and (_task.num is defined)
+                                             and (preimpl_tasks | default([]) | selectattr('num', 'equalto', _task.num | int) | list | length == 0))
+                                         else []) }}
+  vars:
+    _task: "{{ preimpl_current_task | default({}) }}"
 
 - name: "Failure: Log it"
   include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"

@@ -1,6 +1,6 @@
 ---
 # ============================================================================
-# steps/06/developer_console.yml - make sure the Developer perspective is enabled
+# steps/07/developer_console.yml - make sure the Developer perspective is enabled
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.

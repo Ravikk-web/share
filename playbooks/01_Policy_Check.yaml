@@ -6,7 +6,7 @@
 # MIGRATION 2.14: No changes needed.
 #
 # Read-only. Steps:
-#   1. Save a baseline snapshot of the cluster (Phase 05 compares against it).
+#   1. Save a baseline snapshot of the cluster (Phase 06 compares against it).
 #   2. Validate the whole upgrade path before anything changes:
 #      - hops the cluster already reached are skipped (so a re-run resumes),
 #      - an update already running to the next hop is watched, not restarted,

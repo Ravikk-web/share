@@ -1,0 +1,126 @@
+---
+# ============================================================================
+# steps/03/task_1_unpause_pools.yml - Phase 03 task 1: unpause allow-listed pools
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Check:   paused MachineConfigPools. A paused pool takes no new configuration, so it
+#          would miss the cgroup change of task 2 and the node part of every hop.
+# Change:  spec.paused=false for paused pools on mcp_auto_unpause_list
+#          (auto_unpause_mcp, auto_remediation_enabled, not in a dry run). Paused pools
+#          that are not on the list are left alone (Precheck 03 stops the run for them).
+# Watch:   a pool whose configuration was held back starts rolling at once and is
+#          watched to the end; otherwise steps/03/watch_rollout.yml looks briefly.
+# Verify:  every unpaused pool reads spec.paused=false, Updated=True, not Degraded.
+# Records: one row in preimpl_tasks (Precheck 03 is re-checked afterwards).
+# Cluster write: MachineConfigPool spec.paused=false.
+# ============================================================================
+
+- name: "Task 1: Start"
+  set_fact:
+    preimpl_current_task: {num: 1, name: "MachineConfigPools"}
+
+- name: "Task 1: Read the paused MachineConfigPools"
+  shell: |
+    set -o pipefail
+    oc get mcp -o json | jq -c '[.items[] | select((.spec.paused // false) == true) | {
+      name: .metadata.name,
+      held_back: (((.spec.configuration.name // "") != (.status.configuration.name // ""))
+                  or ((.status.updatedMachineCount // 0) < (.status.machineCount // 0)))}]'
+  args:
+    executable: /bin/bash
+  register: t1_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: t1_raw.rc == 0
+
+- name: "Task 1: Decide what to unpause"
+  set_fact:
+    t1_paused: "{{ _paused | map(attribute='name') | list }}"
+    t1_to_unpause: "{{ _paused | map(attribute='name') | list | intersect(mcp_auto_unpause_list | default([])) }}"
+    t1_held_back: >-
+      {%- set out = [] -%}
+      {%- for p in _paused if (p.name in (mcp_auto_unpause_list | default([]))) and (p.held_back | bool) -%}{%- set _ = out.append(p.name) -%}{%- endfor -%}
+      {{ out }}
+    t1_enabled: "{{ (auto_remediation_enabled | default(true) | bool) and (auto_unpause_mcp | default(true) | bool) }}"
+  vars:
+    _paused: "{{ t1_raw.stdout | from_json }}"
+
+- name: "Task 1: Unpause {{ item }}"
+  command: "oc patch mcp {{ item | quote }} --type=merge -p '{\"spec\":{\"paused\":false}}'"
+  loop: "{{ t1_to_unpause }}"
+  register: t1_patch
+  changed_when: t1_patch.rc == 0
+  failed_when: false
+  when:
+    - t1_enabled | bool
+    - not (dry_run | bool)
+
+- name: "Task 1: Remember what was unpaused"
+  set_fact:
+    t1_unpaused: "{{ t1_patch.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+    t1_patch_errors: "{{ t1_patch.results | default([]) | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | map(attribute='stderr') | list }}"
+
+# Why: a pool whose configuration was held back while it was paused always rolls out.
+- name: "Task 1: Watch the node rollout of the unpaused pools"
+  include_tasks: "{{ playbook_dir }}/steps/03/watch_rollout.yml"
+  vars:
+    rollout_task: "Unpause MachineConfigPools"
+    rollout_expected: "{{ t1_held_back | intersect(t1_unpaused) | length > 0 }}"
+  when: t1_unpaused | length > 0
+
+- name: "Task 1: Check the unpaused pools"
+  shell: |
+    set -o pipefail
+    oc get mcp -o json | jq -c --argjson names {{ t1_unpaused | to_json | quote }} '
+      def cstat(t): ([(.status.conditions // [])[] | select(.type == t) | .status] | .[0]) // "Unknown";
+      [ .items[] | select(.metadata.name as $n | ($names | map(. == $n) | any))
+        | select(((.spec.paused // false) == true) or (cstat("Updated") != "True") or (cstat("Degraded") == "True"))
+        | "\(.metadata.name) (paused=\(.spec.paused // false), Updated=\(cstat("Updated")), Degraded=\(cstat("Degraded")))" ]'
+  args:
+    executable: /bin/bash
+  register: t1_verify_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: t1_verify_raw.rc == 0
+  when: t1_unpaused | length > 0
+
+- name: "Task 1: Record the result"
+  include_tasks: "{{ playbook_dir }}/steps/03/record_task.yml"
+  vars:
+    task_num: 1
+    task_name: "MachineConfigPools"
+    task_check_num: 3
+    task_changed: "{{ t1_unpaused | length > 0 }}"
+    _t1_bad: "{{ (t1_verify_raw.stdout | default('[]', true)) | from_json }}"
+    _t1_left: "{{ t1_paused | difference(t1_to_unpause) }}"
+    task_status: >-
+      {%- if t1_paused | length == 0 -%}PASS
+      {%- elif t1_to_unpause | length == 0 -%}WARN
+      {%- elif not (t1_enabled | bool) -%}SKIPPED
+      {%- elif dry_run | bool -%}WARN
+      {%- elif (t1_unpaused | length == t1_to_unpause | length) and (_t1_bad | length == 0) -%}AUTO-FIXED
+      {%- else -%}FIX-FAILED
+      {%- endif -%}
+    task_observed: >-
+      {%- if t1_paused | length == 0 -%}
+      No MachineConfigPool is paused.
+      {%- elif t1_to_unpause | length == 0 -%}
+      Paused and not on mcp_auto_unpause_list, left alone: {{ t1_paused | join(', ') }}.
+      {%- elif not (t1_enabled | bool) -%}
+      Paused: {{ t1_to_unpause | join(', ') }}; not changed because {{ 'auto_remediation_enabled' if not (auto_remediation_enabled | default(true) | bool) else 'auto_unpause_mcp' }} is false.
+      {%- elif dry_run | bool -%}
+      Dry run: would unpause {{ t1_to_unpause | join(', ') }}{{ (' (configuration held back on ' ~ (t1_held_back | join(', ')) ~ ': their nodes reboot)') if (t1_held_back | length > 0) else '' }}.
+      {%- else -%}
+      Unpaused {{ t1_unpaused | join(', ') or 'none' }}{{ ('; ' ~ (rollout_result | default(''))) if (t1_unpaused | length > 0) else '' }}.
+      {{ ('Still paused or not updated: ' ~ (_t1_bad | join('; ')) ~ '.') if (_t1_bad | length > 0) else '' }}
+      {{ ('Patch errors: ' ~ (t1_patch_errors | join('; ') | truncate(300)) ~ '.') if (t1_patch_errors | length > 0) else '' }}
+      {{ ('Left paused (not on mcp_auto_unpause_list): ' ~ (_t1_left | join(', ')) ~ '.') if (_t1_left | length > 0) else '' }}
+      {%- endif -%}
+    task_autofix:
+      name: "Unpaused MachineConfigPools ({{ t1_unpaused | join(', ') }})"
+      action: "Set spec.paused=false on {{ t1_unpaused | join(', ') }}; {{ rollout_result | default('') }}."
+      reference: "https://docs.openshift.com/container-platform/latest/post_installation_configuration/machine-configuration-tasks.html"

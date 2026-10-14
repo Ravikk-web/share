@@ -1,12 +1,13 @@
 ---
 # ============================================================================
-# Phase 04 - Watch the cluster until it settles
+# Phase 05 - Watch the cluster until it settles
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 #
-# Included by steps/03/hop.yml (each hop) and by Phase 02 (node rollout after an
-# auto-fix). Inputs (include vars):
+# Never runs on its own. Included by steps/04/hop.yml (each hop) and by
+# steps/03/watch_rollout.yml (a node rollout started by a Phase 03 change).
+# Inputs (include vars):
 #   watch_mode     hop     - the cluster must reach watch_version
 #                  rollout - only pools and operators must settle
 #   watch_version  target version (hop mode)
@@ -24,7 +25,7 @@
 # reports Failing for cv_failing_fail_minutes.
 # ============================================================================
 
-- name: "Phase 04: Start watching {{ watch_label }}"
+- name: "Phase 05: Start watching {{ watch_label }}"
   set_fact:
     monitor_mode: "{{ watch_mode }}"
     monitor_target: "{{ watch_version }}"
@@ -57,7 +58,7 @@
              and ((lookup('pipe', 'date +%s') | int) - (last_heartbeat_epoch | int)) < ((heartbeat_minutes | default(20) | int) * 60))
          else (lookup('pipe', 'date +%s') | int) }}
 
-- name: "Phase 04: Watching {{ watch_label }}"
+- name: "Phase 05: Watching {{ watch_label }}"
   debug:
     msg: >-
       Watching {{ monitor_label }}{{ (' -> ' ~ monitor_target) if monitor_mode == 'hop' else '' }}: poll every
@@ -67,28 +68,28 @@
 # Why: Ansible cannot break out of a loop, so each iteration file runs the poll only
 #      while the cluster is not settled and nothing has aborted. After the cluster
 #      settles, the remaining iterations are one skipped task each.
-- name: "Phase 04: Poll until settled"
-  include_tasks: "{{ playbook_dir }}/steps/04/poll_if_needed.yml"
+- name: "Phase 05: Poll until settled"
+  include_tasks: "{{ playbook_dir }}/steps/05/poll_if_needed.yml"
   loop: "{{ range(1, (monitor_max_polls | int) + 1) | list }}"
   loop_control:
     loop_var: poll_number
 
-- name: "Phase 04: How long it took"
+- name: "Phase 05: How long it took"
   set_fact:
     monitor_elapsed: >-
       {%- set s = (lookup('pipe', 'date +%s') | int) - (monitor_start_epoch | int) -%}
       {{ '%02d:%02d:%02d' | format(s // 3600, (s % 3600) // 60, s % 60) }}
 
 # Why: a hop that stops progressing or times out exits with 30, any other hop
-#      failure with 20 (Phase 02 rollout failures keep Phase 02's code).
-- name: "Phase 04: Set the exit code for a failed hop"
+#      failure with 20 (a Phase 03 rollout that fails keeps Phase 03's code, 15).
+- name: "Phase 05: Set the exit code for a failed hop"
   set_fact:
     failure_exit_code: "{{ (monitor_abort_code | int) if (monitor_abort | bool) else 30 }}"
   when:
     - (monitor_abort | bool) or not (monitor_settled | bool)
     - monitor_mode == 'hop'
 
-- name: "Phase 04: Stop - {{ watch_label }} did not settle"
+- name: "Phase 05: Stop - {{ watch_label }} did not settle"
   fail:
     msg: >-
       {{ monitor_label }}{{ (' -> ' ~ monitor_target) if monitor_mode == 'hop' else '' }} on '{{ cluster_name }}':
@@ -96,13 +97,13 @@
       (after {{ monitor_elapsed }}; cluster at {{ (poll_cv | default({})).latest | default('unknown') }}).
   when: (monitor_abort | bool) or not (monitor_settled | bool)
 
-- name: "Phase 04: Settled"
+- name: "Phase 05: Settled"
   debug:
     msg: >-
       SETTLED: {{ monitor_label }}{{ (' at ' ~ monitor_target) if monitor_mode == 'hop' else '' }} after {{ monitor_elapsed }}
       - ClusterVersion Available and not Progressing, operators settled, every unpaused pool updated.
 
-- name: "Phase 04: Log it"
+- name: "Phase 05: Log it"
   include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
   vars:
     event_status: "PASS"

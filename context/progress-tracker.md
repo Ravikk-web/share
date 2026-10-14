@@ -5,10 +5,10 @@ Update this file after **every meaningful implementation change**.
 ---
 
 ## Current Phase
-- **Phase 4 - Simplification (one flow)** (2026-10-13)
+- **Phase 5 - Pre-upgrade implementation phase** (2026-10-14)
 
 ## Current Goal
-- The workflow is simplified to one flow (`00_Run.sh -> main.yml -> 01..06`, one failure handler) and verified offline. Next: jump-host validation (see Next Up). Nothing committed - the user commits when ready.
+- New Phase 03 (`03_Pre_upgrade_Implementation.yaml`) makes every pre-upgrade change with a rollout watch after each; phases renumbered to 01..07 (`00_Run.sh -> main.yml -> 01..07`, one failure handler). Verified offline. Next: jump-host validation (see Next Up). Nothing committed - the user commits when ready.
 
 ---
 
@@ -385,20 +385,25 @@ During v1 development and testing, 20+ critical operational and syntax issues we
 
 ## Next Up
 1. Jump host, in order: `ansible-playbook --syntax-check main.yml` on Ansible 2.7.17 and 2.14.18; `ansible-doc -t module mail` (community.general on 2.14); `jq --version`; `curl` reaches `upgrade_graph_url`.
-2. `./00_Run.sh --cluster <dev> --dry-run`, then `--pre-check`, then a one-hop DEV upgrade (watch the heartbeat / degradation mails and the admin-ack step).
-3. Non-production multi-hop soak; SRE handover; CAB.
+2. `./00_Run.sh --cluster <dev> --dry-run`, then `--pre-check` (Phase 03 changes: watch the rollout mails, the operator approvals and the admin-ack), then a one-hop DEV upgrade.
+3. While testing, phases can be commented out in `main.yml` (and single tasks in `03_Pre_upgrade_Implementation.yaml`); each reads what it needs from the cluster.
+4. Non-production multi-hop soak; SRE handover; CAB.
 
 ## Architecture Decisions (Locked)
-1. **One flow**: `00_Run.sh -> main.yml` (one play, one block / rescue / always) -> phase files `01..06` -> `steps/<phase>/`. No roles, no single-phase entry points. Run modes: upgrade, dry-run, pre-check, post-check (`mode_phases` in `main.yml`).
+1. **One flow**: `00_Run.sh -> main.yml` (one play, one block / rescue / always) -> phase files `01..07` -> `steps/<phase>/`. No roles, no single-phase entry points. Run modes: upgrade (01 02 03 04 06 07), dry-run (same, read-only), pre-check (01 02 03), post-check (06) via `mode_phases` in `main.yml`. Phase 05 (monitoring) is included by 03 and 04.
 2. **One failure handler** (`steps/common/handle_failure.yml`): report, `.status` exit code, one alert; `always:` logs out.
 3. **Checks only record; phases gate.** 16 prechecks (Check 16 installed operator health, WARN), 10 postchecks.
-4. **Auto-fixes** (Phase 02, never in dry run): cgroup v2, unpause allow-listed pools; rollout watched; full re-check decides AUTO-FIXED / FIX-FAILED. Admin-ack per minor hop after the removed-API check. One restart of a Failed approved operator (Phase 06).
+4. **Pre-upgrade changes only in Phase 03** (decided 2026-10-14; never in dry run): unpause allow-listed pools, cgroup v2, approve every pending operator upgrade (stop if an operator still blocks the target; channels are never changed), admin-ack after the removed-API check. Each task: check -> change -> watch rollout -> verify -> stop on FIX-FAILED. Full re-check decides AUTO-FIXED / FIX-FAILED. Phase 02 is read-only and leaves fixable problems to Phase 03 as WARN. A later minor hop's admin-ack is applied right before that hop (its key only appears on that minor). One restart of a Failed approved operator (Phases 03 and 07). Exit code 15 for Phase 03.
 5. **Mails**: heartbeat + degradation during updates, then one summary or one alert; lists `mail_to` / `alert_mail_to`; switch `send_email`.
 6. **One report per run** (`templates/report.j2`).
 7. **No AI in runtime**; Ansible 2.7.17 / 2.14.18 single codebase; flock lock per cluster; snapshot is the only saved state.
 8. **Removed on request (2026-10-13)**: single-phase / skip-to / stop-after runs, opt-in degraded-operator pod restart, opt-in machine-config-daemon force, forced-image upgrade, decorated CLI and `--clean`, prevalidation mail, per-type mail lists / switches, notification ledger.
 
 ---
+
+## Open Questions
+- Multi-step operator upgrade chains: Phase 03 approves the current InstallPlan once per run. If an operator needs two steps to reach a version that supports the target, the run stops and the next run approves the next step. A bounded multi-round approval could remove the re-run.
+- An operator that blocks a *later* hop but only gets a compatible version in the catalog of an intermediate minor still stops the run in Phase 02 (Check 15 compares with the highest hop), as before.
 
 ## Session Notes
 
@@ -632,3 +637,18 @@ During v1 development and testing, 20+ critical operational and syntax issues we
   Subject tags are back to COMPLETE / DRY-RUN / PRE-CHECK / POSTVALIDATION.
 - `00_Run.sh` empties `logs/` after taking the lock and before every run (any mode). Logs of a run still active on another cluster are kept; `output/` and `snapshots/` are untouched. `--resume` is accepted again (no-op) because the alert template tells people to use it.
 - Verified offline: all checks pass (0 problems); 35 behaviour tests with the restored templates rendered under strict undefined; cleanup loop tested on sample logs.
+
+### Session: Pre-upgrade implementation phase (2026-10-14)
+- **User request**: a new Phase 03 "Pre_upgrade_Implementation" for the pre-upgrade checks and changes, the old 03..06 shifted to 04..07; cgroup check + fix, installed-operator check + operator upgrade, admin-ack check + ack in Phase 03; every change that starts an MCP rollout is monitored before the next task. The user will comment out phases while testing.
+- **User decisions**: approve every pending operator upgrade in Phase 03 and stop if an operator still blocks the target (channels stay manual); admin-ack in Phase 03 plus again right before each later minor hop; `--pre-check` = 01-03.
+- **What changed**:
+  - Renamed (git mv): `03_Initiate_upgrade.yaml` -> `04_...`, `04_Live_monitoring_upgrade.yaml` -> `05_...`, `05_post_Upgrade_Checks.yaml` -> `06_...`, `06_Operator_Upgrade.yaml` -> `07_...`; `steps/03/hop.yml, start_hop.yml` -> `steps/04/`, `steps/04` -> `steps/05`, `steps/05` -> `steps/06`, `steps/06` -> `steps/07`; `steps/02/fix_*` -> `steps/03/task_1_unpause_pools.yml`, `task_2_cgroup_v2.yml`.
+  - New: `03_Pre_upgrade_Implementation.yaml`, `steps/03/task_3_operator_upgrades.yml`, `task_4_admin_ack.yml`, `watch_rollout.yml`, `record_task.yml`, `steps/02/read_operators.yml` (operator read shared by Check 15 and task 3).
+  - `main.yml`: phases 01..07, `mode_phases`, exit code 15, `target_max_version` computed once at start.
+  - Phase 02 read-only; Checks 03/14/15 defer fixable problems (`preval_defer_fixes`, `preval_deferred`).
+  - `admin_ack.yml`: `admin_ack_label` input, refuses apply mode in a dry run, waits for Upgradeable only when the next hop is a minor hop, records the phase of each ack.
+  - `handle_failure.yml`: Phase 03 task in the failure reason, FAIL row for a task stopped part-way, hop context is Phase 04.
+  - Report: new Phase 03 section, headings 04/06/07; alert note covers node rollouts; `00_Run.sh` help, exit codes and Changes line; `vars/upgrade.yml` Phase 03 section with `preupgrade_operator_upgrades` and `rollout_detect_seconds`.
+  - Docs: architecture, project overview, UI context, code standards, AI workflow rules, WORKFLOW.md, README, Documentation.md, AGENTS.md.
+- **Verified offline** (session scratchpad): 66 YAML files parse; 1000 templated strings parse with known filters/tests; every include exists; 82 jq programs compile (libjq) and pass the jq 1.5 scan; `bash -n` on 53 rendered shell blocks and `00_Run.sh`; 13 end-to-end scenarios running the real `main.yml` with a small Ansible emulator against a fake `oc` (MCO / OLM / CVO simulated) and fake `jq` (libjq).
+- **Not verified here**: Ansible itself and a real cluster - see Next Up.

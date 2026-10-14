@@ -1,11 +1,14 @@
 ---
 # ============================================================================
-# steps/06/approve_operators.yml - approve pending operator upgrades
+# steps/07/approve_operators.yml - approve pending operator upgrades
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 #
-# 1. Records every operator CSV phase before any approval (used to spot regressions).
+# Used by: Phase 03 task 3 (before the first hop) and Phase 07 (after the cluster
+#          upgrade); the log lines name the phase that ran it.
+# 1. Records every operator CSV phase before any approval (Phase 07 uses it to spot
+#    regressions).
 # 2. For each Subscription in state UpgradePending, approves ONLY the InstallPlan it
 #    points to (status.installPlanRef). Other unapproved plans are listed, never approved.
 # 3. Waits (bounded) for those CSVs to reach Succeeded. With operator_upgrade_auto_recover,
@@ -128,7 +131,7 @@
   include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
   vars:
     event_status: "INFO"
-    event_task: "Phase 06 InstallPlan approval"
+    event_task: "Phase {{ current_phase }} InstallPlan approval"
     event_reason: "Approved: {% for p in opu_to_approve %}{{ p.namespace }}/{{ p.name }} ({{ p.package }} -> {{ p.csv_names | join(', ') }}){% if not loop.last %}; {% endif %}{% endfor %}"
     event_observed: "Left untouched: {{ skipped_installplans | map(attribute='name') | join(', ') or 'none' }}"
   when:
@@ -194,7 +197,7 @@
   include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
   vars:
     event_status: "AUTO-FIX"
-    event_task: "Phase 06 operator recovery"
+    event_task: "Phase {{ current_phase }} operator recovery"
     event_reason: "Restarted the operator Deployments of Failed CSV(s): {{ recovered_csvs | join(', ') }}"
   when: recovered_csvs | length > 0
 

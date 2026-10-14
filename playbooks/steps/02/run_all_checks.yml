@@ -5,11 +5,17 @@
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 #
+# Used by: Phase 02, and by Phase 03 again after its changes.
 # Every check file reads the cluster and appends one record to preval_checks:
 #   {num, name, gate, status, observed}
 #   gate:   HARD (a FAIL stops the run) or WARN (reported only)
 #   status: PASS, WARN or FAIL
-# No check stops the run by itself; 02_Pre_upgrade_check.yaml applies the gate.
+# No check stops the run by itself; the calling phase applies the gate.
+# When preval_defer_fixes is true (Phase 02 of a run that includes Phase 03), Checks
+# 03, 14 and 15 record a problem Phase 03 will fix as WARN and add their number to
+# preval_deferred. Phase 03 re-runs the checks with preval_defer_fixes false.
+# The highest hop of the path (target_max_version, set in main.yml) decides what the
+# whole path needs (cgroup v2 for 4.19+, operator compatibility, API removals).
 #
 #   01 ClusterOperators          HARD     09 Pending CSRs               WARN
 #   02 Nodes                     HARD     10 PersistentVolumes          WARN
@@ -21,17 +27,10 @@
 #   08 Capacity headroom         HARD     16 Installed operator health  WARN
 # ============================================================================
 
-# Why: the highest hop decides what the whole path needs (cgroup v2 for 4.19+,
-#      operator compatibility, API removals).
 - name: "Prechecks: Start a fresh list"
   set_fact:
     preval_checks: []
-    preval_max_target_version: >-
-      {%- set best = [] -%}
-      {%- for v in upgrade_path if v is match('^[0-9]+[.][0-9]+[.][0-9]+$') -%}
-      {%- if (best | length == 0) or (v is version(best[-1], '>')) -%}{%- set _ = best.append(v) -%}{%- endif -%}
-      {%- endfor -%}
-      {{ best[-1] if (best | length > 0) else '' }}
+    preval_deferred: []
 
 - name: "Precheck 01 - ClusterOperators"
   include_tasks: "{{ playbook_dir }}/steps/02/check_01_cluster_operators.yml"

@@ -2241,3 +2241,69 @@ They remain in git history. `WORKFLOW.md` and `context/` are the current documen
 - The earlier mail templates (`email-summary.j2`, `progress-mail.j2`, `error-report.j2`) are back in use, unchanged; the code supplies the variable names they read.
 - `00_Run.sh` empties `logs/` before every run. It keeps logs of runs still active on other clusters, and never touches reports or snapshots.
 - `--resume` is accepted as a no-op.
+
+
+## Pre-upgrade implementation phase (2026-10-14)
+
+### Why
+All changes the cluster needs before the first hop now happen in one place, Phase 03, after the read-only prechecks have passed. Any node rollout a change starts is watched to the end before the next change, so the next change and the first hop never start on a cluster that is still rebooting nodes.
+
+### New phase layout
+| Phase | File | Notes |
+|---|---|---|
+| 01 | `01_Policy_Check.yaml` | unchanged |
+| 02 | `02_Pre_upgrade_check.yaml` | read-only now (fixes moved to 03) |
+| 03 | `03_Pre_upgrade_Implementation.yaml` | **new** |
+| 04 | `04_Initiate_upgrade.yaml` | was 03 |
+| 05 | `05_Live_monitoring_upgrade.yaml` | was 04; included by 03 (rollout mode) and 04 (hop mode) |
+| 06 | `06_post_Upgrade_Checks.yaml` | was 05 |
+| 07 | `07_Operator_Upgrade.yaml` | was 06 |
+
+Step folders follow the phases (`steps/03` Phase 03 tasks, `steps/04` hops, `steps/05` polls, `steps/06` postchecks, `steps/07` operators). Run modes: upgrade and dry-run run 01 02 03 04 06 07; pre-check runs 01 02 03; post-check runs 06.
+
+### Phase 03 tasks
+Every task: check -> change if needed -> watch the node rollout it started -> verify -> record one row -> stop the run if the change did not work.
+
+1. **MachineConfigPools** - unpause paused pools on `mcp_auto_unpause_list` (a paused pool would not take the cgroup change). Watched at once when the pool had configuration held back.
+2. **cgroup v2** - when a hop reaches 4.19+ and the cluster is on v1; every node reboots and the rollout is always watched.
+3. **Operator upgrades** - approve the current InstallPlan of every UpgradePending subscription (the same step Phase 07 uses), wait for Succeeded, then stop if an operator still blocks the target (`olm.maxOpenShiftVersion`) or OLM reports Upgradeable=False. Subscription channels are never changed: a blocking operator with nothing pending stops the run with that advice.
+4. **Admin-ack** - removed-API check (APIRequestCount) for the whole path, set the admin-gates keys for the current minor, wait for Upgradeable=True when the next hop is a minor hop. A later minor hop's key only appears once the cluster is on that minor, so `steps/04/start_hop.yml` runs the same step right before each minor hop.
+
+After a task that changed something, `steps/03/watch_rollout.yml` looks for a pool that starts updating (`rollout_detect_seconds`, default 120) and has Phase 05 watch it, with the usual heartbeat and degradation mails. If anything changed, all 16 prechecks run again; a check a task worked on becomes AUTO-FIXED (passes now) or FIX-FAILED (stops the run).
+
+Nothing is changed while a cluster update is already running (a re-run resuming a hop): every task is SKIPPED. A dry run reports what each task would change.
+
+### Phase 02 -> Phase 03 hand-off
+When Phase 03 is in the run and the fix is switched on, Checks 03 (paused allow-listed pools, none Degraded), 14 (cgroup v1 on a 4.19+ path) and 15 (every blocking operator has an upgrade pending) record WARN "Phase 03 will ..." instead of FAIL, so only problems nothing in the run can fix stop the run in Phase 02.
+
+### Settings (`vars/upgrade.yml`)
+| Setting | Default | Meaning |
+|---|---|---|
+| `rollout_detect_seconds` | 120 | how long Phase 03 looks for a pool that starts updating after a change that may roll out |
+| `preupgrade_operator_upgrades` | true | Phase 03 approves pending operator upgrades |
+| `skip_operator_upgrade` | false | true: no InstallPlan is approved in Phase 03 or 07 |
+| `auto_remediation_enabled`, `auto_unpause_mcp`, `mcp_auto_unpause_list`, `auto_fix_cgroup_v2` | unchanged | now used by Phase 03 tasks 1 and 2 |
+| `auto_apply_admin_acks`, `api_usage_*`, `admin_ack_clear_timeout_seconds` | unchanged | Phase 03 task 4 and Phase 04 |
+
+### Exit codes
+`15` is new for Phase 03 (a failed rollout watch inside Phase 03 also exits 15). The others keep their numbers: 5 login/01, 10 prechecks, 20 hop, 30 hop timeout, 25 postchecks, 35 operators, 99 other.
+
+### Testing by commenting out code
+Each phase reads what it needs from the cluster itself. `target_max_version` is computed in `main.yml`, Phase 03 does not use Phase 02 facts, and Phase 04 uses defaults for Phase 01 facts. Any phase include in `main.yml`, or any task include in the Phase 03 file, can therefore be commented out for a test. With Phase 03 commented out, the hop still applies a pending admin-ack itself.
+
+### Verification
+Offline only (no Ansible on the Windows workstation): YAML / Jinja / include / jq 1.5 / `bash -n` checks, plus 13 end-to-end scenarios running the real `main.yml` with a small Ansible emulator against a fake `oc`. The scenarios cover:
+- pre-check with all four fixes
+- dry run with no writes
+- a one-hop upgrade
+- a forbidden cgroup patch (exit 15)
+- a rollout that never finishes
+- an update already running
+- Phase 02 or Phase 03 commented out
+- two hops with one ack per minor
+- a blocking operator with nothing pending
+- `skip_operator_upgrade`
+- a compatible operator with an upgrade pending
+- a paused pool that is not allow-listed
+
+Next: `ansible-playbook --syntax-check main.yml` on 2.7.17 and 2.14.18, then dry-run, pre-check and a one-hop upgrade on DEV.

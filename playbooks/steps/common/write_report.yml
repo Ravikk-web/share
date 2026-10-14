@@ -28,14 +28,19 @@
       Upgraded from {{ run_start_version | default('?') }} to {{ run_final_version | default('?') }}
       ({{ hop_results | selectattr('status', 'match', '^COMPLETE') | list | length }} hop(s) run,
       {{ hop_results | selectattr('status', 'equalto', 'ALREADY DONE') | list | length }} already done).
+      {{ ('Pre-upgrade changes: ' ~ (_changed | join(', ')) ~ '.') if (_changed | length > 0) else '' }}
       Postchecks and the operator closeout finished.
       {%- elif run_mode == 'dry-run' -%}
       Dry run of {{ run_start_version | default('?') }} -> {{ upgrade_path | join(' -> ') }}: every check ran and nothing on the cluster was changed.
       {%- elif run_mode == 'pre-check' -%}
-      Prechecks passed{{ (' after auto-fix: ' ~ (preval_autofix_items | map(attribute='name') | join(', '))) if (preval_autofix_items | length > 0) else '' }}. No upgrade was started.
+      Prechecks passed and the pre-upgrade changes are done
+      ({{ ('changed: ' ~ (_changed | join(', '))) if (_changed | length > 0) else 'nothing needed changing' }}). No upgrade was started.
       {%- else -%}
       Postchecks of the cluster at {{ run_final_version | default('?') }} finished.
       {%- endif -%}
+  vars:
+    # Names of the Phase 03 tasks that changed the cluster.
+    _changed: "{{ preimpl_tasks | default([]) | selectattr('status', 'equalto', 'AUTO-FIXED') | map(attribute='name') | list }}"
 
 - name: "Report: Make sure the output folder exists"
   file:

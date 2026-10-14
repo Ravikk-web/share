@@ -1,6 +1,6 @@
 ---
 # ============================================================================
-# steps/03/hop.yml - one upgrade hop (looped by 03_Initiate_upgrade.yaml)
+# steps/04/hop.yml - one upgrade hop (looped by 04_Initiate_upgrade.yaml)
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
@@ -12,8 +12,8 @@
 #        start   - the hop has to be started
 #        (an update running to any other version stops the run)
 #   2. start only: wait up to prehop_settle_wait_minutes for a stable cluster
-#   3. start only: steps/03/start_hop.yml (channel, offer, admin-ack, trigger)
-#   4. start / resume: 04_Live_monitoring_upgrade.yaml watches until it settles
+#   3. start only: steps/04/start_hop.yml (channel, offer, admin-ack, trigger)
+#   4. start / resume: 05_Live_monitoring_upgrade.yaml watches until it settles
 # A failure goes straight to the failure handler in main.yml.
 # ============================================================================
 
@@ -139,14 +139,14 @@
 # 3. Start the hop
 # ----------------------------------------------------------------------------
 - name: "{{ current_hop_label }} -> {{ hop_target }}: Start the update"
-  include_tasks: "{{ playbook_dir }}/steps/03/start_hop.yml"
+  include_tasks: "{{ playbook_dir }}/steps/04/start_hop.yml"
   when: hop_action == 'start'
 
 # ----------------------------------------------------------------------------
-# 4. Watch it until the cluster settles (Phase 04)
+# 4. Watch it until the cluster settles (Phase 05)
 # ----------------------------------------------------------------------------
-- name: "{{ current_hop_label }} -> {{ hop_target }}: Watch until the cluster settles (Phase 04)"
-  include_tasks: "{{ playbook_dir }}/04_Live_monitoring_upgrade.yaml"
+- name: "{{ current_hop_label }} -> {{ hop_target }}: Watch until the cluster settles (Phase 05)"
+  include_tasks: "{{ playbook_dir }}/05_Live_monitoring_upgrade.yaml"
   vars:
     watch_mode: "hop"
     watch_version: "{{ hop_target }}"

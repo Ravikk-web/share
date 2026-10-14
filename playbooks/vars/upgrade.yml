@@ -42,7 +42,7 @@ target_channel_prefix: "stable"
 allow_conditional_updates: false
 
 # ----------------------------------------------------------------------------
-# Phase 02 - prechecks
+# Phase 02 - prechecks (read-only)
 # ----------------------------------------------------------------------------
 max_cpu_percent: 90                # Check 08: requested CPU vs allocatable
 max_memory_percent: 90             # Check 08: requested memory vs allocatable
@@ -50,31 +50,39 @@ allowed_unschedulable_nodes: 0     # Checks 02 / 05: cordoned nodes allowed
 fail_on_zero_disruption_pdb: false # Check 12: true makes blocking PDBs a HARD stop
 co_allow_list: []                  # ClusterOperators ignored by every check, e.g. ["insights"]
 
-# Check 14: true turns a cgroup v1 blocker into a warning (not recommended:
-# OpenShift 4.19+ cannot run on cgroup v1).
+# Check 14: true turns a cgroup v1 blocker into a warning and Phase 03 leaves cgroups
+# alone (not recommended: OpenShift 4.19+ cannot run on cgroup v1).
 skip_cgroup_check: false
 
 # ----------------------------------------------------------------------------
-# Phase 02 - auto-fixes (never in a dry run)
+# Phase 03 - pre-upgrade implementation (never in a dry run)
 # ----------------------------------------------------------------------------
-auto_remediation_enabled: true     # master switch for the two fixes below
+# Every change is followed by a look for a MachineConfigPool rollout; a rollout is
+# watched to the end (Phase 05, with heartbeat and degradation mails) before the next
+# task. How long to look for a pool that starts updating after a change that may or
+# may not roll out (cgroup v2 always does and is watched at once):
+rollout_detect_seconds: 120
 
-# Check 14: set cgroupMode v2 when a hop reaches 4.19+ (every node reboots; Phase 02
-# waits for the rollout before the first hop).
-auto_fix_cgroup_v2: true
+auto_remediation_enabled: true     # master switch for tasks 1 and 2 below
 
-# Check 03: unpause paused pools that are on this list.
+# Task 1 (Check 03): unpause paused pools that are on this list.
 auto_unpause_mcp: true
 mcp_auto_unpause_list: ["worker", "master"]
 
-# ----------------------------------------------------------------------------
-# Phase 03 - hops
-# ----------------------------------------------------------------------------
-prehop_settle_wait_minutes: 10     # wait for a stable cluster before starting a hop
-upgrade_edge_wait_seconds: 300     # wait for the cluster to offer the hop target
+# Task 2 (Check 14): set cgroupMode v2 when a hop reaches 4.19+ (every node reboots,
+# watched to the end before the next task).
+auto_fix_cgroup_v2: true
 
-# Before each minor hop: check APIRequestCount for APIs the update removes, then set
-# the admin-ack. Any non-ignored caller in the last 24 h stops the run before the hop.
+# Task 3 (Check 15): approve every pending operator upgrade (the current InstallPlan of
+# each UpgradePending subscription) before the first hop and wait for Succeeded; the run
+# stops if an operator still blocks the target version. skip_operator_upgrade (Phase 07
+# section) turns this off too. Timeouts and the one-time restart are shared with Phase 07.
+preupgrade_operator_upgrades: true
+
+# Task 4 (Check 07): check APIRequestCount for APIs the path removes, then set the
+# admin-ack the next minor hop needs. A later minor hop's ack only appears once the
+# cluster is on that minor, so Phase 04 does the same right before each minor hop.
+# Any non-ignored caller in the last 24 h stops the run.
 auto_apply_admin_acks: true
 api_usage_check_enabled: true
 admin_ack_clear_timeout_seconds: 300
@@ -86,7 +94,13 @@ api_usage_ignore_users:
   - "system:cluster-policy-controller"
 
 # ----------------------------------------------------------------------------
-# Phase 04 - watching a hop
+# Phase 04 - hops
+# ----------------------------------------------------------------------------
+prehop_settle_wait_minutes: 10     # wait for a stable cluster before starting a hop
+upgrade_edge_wait_seconds: 300     # wait for the cluster to offer the hop target
+
+# ----------------------------------------------------------------------------
+# Phase 05 - watching a hop or a Phase 03 node rollout
 # ----------------------------------------------------------------------------
 poll_interval_minutes: 2
 heartbeat_minutes: 20              # heartbeat mail cadence
@@ -106,15 +120,15 @@ degradation_cv_failing_minutes: 10             # ClusterVersion Failing
 node_stall_threshold_minutes: 30               # node stuck in its update (often a PDB)
 
 # ----------------------------------------------------------------------------
-# Phase 05 - postchecks
+# Phase 06 - postchecks
 # ----------------------------------------------------------------------------
 postval_co_settle_seconds: 300     # wait for operators to settle before judging them
 alerts_query_timeout_seconds: 20
 
 # ----------------------------------------------------------------------------
-# Phase 06 - operators and console
+# Phase 07 - operators and console (the approval settings apply to Phase 03 too)
 # ----------------------------------------------------------------------------
-skip_operator_upgrade: false             # true = report only, approve nothing
+skip_operator_upgrade: false             # true = report only, approve nothing (Phase 03 and 07)
 operator_upgrade_timeout_seconds: 600
 operator_upgrade_poll_interval_seconds: 15
 operator_upgrade_auto_recover: true      # one restart of a Failed CSV's Deployments

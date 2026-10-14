@@ -1,67 +1,70 @@
 ---
 # ============================================================================
-# Phase 03 - Upgrade hops (Phase 04 watches each hop)
+# Phase 04 - Upgrade hops (Phase 05 watches each hop)
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 #
-# Runs every hop of upgrade_path in order through steps/03/hop.yml:
+# Runs every hop of upgrade_path in order through steps/04/hop.yml:
 #   plan from the live cluster (skip / resume / start) -> wait for a stable cluster
-#   -> set the channel, wait for the offer, admin-ack, start the update
-#   -> 04_Live_monitoring_upgrade.yaml watches it until the cluster settles.
+#   -> set the channel, wait for the offer, apply an admin-ack still pending before a
+#      minor hop (Phase 03 applied the first one), start the update
+#   -> 05_Live_monitoring_upgrade.yaml watches it until the cluster settles.
 # Hops the cluster already reached are skipped and an update already running to
 # the next hop is watched, so running the same command again resumes the upgrade.
 # Dry run: prints the plan for each hop and changes nothing.
 # ============================================================================
 
-- name: "Phase 03: Start"
+- name: "Phase 04: Start"
   set_fact:
-    current_phase: "03"
+    current_phase: "04"
 
-- name: "Phase 03 (dry run): Show what each hop would do"
+# Why: path_validation comes from Phase 01; the defaults keep this phase working when
+#      Phase 01 is commented out for a test.
+- name: "Phase 04 (dry run): Show what each hop would do"
   debug:
     msg: >-
-      {% for r in path_validation %}[{{ r.status }}] {{ ((r['from'] ~ ' -> ') if (r['from'] | length > 0) else '') ~ r.to }}{{ (' via ' ~ r.channel) if (r.channel | length > 0) else '' }}: {{ r.detail }}{% if not loop.last %} | {% endif %}{% endfor %}.
-      A live run sets each hop's channel, applies the admin-ack before a minor hop
+      {% for r in path_validation | default([]) %}[{{ r.status }}] {{ ((r['from'] ~ ' -> ') if (r['from'] | length > 0) else '') ~ r.to }}{{ (' via ' ~ r.channel) if (r.channel | length > 0) else '' }}: {{ r.detail }}{% if not loop.last %} | {% endif %}{% endfor %}.
+      A live run sets each hop's channel, applies any admin-ack still pending before a minor hop
       (after the removed-API check), starts the update and watches it until the cluster settles.
   when: dry_run | bool
 
-- name: "Phase 03: Run the hops in order"
-  include_tasks: "{{ playbook_dir }}/steps/03/hop.yml"
+- name: "Phase 04: Run the hops in order"
+  include_tasks: "{{ playbook_dir }}/steps/04/hop.yml"
   loop: "{{ upgrade_path }}"
   loop_control:
     loop_var: hop_target
     index_var: hop_index
   when: not (dry_run | bool)
 
-- name: "Phase 03: Read the version the cluster is on now"
+- name: "Phase 04: Read the version the cluster is on now"
   shell: |
     set -o pipefail
     oc get clusterversion version -o json | jq -r '(((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // "unknown")'
   args:
     executable: /bin/bash
-  register: p03_final_version
+  register: p04_final_version
   changed_when: false
   retries: "{{ oc_command_retries | default(3) }}"
   delay: "{{ oc_command_retry_delay | default(10) }}"
-  until: p03_final_version.rc == 0
+  until: p04_final_version.rc == 0
   when: not (dry_run | bool)
 
-- name: "Phase 03: Record the result"
+- name: "Phase 04: Record the result"
   set_fact:
     current_hop_target: ""
-    run_final_version: "{{ p03_final_version.stdout | trim if not (dry_run | bool) else run_start_version }}"
+    run_final_version: "{{ p04_final_version.stdout | trim if not (dry_run | bool) else run_start_version | default('?') }}"
     run_phase_results: >-
       {{ run_phase_results + [{
-           'phase': '03', 'name': phase_names['03'], 'status': 'PASS',
-           'detail': (((path_remaining_hops | length) ~ ' hop(s) planned: ' ~ (path_remaining_hops | join(' -> ') or 'none') ~ '; nothing changed (dry run)')
+           'phase': '04', 'name': phase_names['04'], 'status': 'PASS',
+           'detail': (((path_remaining_hops | default(upgrade_path) | length) ~ ' hop(s) planned: ' ~ (path_remaining_hops | default(upgrade_path) | join(' -> ') or 'none') ~ '; nothing changed (dry run)')
                       if (dry_run | bool)
                       else ((hop_results | selectattr('status', 'match', '^COMPLETE') | list | length) ~ ' hop(s) done, '
                             ~ (hop_results | selectattr('status', 'equalto', 'ALREADY DONE') | list | length) ~ ' already done; cluster now at '
-                            ~ (p03_final_version.stdout | trim)))
+                            ~ (p04_final_version.stdout | trim)))
          }] }}
 
-- name: "Phase 03: Log the result"
+- name: "Phase 04: Log the result"
   include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
   vars:
     event_status: "PASS"

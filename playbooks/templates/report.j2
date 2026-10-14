@@ -101,13 +101,8 @@ Standalone page: max-width 1080px, no external resources, details expand when pr
 
 {% if preval_checks | length > 0 %}
 <section>
-  <h2>02 &bull; Prechecks</h2>
+  <h2>02 &bull; Prechecks{{ ' (run again after the Phase 03 changes)' if (preval_rechecked | default(false) | bool) else '' }}</h2>
   {{ check_table(preval_checks) }}
-  {% if preval_autofix_items | length > 0 %}
-  <div class="box autofix"><b>Auto-fixes applied</b><ul>
-    {%- for f in preval_autofix_items %}<li><b>{{ f.name | e }}</b>: {{ f.action | e }} (<a href="{{ f.reference | e }}">docs</a>)</li>{% endfor %}
-  </ul></div>
-  {% endif %}
   {% if installed_operators | length > 0 %}
   <details open><summary><b>Installed operators ({{ installed_operators | length }})</b></summary>
   <table>
@@ -122,18 +117,46 @@ Standalone page: max-width 1080px, no external resources, details expand when pr
 </section>
 {% endif %}
 
-{% if (hop_results | length > 0) or (admin_acks_applied | length > 0) %}
+{%- set acks_03 = [] -%}
+{%- set acks_04 = [] -%}
+{%- for a in admin_acks_applied | default([]) -%}
+{%- if (a.phase | default('')) == '03' -%}{%- set _ = acks_03.append(a) -%}{%- else -%}{%- set _ = acks_04.append(a) -%}{%- endif -%}
+{%- endfor %}
+{% if preimpl_tasks | default([]) | length > 0 %}
 <section>
-  <h2>03 &bull; Upgrade hops</h2>
+  <h2>03 &bull; Pre-upgrade implementation{{ ' (plan only)' if (dry_run | bool) else '' }}</h2>
+  <p class="meta">Each task: check, change if needed, watch any node rollout it started, verify.</p>
+  <table>
+    <tr><th>#</th><th>Task</th><th>Result</th><th>What was found and done</th></tr>
+    {%- for t in preimpl_tasks %}
+    <tr><td>{{ t.num | e }}</td><td>{{ t.name | e }}</td><td>{{ pill(t.status) }}</td><td>{{ t.observed | e }}</td></tr>
+    {%- endfor %}
+  </table>
+  {% if preval_autofix_items | length > 0 %}
+  <div class="box autofix"><b>Changes made</b><ul>
+    {%- for f in preval_autofix_items %}<li><b>{{ f.name | e }}</b>: {{ f.action | e }} (<a href="{{ f.reference | e }}">docs</a>)</li>{% endfor %}
+  </ul></div>
+  {% endif %}
+  {% if acks_03 | length > 0 %}
+  <div class="box autofix"><b>Admin-acks applied</b><ul>
+    {%- for a in acks_03 %}<li><code>{{ a.key | e }}</code> before {{ a.hop | e }}</li>{% endfor %}
+  </ul></div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if (hop_results | length > 0) or (acks_04 | length > 0) %}
+<section>
+  <h2>04 &bull; Upgrade hops</h2>
   <table>
     <tr><th>Hop</th><th>Target</th><th>Result</th><th>Duration</th></tr>
     {%- for h in hop_results %}
     <tr><td>{{ h.hop_label | e }}</td><td class="mono">{{ h.target | e }}</td><td>{{ pill(h.status) }}</td><td>{{ h.duration | e }}</td></tr>
     {%- endfor %}
   </table>
-  {% if admin_acks_applied | length > 0 %}
+  {% if acks_04 | length > 0 %}
   <div class="box autofix"><b>Admin-acks applied</b><ul>
-    {%- for a in admin_acks_applied %}<li><code>{{ a.key | e }}</code> before {{ a.hop | e }}</li>{% endfor %}
+    {%- for a in acks_04 %}<li><code>{{ a.key | e }}</code> before {{ a.hop | e }}</li>{% endfor %}
   </ul></div>
   {% endif %}
 </section>
@@ -141,14 +164,14 @@ Standalone page: max-width 1080px, no external resources, details expand when pr
 
 {% if postval_checks | length > 0 %}
 <section>
-  <h2>05 &bull; Postchecks{{ ' (audit only)' if (dry_run | bool) else '' }}</h2>
+  <h2>06 &bull; Postchecks{{ ' (audit only)' if (dry_run | bool) else '' }}</h2>
   {{ check_table(postval_checks) }}
 </section>
 {% endif %}
 
 {% if operator_checks | length > 0 %}
 <section>
-  <h2>06 &bull; Operators and developer console{{ ' (plan only)' if (dry_run | bool) else '' }}</h2>
+  <h2>07 &bull; Operators and developer console{{ ' (plan only)' if (dry_run | bool) else '' }}</h2>
   {{ check_table(operator_checks) }}
   {% if operators | length > 0 %}
   <details><summary><b>Subscriptions ({{ operators | length }})</b></summary>

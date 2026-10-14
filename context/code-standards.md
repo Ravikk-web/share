@@ -8,7 +8,8 @@ Mandatory for everything under `playbooks/`. The code must run **unchanged on An
 - **Flow.** Phase files list *what* happens, top to bottom. `steps/` files do the work. Templates only render. `vars/` holds every setting.
 - **No roles.** No role defaults and no new entry points: everything starts at `00_Run.sh -> main.yml`.
 - **One failure handler.** It is `steps/common/handle_failure.yml`, run by `main.yml`'s `rescue:`. Do not add a phase-level rescue. A local `block/rescue` is allowed only to turn a non-critical problem into a WARN (mail, report rendering, Developer perspective).
-- **Checks.** A check file reads the cluster and appends one record to `preval_checks` / `postval_checks`: `{num, name, gate, status, observed}`. Checks never `fail:`; the phase file applies the gate.
+- **Checks.** A check file reads the cluster and appends one record to `preval_checks` / `postval_checks`: `{num, name, gate, status, observed}`. Checks never `fail:`; the phase file applies the gate. Checks never change the cluster.
+- **Phase 03 tasks.** A task file (`steps/03/task_<n>_<name>.yml`) checks, changes only if needed, watches any rollout with `steps/03/watch_rollout.yml`, verifies, and ends with `steps/03/record_task.yml`, which records one row in `preimpl_tasks` and stops the run on FAIL / FIX-FAILED. Each task reads the cluster itself (no dependency on Phase 02 facts), so a phase or task can be commented out for a test.
 - **Inputs to a step.** Pass them as `include_tasks ... vars:` (scoped to that include). Facts that persist are results, not inputs.
 - **Comments.** Each file has a short header: purpose, inputs and outputs, and any cluster write. Explain *why* for anything non-obvious.
 - **Settings.** Gates, thresholds and switches live in `vars/`, never as literals buried in tasks.
@@ -54,11 +55,14 @@ Mandatory for everything under `playbooks/`. The code must run **unchanged on An
   - Only `steps/common/send_mail.yml` sends mail. Include it with `when: send_email | default(true) | bool`.
   - Kinds: summary, alert, heartbeat, degradation. Subjects are ASCII: `[ARO Upgrade][<cluster>][<KIND>] <headline> (run <ts>)`.
   - An SMTP error is a WARN.
-- **Exit codes.** 5 login or Phase 01, 10 Phase 02, 20 hop, 30 hop timeout / no progress, 25 Phase 05, 35 Phase 06, 99 other.
+- **Exit codes.** 5 login or Phase 01, 10 Phase 02, 15 Phase 03, 20 hop (Phase 04), 30 hop timeout / no progress (Phase 05), 25 Phase 06, 35 Phase 07, 99 other.
 
-## Auto-fixes
-- Each fix is behind `auto_remediation_enabled`, its own switch, and `not dry_run`.
-- A fix only records what it changed (`remediation_attempted_nums`, `remediation_rollout_needed`, `preval_autofix_items`). Phase 02 waits for any node rollout and re-runs **all** checks. The status (AUTO-FIXED / FIX-FAILED) comes from that re-check.
+## Pre-upgrade changes (Phase 03)
+- Only Phase 03 changes the cluster before the first hop. Each change is behind its own switch and `not dry_run` (the unpause and cgroup changes also behind `auto_remediation_enabled`; operator approvals behind `preupgrade_operator_upgrades` and not `skip_operator_upgrade`; the admin-ack behind `auto_apply_admin_acks`).
+- A Phase 02 check may record a problem as WARN ("Phase 03 will ...") and add its number to `preval_deferred` only when `preval_defer_fixes` is true (Phase 03 is in the run) and the fix is switched on and can fix it.
+- After a change, any MachineConfigPool rollout is watched to the end (Phase 05 rollout mode) before the next task.
+- A task records what it changed (`remediation_attempted_nums`, `preval_autofix_items`). If anything changed, Phase 03 re-runs **all** 16 prechecks with `preval_defer_fixes: false`; AUTO-FIXED / FIX-FAILED comes from that re-check.
+- No Phase 03 change is made while a cluster update is running.
 - **New cluster writes.** Any new write must be added to `context/architecture.md` (Cluster writes), to `WORKFLOW.md` and to the "Changes" line in `00_Run.sh`, in the same change.
 
 ## Secrets

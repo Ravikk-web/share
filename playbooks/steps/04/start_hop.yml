@@ -1,6 +1,6 @@
 ---
 # ============================================================================
-# steps/03/start_hop.yml - start one hop
+# steps/04/start_hop.yml - start one hop
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
@@ -10,7 +10,10 @@
 #   2. Wait (bounded) until the cluster offers hop_target. A conditional update whose
 #      risks apply is refused unless allow_conditional_updates is true.
 #   3. Minor hop: removed-API check, admin-ack, wait for Upgradeable=True
-#      (steps/03/admin_ack.yml in apply mode).
+#      (steps/03/admin_ack.yml in apply mode - the step Phase 03 task 4 ran). Phase 03
+#      already applied the first minor hop's ack, so this sets nothing then; it is
+#      needed for a later minor hop, whose key OpenShift only publishes once the
+#      cluster is on that minor.
 #   4. `oc adm upgrade --to=<hop_target>` and confirm ClusterVersion accepted it.
 # Cluster writes: spec.channel, openshift-config/admin-acks (minor hops), the update.
 # ============================================================================
@@ -113,15 +116,16 @@
 # ----------------------------------------------------------------------------
 # 3. Admin-ack (minor hops only; removed-API check first)
 # ----------------------------------------------------------------------------
-- name: "Start hop: Check removed-API usage and apply the admin-ack"
+- name: "Start hop: Check removed-API usage and apply any admin-ack still pending"
   include_tasks: "{{ playbook_dir }}/steps/03/admin_ack.yml"
   vars:
     admin_ack_mode: "apply"
     admin_ack_versions: ["{{ hop_target }}"]
+    admin_ack_label: "{{ current_hop_label }}"
   when: hop_is_minor | bool
 
 # ----------------------------------------------------------------------------
-# 4. Start and confirm
+# 4. Start and confirm (TRIGGER UPGRADE)
 # ----------------------------------------------------------------------------
 - name: "Start hop: oc adm upgrade --to={{ hop_target }}"
   command: >-

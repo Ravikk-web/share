@@ -6,7 +6,7 @@
 # MIGRATION 2.14: No changes needed.
 #
 # Writes snapshots/<cluster>_<ts>_baseline.json: version, channel, cluster ID,
-# nodes, ClusterOperators and routes. Phase 05 Check 10 compares the cluster
+# nodes, ClusterOperators and routes. Phase 06 Check 10 compares the cluster
 # against it. This file is the only state kept between phases.
 # ============================================================================
 

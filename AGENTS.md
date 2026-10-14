@@ -6,7 +6,7 @@ Read the following files in order before implementing or making any architectura
 
 0. `WORKFLOW.md` — how one run works, step by step, in file order
 1. `context/project-overview.md` — product definition, goals, one-touch automation flow, features, and scope
-2. `context/architecture.md` — system structure (00_Run.sh → main.yml → phase files 01–06 → steps/), boundaries, storage model, and invariants
+2. `context/architecture.md` — system structure (00_Run.sh → main.yml → phase files 01–07 → steps/), boundaries, storage model, and invariants
 3. `context/ui-context.md` — theme, colors, typography, report/email templates, status pills (`AUTO-FIXED`/`FIX-FAILED`), and CLI display conventions
 4. `context/code-standards.md` — implementation rules, exception handling hierarchy, auto-remediation standards, Jinja2/shell anti-patterns, and developer comment requirements
 5. `context/ai-workflow-rules.md` — development workflow, rebuild scoping rules, auto-remediation rules, and pre-unit checklist

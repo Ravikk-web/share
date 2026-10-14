@@ -1,103 +1,50 @@
 ---
 # ============================================================================
-# Phase 02 - Prechecks and auto-fix
+# Phase 02 - Prechecks (read-only)
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 #
 # Steps:
-#   1. Run the 16 prechecks (steps/02/check_*.yml). Each one only records a result.
-#   2. Auto-fix what can be fixed safely (never in a dry run):
-#        Check 14 cgroup v1 on a path that reaches 4.19+  -> set cgroupMode v2
-#        Check 03 paused pool on mcp_auto_unpause_list     -> unpause it
-#   3. If a fix makes nodes reboot, wait for the rollout (Phase 04 in rollout mode).
-#   4. Run all 16 checks again. A fixed check is AUTO-FIXED only if it now passes,
-#      otherwise FIX-FAILED.
-#   5. GATE: stop if any HARD check is FAIL or FIX-FAILED.
-# Admin-acks are not applied here: Phase 03 applies them right before each minor hop.
+#   1. Run the 16 prechecks (steps/02/check_*.yml). Each one only records a result;
+#      nothing on the cluster is changed in this phase.
+#   2. GATE: stop if any HARD check is FAIL.
+#
+# Problems Phase 03 fixes do not stop the run here when Phase 03 is part of this
+# run and the fix is switched on. They are recorded as WARN ("Phase 03 will ..."):
+#   Check 03  paused pools on mcp_auto_unpause_list    -> Phase 03 unpauses them
+#   Check 14  cgroup v1 on a path that reaches 4.19+   -> Phase 03 sets cgroupMode v2
+#   Check 15  blocking operators with a pending upgrade -> Phase 03 approves the upgrade
+# Phase 03 makes the change, watches any node rollout, re-runs these 16 checks and
+# stops the run if one is still failing. The admin-ack (Check 07) is applied in
+# Phase 03 as well.
 # ============================================================================
 
+# Why: a fixable problem may only be waved through when Phase 03 runs after this phase.
 - name: "Phase 02: Start"
   set_fact:
     current_phase: "02"
-    remediation_attempted_nums: []
-    remediation_rollout_needed: false
+    preval_defer_fixes: "{{ 3 in run_phases }}"
 
 - name: "Phase 02: Run the 16 prechecks"
   include_tasks: "{{ playbook_dir }}/steps/02/run_all_checks.yml"
 
-# Why: a fix is only tried when there is something it can change - a paused pool on the
-#      allow-list (Check 03) or cgroup v1 (Check 14). Other failures stay FAIL.
-- name: "Phase 02: Decide which auto-fixes to try"
-  set_fact:
-    fix_cgroup: >-
-      {{ (auto_fix_cgroup_v2 | default(true) | bool) and not (skip_cgroup_check | default(false) | bool)
-         and (preval_checks | selectattr('num', 'equalto', 14) | selectattr('status', 'equalto', 'FAIL') | list | length > 0) }}
-    fix_paused_pools: >-
-      {{ (auto_unpause_mcp | default(true) | bool)
-         and (mcp_paused_pools | default([]) | intersect(mcp_auto_unpause_list | default([])) | length > 0) }}
-
-- name: "Phase 02: Auto-fix - move the cluster to cgroup v2 (all nodes reboot)"
-  include_tasks: "{{ playbook_dir }}/steps/02/fix_cgroup_v2.yml"
-  when:
-    - auto_remediation_enabled | default(true) | bool
-    - not (dry_run | bool)
-    - fix_cgroup | bool
-
-- name: "Phase 02: Auto-fix - unpause allow-listed MachineConfigPools"
-  include_tasks: "{{ playbook_dir }}/steps/02/fix_unpause_mcp.yml"
-  when:
-    - auto_remediation_enabled | default(true) | bool
-    - not (dry_run | bool)
-    - fix_paused_pools | bool
-
-# Why: the Machine Config Operator drains and reboots nodes after these fixes; the
-#      re-check (and the first hop) must not start before that rollout is finished.
-- name: "Phase 02: Wait for the node rollout started by the fixes"
-  include_tasks: "{{ playbook_dir }}/04_Live_monitoring_upgrade.yaml"
-  vars:
-    watch_mode: "rollout"
-    watch_version: "{{ run_start_version | default('current', true) }}"
-    watch_label: "Auto-fix node rollout (Phase 02)"
-  when: remediation_rollout_needed | bool
-
-- name: "Phase 02: Run all 16 prechecks again after the fixes"
-  include_tasks: "{{ playbook_dir }}/steps/02/run_all_checks.yml"
-  when: remediation_attempted_nums | length > 0
-
-- name: "Phase 02: Mark fixed checks AUTO-FIXED or FIX-FAILED"
-  set_fact:
-    preval_checks: >-
-      {%- set out = [] -%}
-      {%- for c in preval_checks -%}
-      {%- if c.num in remediation_attempted_nums -%}
-      {%- set fixed = c.status in ['PASS', 'WARN'] -%}
-      {%- set _ = out.append(c | combine({'status': ('AUTO-FIXED' if fixed else 'FIX-FAILED'),
-            'observed': ('Fixed automatically, then re-checked: ' if fixed else 'Auto-fix tried, but the re-check still fails: ') ~ c.observed})) -%}
-      {%- else -%}
-      {%- set _ = out.append(c) -%}
-      {%- endif -%}
-      {%- endfor -%}
-      {{ out }}
-  when: remediation_attempted_nums | length > 0
-
 - name: "Phase 02: Record the result"
   set_fact:
-    preval_blockers: "{{ preval_checks | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'match', '^(FAIL|FIX-FAILED)$') | list }}"
+    preval_blockers: "{{ _blockers }}"
     run_phase_results: >-
       {{ run_phase_results + [{
            'phase': '02', 'name': phase_names['02'],
            'status': ('FAIL' if (_blockers | length > 0)
-                      else ('WARN' if (preval_checks | selectattr('status', 'equalto', 'WARN') | list | length > 0)
-                      else ('AUTO-FIXED' if (preval_autofix_items | length > 0) else 'PASS'))),
+                      else ('WARN' if (preval_checks | selectattr('status', 'equalto', 'WARN') | list | length > 0) else 'PASS')),
            'detail': (preval_checks | length) ~ ' checks: '
                      ~ (preval_checks | selectattr('status', 'equalto', 'PASS') | list | length) ~ ' pass, '
                      ~ (preval_checks | selectattr('status', 'equalto', 'WARN') | list | length) ~ ' warn, '
-                     ~ (preval_checks | selectattr('status', 'equalto', 'AUTO-FIXED') | list | length) ~ ' auto-fixed, '
                      ~ (_blockers | length) ~ ' blocking'
+                     ~ ((' (left to Phase 03: checks ' ~ (preval_deferred | map('string') | join(', ')) ~ ')') if (preval_deferred | length > 0) else '')
          }] }}
   vars:
-    _blockers: "{{ preval_checks | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'match', '^(FAIL|FIX-FAILED)$') | list }}"
+    _blockers: "{{ preval_checks | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'equalto', 'FAIL') | list }}"
 
 - name: "Phase 02: Log the result"
   include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
@@ -105,12 +52,11 @@
     event_status: "{{ run_phase_results[-1].status }}"
     event_task: "Prechecks"
     event_reason: "{{ run_phase_results[-1].detail }}"
-    event_observed: "{{ preval_autofix_items | map(attribute='name') | join('; ') }}"
 
 - name: "Phase 02: GATE - no HARD precheck may fail"
   fail:
     msg: >-
       {{ preval_blockers | length }} blocking precheck(s) on '{{ cluster_name }}':
-      {% for c in preval_blockers %}Check {{ '%02d' | format(c.num) }} {{ c.name }} [{{ c.status }}]: {{ c.observed | truncate(300) }}{% if not loop.last %} | {% endif %}{% endfor %}.
-      {{ 'This was a dry run, so no auto-fix was tried. ' if (dry_run | bool) else '' }}No upgrade was started.
+      {% for c in preval_blockers %}Check {{ '%02d' | format(c.num) }} {{ c.name }}: {{ c.observed | truncate(300) }}{% if not loop.last %} | {% endif %}{% endfor %}.
+      Nothing on the cluster was changed and no upgrade was started.
   when: preval_blockers | length > 0

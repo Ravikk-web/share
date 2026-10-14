@@ -6,19 +6,25 @@
 # MIGRATION 2.14: No changes needed.
 #
 # Inputs (include vars):
-#   admin_ack_mode      evaluate - read-only, for Precheck 07 (whole path)
-#                       apply    - right before one minor hop (steps/03/start_hop.yml)
+#   admin_ack_mode      evaluate - read-only: Precheck 07 and a dry run of Phase 03
+#                       apply    - Phase 03 task 4 (whole path, before the first hop)
+#                                  and steps/04/start_hop.yml (right before each minor hop)
 #   admin_ack_versions  the versions to look at (the path, or [hop target])
+#   admin_ack_label     who is asking, for messages and admin_acks_applied
+#                       (e.g. "the upgrade (Phase 03)" or "Hop 2 of 3")
 #
 # How OpenShift gates a minor update: openshift-config-managed/admin-gates lists keys
 # such as ack-4.15-kube-1.29-api-removals-in-4.16. While the cluster is on the minor
 # in the key (4.15 here) ClusterVersion reports Upgradeable=False (AdminAckRequired)
-# until openshift-config/admin-acks has that key set to "true".
+# until openshift-config/admin-acks has that key set to "true". Only the keys for the
+# minor the cluster is on now can be seen, so a later hop's key is applied right
+# before that hop.
 #
-# Apply mode stops the hop if a workload still calls an API the update removes, if
-# auto_apply_admin_acks is false, or if Upgradeable stays False after the ack.
+# Apply mode stops the run if a workload still calls an API the path removes, if
+# auto_apply_admin_acks is false, or if Upgradeable stays False after the ack while
+# the next hop is a minor hop. It refuses to run in a dry run.
 # Outputs: admin_ack_check_status / admin_ack_check_observed (evaluate),
-#          admin_acks_applied (apply)
+#          admin_ack_required_keys, admin_acks_applied (apply)
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -110,7 +116,7 @@
     admin_ack_check_observed: >-
       {{ api_usage_summary }}.
       {{ ('Admin-ack needed before the ' ~ admin_ack_current_minor ~ ' minor hop: ' ~ (admin_ack_required_keys | join(', '))
-          ~ (' - applied automatically before that hop.' if (auto_apply_admin_acks | default(true) | bool) else ' - auto_apply_admin_acks is false; acknowledge it by hand.'))
+          ~ (' - applied automatically before the upgrade (Phase 03).' if (auto_apply_admin_acks | default(true) | bool) else ' - auto_apply_admin_acks is false; acknowledge it by hand.'))
          if (admin_ack_required_keys | length > 0)
          else ('No admin-ack pending for the current minor ' ~ admin_ack_current_minor ~ '.' if (admin_ack_minor_hop | bool)
                else 'No minor-version hop in the path; no admin-ack needed.') }}
@@ -125,12 +131,19 @@
   when: admin_ack_mode == 'evaluate'
 
 # ----------------------------------------------------------------------------
-# 4. Apply mode (right before a minor hop)
+# 4. Apply mode (Phase 03, and right before each minor hop)
 # ----------------------------------------------------------------------------
+- name: "Admin-ack: Stop - apply mode was reached in a dry run"
+  fail:
+    msg: "admin_ack.yml apply mode was reached in a dry run; nothing may be changed in a dry run."
+  when:
+    - admin_ack_mode == 'apply'
+    - dry_run | bool
+
 - name: "Admin-ack: Stop - removed APIs are still in use"
   fail:
     msg: >-
-      {{ current_hop_label | default('Hop') }}: {{ api_usage_summary }}.
+      {{ admin_ack_label | default('Hop') }}: {{ api_usage_summary }}.
       The admin-ack for {{ admin_ack_current_minor }} was NOT applied. Move these clients to the newer APIs
       (or add verified system users to api_usage_ignore_users) and run the same command again.
   when:
@@ -141,7 +154,7 @@
 - name: "Admin-ack: Stop - an admin-ack is needed but auto_apply_admin_acks is false"
   fail:
     msg: >-
-      {{ current_hop_label | default('Hop') }} needs admin-ack key(s) {{ admin_ack_required_keys | join(', ') }} and
+      {{ admin_ack_label | default('Hop') }} needs admin-ack key(s) {{ admin_ack_required_keys | join(', ') }} and
       auto_apply_admin_acks is false. Apply them with
       oc -n openshift-config patch cm admin-acks --type=merge -p '{"data":{"<key>":"true"}}' and run the same command again.
   when:
@@ -174,7 +187,7 @@
   set_fact:
     admin_acks_applied: >-
       {%- set out = [] -%}
-      {%- for k in admin_ack_required_keys -%}{%- set _ = out.append({'key': k, 'hop': current_hop_label | default('hop')}) -%}{%- endfor -%}
+      {%- for k in admin_ack_required_keys -%}{%- set _ = out.append({'key': k, 'hop': admin_ack_label | default('hop'), 'phase': current_phase}) -%}{%- endfor -%}
       {{ admin_acks_applied + out }}
   when:
     - admin_ack_mode == 'apply'
@@ -184,7 +197,7 @@
   include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
   vars:
     event_status: "AUTO-FIX"
-    event_task: "Admin-ack before {{ current_hop_label | default('hop') }}"
+    event_task: "Admin-ack before {{ admin_ack_label | default('hop') }}"
     event_reason: "Set {{ admin_ack_required_keys | join(', ') }} in openshift-config/admin-acks"
     event_observed: "{{ api_usage_summary }}"
   when:
@@ -192,8 +205,10 @@
     - admin_ack_required_keys | length > 0
 
 # Why: the cluster refuses a minor update while Upgradeable=False. Wait (bounded) for it
-#      to re-evaluate after the ack; any other reason stops the hop now instead of
-#      leaving the update rejected until the hop timeout.
+#      to re-evaluate after the ack; any other reason stops the run now instead of
+#      leaving the update rejected until the hop timeout. Upgradeable=False does not
+#      block a z-stream update, so this only applies when the next hop is a minor hop
+#      (in Phase 03 the path may start with a z-stream hop).
 - name: "Admin-ack: Wait for ClusterVersion Upgradeable=True"
   shell: |
     set -o pipefail
@@ -212,15 +227,15 @@
   failed_when: false
   when:
     - admin_ack_mode == 'apply'
-    - admin_ack_minor_hop | bool
+    - admin_ack_first_hop_is_minor | bool
 
 - name: "Admin-ack: Stop - ClusterVersion is not Upgradeable"
   fail:
     msg: >-
-      {{ current_hop_label | default('Hop') }}: ClusterVersion reports Upgradeable=False
+      {{ admin_ack_label | default('Hop') }}: ClusterVersion reports Upgradeable=False
       ({{ admin_ack_wait_raw.stdout.split('|')[1] | default('') }}): {{ admin_ack_wait_raw.stdout.split('|')[2:] | join('|') | truncate(500) }}.
       A minor-version update cannot start until this clears.
   when:
     - admin_ack_mode == 'apply'
-    - admin_ack_minor_hop | bool
+    - admin_ack_first_hop_is_minor | bool
     - not ((admin_ack_wait_raw.stdout | default('True')).startswith('True'))
