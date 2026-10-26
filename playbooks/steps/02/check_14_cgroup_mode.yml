@@ -3,11 +3,24 @@
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 # Rule: OpenShift 4.19+ cannot run on cgroup v1, so when any hop of the path is 4.19
-#       or later, nodes.config/cluster must be cgroupMode v2. An empty cgroupMode means
-#       the historical default, which is v1 on clusters installed before 4.14.
-# Phase 03 task 2 (steps/03/task_2_cgroup_v2.yml) sets v2; all nodes reboot before the
-# first hop. With preval_defer_fixes and the fix switched on, v1 is recorded as WARN.
-# skip_cgroup_check: true turns the check into a WARN (not recommended).
+#       or later, every node must run cgroup v2 (steps/03/cgroup_nodes.yml: the MCO
+#       configuration it runs and, with cgroup_check_kernel, its kernel), and
+#       nodes.config/cluster must not say cgroupMode v1.
+#       The nodes decide, not the setting: an empty cgroupMode is rendered as v2 by the
+#       MCO on OpenShift 4.14 and later, while clusters upgraded from 4.13 on v1 carry an
+#       explicit "v1".
+# Left to Phase 03 task 2 (steps/03/task_2_cgroup_v2.yml) as WARN, with
+# preval_defer_fixes, when the nodes could be read and none is "broken":
+#   - the setting is not v2 and nodes are not on v2 (task 2 sets v2, watches the
+#     rollout and checks every node; needs auto_fix_cgroup_v2 and auto_remediation_enabled)
+#   - the setting is v2 but nodes have not finished rolling it out (task 2 watches and
+#     checks every node)
+# Stays FAIL: the nodes cannot be read, or a node the MCO finished runs a configuration
+# that cannot be read, or runs a v2 configuration but its kernel is not on cgroup v2 or
+# cannot be checked (waiting does not fix these).
+# skip_cgroup_check: true leaves cgroups alone: the nodes are not checked and the check
+# is a WARN (not recommended).
+# Sets: cgroup_nodes (when the nodes were checked; shown in the report).
 
 - name: "Check 14: Read the cluster cgroup mode"
   shell: |
@@ -23,22 +36,49 @@
 
 # Why: versions are compared with split('.') - regex backreferences inside YAML-quoted
 #      Jinja turn into control characters (the old check never required v2).
+- name: "Check 14: Decide whether the path needs cgroup v2"
+  set_fact:
+    c14_mode: "{{ c14_raw.stdout | trim }}"
+    c14_needs_v2: "{{ (_p | length >= 2) and (((_p[0] | int) > 4) or (((_p[0] | int) == 4) and ((_p[1] | int) >= 19))) }}"
+  vars:
+    _p: "{{ (target_max_version | string).split('.') }}"
+
+# Why: the setting alone proves nothing - a node is on v2 only once the MCO rolled a
+#      v2 configuration out to it and it rebooted.
+- name: "Check 14: Check every node (configuration and kernel)"
+  include_tasks: "{{ playbook_dir }}/steps/03/cgroup_nodes.yml"
+  vars:
+    cgroup_wait_seconds: 0
+  when:
+    - c14_needs_v2 | bool
+    - not (skip_cgroup_check | default(false) | bool)
+
 - name: "Check 14: Record the result"
   set_fact:
     preval_deferred: "{{ preval_deferred + ([14] if (_defer | bool) else []) }}"
     preval_checks: >-
       {{ preval_checks + [{'num': 14, 'name': 'cgroup mode', 'gate': 'HARD',
-           'status': 'PASS' if not (_problem | bool) else ('WARN' if ((skip_cgroup_check | default(false) | bool) or (_defer | bool)) else 'FAIL'),
-           'observed': 'Cluster cgroupMode is ' ~ _mode ~ ('' if (c14_raw.stdout | trim | length > 0) else ' (not set: historical default)')
-                       ~ ('; the highest hop ' ~ target_max_version ~ (' needs v2' if (_needs_v2 | bool) else ' does not need v2'))
-                       ~ ('; skip_cgroup_check is true' if ((skip_cgroup_check | default(false) | bool) and (_problem | bool)) else '')
-                       ~ ('; Phase 03 will set cgroupMode v2 (every node reboots) and watch the node rollout' if (_defer | bool) else '')}] }}
+           'status': 'PASS' if not (_problem | bool) else ('WARN' if ((_skip | bool) or (_defer | bool)) else 'FAIL'),
+           'observed': 'Cluster cgroupMode is ' ~ (c14_mode if (c14_mode | length > 0) else 'not set (the MCO renders that as v2 on OpenShift 4.14+)')
+                       ~ ('; the highest hop ' ~ target_max_version ~ (' needs v2' if (c14_needs_v2 | bool) else ' does not need v2'))
+                       ~ (('; ' ~ _nodes.summary) if (_checked | bool) else '')
+                       ~ ('; skip_cgroup_check is true: the nodes were not checked and the setting is left as it is'
+                          if ((_skip | bool) and (c14_needs_v2 | bool)) else '')
+                       ~ (('; Phase 03 will set cgroupMode v2 (nodes still on v1 reboot), watch the node rollout and check every node'
+                           if c14_mode != 'v2' else '; Phase 03 will watch the node rollout to the end and check every node')
+                          if (_defer | bool) else '')}] }}
   vars:
-    _mode: "{{ (c14_raw.stdout | trim) if (c14_raw.stdout | trim | length > 0) else 'v1' }}"
-    _p: "{{ (target_max_version | string).split('.') }}"
-    _needs_v2: "{{ (_p | length >= 2) and (((_p[0] | int) > 4) or (((_p[0] | int) == 4) and ((_p[1] | int) >= 19))) }}"
-    _problem: "{{ (_needs_v2 | bool) and _mode != 'v2' }}"
+    _skip: "{{ skip_cgroup_check | default(false) | bool }}"
+    _checked: "{{ (c14_needs_v2 | bool) and not (_skip | bool) }}"
+    _nodes: "{{ cgroup_nodes if (_checked | bool) else {} }}"
+    # Why: an explicit v1 is always a problem (the MCO keeps or brings the nodes to v1);
+    #      otherwise every node must be on v2. With skip_cgroup_check nothing was verified.
+    _problem: >-
+      {{ (c14_needs_v2 | bool) and ((_skip | bool) or c14_mode == 'v1' or not (_nodes.all_ok | default(false) | bool)) }}
+    # Why: Phase 03 can set v2 (switches on) or wait for a rollout; it cannot repair a node
+    #      the MCO already finished, and it needs the nodes to be readable.
     _defer: >-
-      {{ (_problem | bool) and not (skip_cgroup_check | default(false) | bool)
-         and (preval_defer_fixes | default(false) | bool)
-         and (auto_remediation_enabled | default(true) | bool) and (auto_fix_cgroup_v2 | default(true) | bool) }}
+      {{ (_problem | bool) and not (_skip | bool) and (preval_defer_fixes | default(false) | bool)
+         and (_nodes.ok | default(false) | bool) and (_nodes.broken | default([]) | length == 0)
+         and ((c14_mode == 'v2')
+              or ((auto_remediation_enabled | default(true) | bool) and (auto_fix_cgroup_v2 | default(true) | bool))) }}

@@ -75,6 +75,32 @@ Standalone page: max-width 1080px, no external resources, details expand when pr
 </section>
 {% endif %}
 
+{% if (node_problems | default([]) | length > 0) or (node_problems_pending | default([]) | length > 0) or (node_problems_error | default('') | length > 0) %}
+<section>
+  <h2>Node problems</h2>
+  <p class="meta">Read-only diagnosis ({{ node_problems_seen | default('') | e }}): the automation reports these; it does not change the nodes.</p>
+  {% if node_problems_error | default('') | length > 0 %}
+  <div class="box warn">The node diagnosis could not run: {{ node_problems_error | e }}</div>
+  {% endif %}
+  {% if node_problems | default([]) | length > 0 %}
+  <table>
+    <tr><th>Node</th><th>Problem</th><th>Likely cause</th><th>What to do</th></tr>
+    {%- for n in node_problems %}
+    <tr><td class="mono">{{ n.node | e }}<br><span class="meta">{{ n.role | e }}, pool {{ n.pool | e }}</span></td>
+        <td><b>{{ n.problem | e }}</b><br><span class="meta">{{ n.detail | e }}</span></td>
+        <td>{{ n.cause | e }}</td><td>{{ n.fix | e }}</td></tr>
+    {%- endfor %}
+  </table>
+  {% endif %}
+  {% if node_problems_pending | default([]) | length > 0 %}
+  <p><b>Pods that cannot be scheduled</b> (the scheduler's message):</p>
+  <ul>
+    {%- for p in node_problems_pending %}<li><code>{{ p.pod | e }}</code>: {{ p.message | e }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+</section>
+{% endif %}
+
 <section>
   <h2>Phases</h2>
   <table>
@@ -111,6 +137,17 @@ Standalone page: max-width 1080px, no external resources, details expand when pr
     <tr><td>{{ o.package | e }}</td><td>{{ o.namespace | e }}</td><td class="mono">{{ (o.version or o.csv) | e }}</td><td>{{ o.channel | e }}</td>
         <td>{{ o.phase | e }}</td><td>{{ ('Yes (max ' ~ o.max_ocp ~ ')') if (o.blocks_upgrade | bool) else 'No' }}</td>
         <td>{{ pill(o.status | default('PASS')) }}</td><td>{{ o.issues | default([]) | join('; ') | e }}</td></tr>
+    {%- endfor %}
+  </table></details>
+  {% endif %}
+  {% if (cgroup_nodes | default({})).nodes | default([]) | length > 0 %}
+  <details{{ '' if (cgroup_nodes.all_ok | bool) else ' open' }}><summary><b>cgroup v2 on every node</b> &mdash; {{ cgroup_nodes.summary | e }}</summary>
+  <table>
+    <tr><th>Node</th><th>Role</th><th>MCO configuration</th><th>Kernel (/sys/fs/cgroup)</th><th>Result</th><th>Problem</th></tr>
+    {%- for n in cgroup_nodes.nodes %}
+    <tr><td class="mono">{{ n.name | e }}</td><td>{{ n.role | e }}</td>
+        <td class="mono">{{ n.config | e }} &bull; {{ n.current | e }}{{ '' if (n.applied | bool) else ' (update not finished)' }}</td>
+        <td class="mono">{{ n.kernel | e }}</td><td>{{ pill('PASS' if (n.ok | bool) else 'FAIL') }}</td><td>{{ n.problem | e }}</td></tr>
     {%- endfor %}
   </table></details>
   {% endif %}

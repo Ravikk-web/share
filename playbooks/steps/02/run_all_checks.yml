@@ -1,6 +1,6 @@
 ---
 # ============================================================================
-# steps/02/run_all_checks.yml - run the 16 prechecks in order
+# steps/02/run_all_checks.yml - run the 17 prechecks in order
 # ============================================================================
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
@@ -24,7 +24,8 @@
 #   05 API server readiness      HARD     13 Platform pods              WARN
 #   06 etcd                      HARD     14 cgroup mode                HARD
 #   07 Admin-acks / removed APIs HARD     15 Operator upgrade blockers  HARD
-#   08 Capacity headroom         HARD     16 Installed operator health  WARN
+#   08 Drain headroom            HARD     16 Installed operator health  WARN
+#                                         17 Router drain headroom      WARN
 # ============================================================================
 
 - name: "Prechecks: Start a fresh list"
@@ -46,7 +47,7 @@
   include_tasks: "{{ playbook_dir }}/steps/02/check_06_etcd.yml"
 - name: "Precheck 07 - Admin-acks and removed APIs"
   include_tasks: "{{ playbook_dir }}/steps/02/check_07_admin_acks.yml"
-- name: "Precheck 08 - Capacity headroom"
+- name: "Precheck 08 - Drain headroom"
   include_tasks: "{{ playbook_dir }}/steps/02/check_08_capacity.yml"
 - name: "Precheck 09 - Pending CSRs"
   include_tasks: "{{ playbook_dir }}/steps/02/check_09_pending_csrs.yml"
@@ -64,6 +65,8 @@
   include_tasks: "{{ playbook_dir }}/steps/02/check_15_operator_blockers.yml"
 - name: "Precheck 16 - Installed operator health"
   include_tasks: "{{ playbook_dir }}/steps/02/check_16_installed_operators.yml"
+- name: "Precheck 17 - Router drain headroom"
+  include_tasks: "{{ playbook_dir }}/steps/02/check_17_router_headroom.yml"
 
 - name: "Prechecks: Results"
   debug:

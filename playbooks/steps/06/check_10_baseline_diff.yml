@@ -4,10 +4,21 @@
 # MIGRATION 2.14: No changes needed.
 # Rule: every node, ClusterOperator and route in the Phase 01 baseline snapshot still
 #       exists. Uses this run's snapshot, or the newest one of the cluster (post-check).
+# Why: a resumed run takes its snapshot while the update is still running; a snapshot
+#      taken on a settled cluster (cluster_metadata.update_running not true) is
+#      preferred - this run's, else the newest one of the cluster.
 
 - name: "Check 10: Find the baseline snapshot"
   shell: |
     wanted={{ baseline_snapshot_file_path | default('') | quote }}
+    settled() { [ -f "$1" ] && jq -e '(.cluster_metadata.update_running // false) | not' "$1" >/dev/null 2>&1; }
+    if [ -n "$wanted" ] && settled "$wanted"; then
+      printf '%s\n' "$wanted"
+      exit 0
+    fi
+    while IFS= read -r f; do
+      if settled "$f"; then printf '%s\n' "$f"; exit 0; fi
+    done < <(ls -1t {{ snapshot_dir | quote }}/{{ cluster_name | quote }}_*_baseline.json 2>/dev/null)
     if [ -n "$wanted" ] && [ -f "$wanted" ]; then
       printf '%s\n' "$wanted"
     else
@@ -46,7 +57,8 @@
       {{ postval_checks + [{'num': 10, 'name': 'Baseline diff', 'gate': 'WARN',
            'status': 'PASS' if ((_base | length > 0) and (_missing | length == 0)) else 'WARN',
            'observed': ('No baseline snapshot found for ' ~ cluster_name ~ '; diff skipped') if (_base | length == 0)
-                       else ('Compared with ' ~ (p10_file.stdout | trim | basename) ~ ' (' ~ _base.cluster_metadata.current_version ~ '): '
+                       else ('Compared with ' ~ (p10_file.stdout | trim | basename) ~ ' (' ~ _base.cluster_metadata.current_version
+                             ~ (', taken while an update was running' if (_base.cluster_metadata.update_running | default(false) | bool) else '') ~ '): '
                              ~ (('missing ' ~ (_missing | join(', ') | truncate(400))) if (_missing | length > 0)
                                 else ('nothing missing - ' ~ (_live.nodes | length) ~ ' nodes, ' ~ (_live.operators | length) ~ ' operators, ' ~ (_routes | length) ~ ' routes')))}] }}
   vars:

@@ -16,6 +16,9 @@
 #                   FIX-FAILED  the change was made but did not verify
 #   task_observed   what was found, what was done, how the rollout went
 #   task_changed    true when the cluster was changed
+#   task_recheck    true when the task changed nothing but watched nodes reboot (the
+#                   rollout of an earlier change): the prechecks run again, and the
+#                   check is not marked AUTO-FIXED
 #   task_check_num  the precheck that Phase 03 marks AUTO-FIXED / FIX-FAILED after its
 #                   re-check (0 = none)
 #   task_autofix    optional {name, action, reference} for the report and summary mail
@@ -29,7 +32,7 @@
     preimpl_tasks: >-
       {{ preimpl_tasks + [{'num': task_num | int, 'name': task_name, 'status': task_status,
                            'observed': task_observed | regex_replace('[ \t\r\n]+', ' ') | trim}] }}
-    preimpl_changed: "{{ (preimpl_changed | bool) or (task_changed | default(false) | bool) }}"
+    preimpl_changed: "{{ (preimpl_changed | bool) or (task_changed | default(false) | bool) or (task_recheck | default(false) | bool) }}"
     remediation_attempted_nums: >-
       {{ remediation_attempted_nums
          + ([task_check_num | int] if ((task_changed | default(false) | bool) and ((task_check_num | default(0) | int) > 0)) else []) }}

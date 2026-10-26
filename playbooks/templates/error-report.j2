@@ -87,6 +87,10 @@ Constraints:
                   <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">{{ current_step_no | default('') | e }} &mdash; <code>{{ failed_task_name | default('Unknown step') | e }}</code></td>
                 </tr>
                 <tr>
+                  <td style="font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Exit code</td>
+                  <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};"><strong>{{ failure_exit_code | default('') | e }}</strong></td>
+                </tr>
+                <tr>
                   <td style="font-weight: 600; color: #344054; background-color: #fcfcfd; padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};">Gate</td>
                   <td style="padding: 8px 12px; border-bottom: 1px solid {{ color_border | default('#e4e7ec') }};"><span style="font-weight: 700; color: {{ color_fail | default('#b42318') }};">{{ failed_gate_type | default('HARD') | e }}</span></td>
                 </tr>
@@ -99,6 +103,31 @@ Constraints:
               <!-- Error output -->
               <div style="margin: 10px 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Error Output</div>
               <div style="background-color: #0f172a; color: #f8fafc; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; padding: 12px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; margin: 8px 0 20px 0; line-height: 1.45;">{{ resolved_error | default('No error output captured.') | string | truncate(4000) | e }}</div>
+
+              {% if (node_problems | default([]) | length > 0) or (node_problems_pending | default([]) | length > 0) or (node_problems_error | default('') | length > 0) %}
+              <!-- Node problems (read-only diagnosis) -->
+              <div style="margin: 10px 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Node problems</div>
+              <div style="border-radius: 6px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; background-color: {{ bg_warn | default('#fff8e1') }}; border: 1px solid #fedf89; color: #7a4f01;">
+                {% if node_problems_error | default('') | length > 0 %}
+                <div style="margin-bottom: 8px;"><strong>The node diagnosis could not run:</strong> {{ node_problems_error | e }}</div>
+                {% endif %}
+                {% for n in node_problems | default([]) %}
+                <div style="margin-bottom: 10px;">
+                  <div><strong>{{ n.node | e }}</strong> ({{ n.role | e }}, pool {{ n.pool | e }}): <strong>{{ n.problem | e }}</strong></div>
+                  <div style="color: #475467;">{{ n.detail | e }}</div>
+                  <div><strong>Likely cause:</strong> {{ n.cause | e }}</div>
+                  <div><strong>What to do:</strong> {{ n.fix | e }}</div>
+                </div>
+                {% endfor %}
+                {% if node_problems_pending | default([]) | length > 0 %}
+                <div style="font-weight: 700; margin: 6px 0 4px 0;">Pods that cannot be scheduled</div>
+                <ul style="margin: 0; padding-left: 18px;">
+                  {% for p in node_problems_pending %}<li><code>{{ p.pod | e }}</code>: {{ p.message | e }}</li>{% endfor %}
+                </ul>
+                {% endif %}
+                <div style="margin-top: 6px; color: #475467;">The automation only reports this; it does not change the nodes.</div>
+              </div>
+              {% endif %}
 
               {% if attachments | length > 0 %}
               <div style="margin: 10px 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #475467;">Attached</div>
@@ -115,7 +144,7 @@ Constraints:
                 <ol style="margin: 0; padding-left: 18px; color: #475467;">
                   <li style="margin-bottom: 4px;">Review the run log on the jump server: <code>{{ log_file | e }}</code></li>
                   <li style="margin-bottom: 4px;">Fix the cause shown above.</li>
-                  <li>Re-run with <code>./00_Run.sh --cluster {{ cluster_name | default('&lt;cluster&gt;') | e }} --resume</code>; hops already completed are skipped automatically.</li>
+                  <li>Run the same command again (for example <code>./00_Run.sh --cluster {{ cluster_name | default('&lt;cluster&gt;') | e }}</code>): an update that is still running is watched to the end first, then the prechecks run and hops already completed are skipped.</li>
                 </ol>
               </div>
 

@@ -8,10 +8,13 @@
 # Used by: main.yml `rescue:` - any failed task in any phase lands here.
 # Does:    1. works out what failed (error text, phase and Phase 03 task or hop,
 #             exit code, RBAC hint)
-#          2. records it in the phase, Phase 03 task and hop results and the run log
-#          3. writes logs/<cluster>_<ts>.status (00_Run.sh turns it into the exit code)
-#          4. writes the run report
-#          5. sends ONE alert mail
+#          2. looks at the nodes (steps/common/diagnose_nodes.yml, read-only): a node
+#             that is not Ready, cordoned or stuck in its update is named in the alert
+#             and the report with the likely cause and what to do
+#          3. records it in the phase, Phase 03 task and hop results and the run log
+#          4. writes logs/<cluster>_<ts>.status (00_Run.sh turns it into the exit code)
+#          5. writes the run report
+#          6. sends ONE alert mail
 # Logout happens afterwards in main.yml `always:`.
 # ============================================================================
 
@@ -42,6 +45,21 @@
     rbac_missing_verb: "{{ (resolved_error | regex_search('cannot [a-z]+ resource') | default('', true)) | regex_replace('^cannot | resource$', '') }}"
     rbac_missing_resource: "{{ (resolved_error | regex_search('resource \"[^\"]+\"') | default('', true)) | regex_replace('^resource \"|\"$', '') }}"
     rbac_missing_group: "{{ (resolved_error | regex_search('API group \"[^\"]*\"') | default('', true)) | regex_replace('^API group \"|\"$', '') }}"
+
+# Why: most stops during or after node work (a precheck, a node rollout, a hop, a
+#      postcheck) come from a node; the alert should say which one and what to do.
+#      Never during login or Phase 01. A problem here must not stop the alert.
+- name: "Failure: Look at the nodes"
+  when: current_phase not in ['login', '01']
+  block:
+    - name: "Failure: Work out what is wrong with the nodes"
+      include_tasks: "{{ playbook_dir }}/steps/common/diagnose_nodes.yml"
+      vars:
+        diagnose_timeout: "20s"
+  rescue:
+    - name: "Failure: The nodes could not be looked at (the alert is still sent)"
+      debug:
+        msg: "[WARN] Node diagnosis skipped: {{ ansible_failed_result.msg | default('unknown error') }}"
 
 # Why: templates/error-report.j2 (the alert mail) reads these names.
 - name: "Failure: Fill in the alert mail details"

@@ -8,7 +8,13 @@
 # Writes snapshots/<cluster>_<ts>_baseline.json: version, channel, cluster ID,
 # nodes, ClusterOperators and routes. Phase 06 Check 10 compares the cluster
 # against it. This file is the only state kept between phases.
+# cluster_metadata.update_running is true when the snapshot was taken while an update
+# or a node rollout was still running (a resumed run); Check 10 then prefers the newest
+# snapshot taken on a settled cluster.
 # ============================================================================
+
+- name: "Snapshot: Is an update still running?"
+  include_tasks: "{{ playbook_dir }}/steps/04/read_update_state.yml"
 
 # Why: one oc call per resource; jq keeps only the fields the diff needs.
 - name: "Snapshot: Read version, operators, nodes and routes"
@@ -41,7 +47,9 @@
   set_fact:
     baseline_snapshot_file_path: "{{ snapshot_dir }}/{{ cluster_name }}_{{ run_timestamp }}_baseline.json"
     baseline:
-      cluster_metadata: "{{ (snapshot_raw.stdout_lines[0] | from_json) | combine({'name': cluster_name, 'api_url': active_cluster_server | default(''), 'captured_at': run_timestamp}) }}"
+      cluster_metadata: >-
+        {{ (snapshot_raw.stdout_lines[0] | from_json) | combine({'name': cluster_name, 'api_url': active_cluster_server | default(''),
+                                                                 'captured_at': run_timestamp, 'update_running': (update_state.running | bool)}) }}
       cluster_operators: "{{ snapshot_raw.stdout_lines[1] | from_json }}"
       nodes: "{{ snapshot_raw.stdout_lines[2] | from_json }}"
       routes: "{{ snapshot_raw.stdout_lines[3] | from_json }}"
@@ -62,4 +70,5 @@
   debug:
     msg: >-
       Baseline saved: {{ baseline.cluster_metadata.current_version }} on {{ baseline.cluster_metadata.channel }},
-      {{ baseline.nodes | length }} nodes, {{ baseline.cluster_operators | length }} operators, {{ baseline.routes | length }} routes.
+      {{ baseline.nodes | length }} nodes, {{ baseline.cluster_operators | length }} operators, {{ baseline.routes | length }} routes
+      {{- ' (taken while an update was still running; Phase 06 prefers an earlier snapshot of a settled cluster)' if (update_state.running | bool) else '' }}.

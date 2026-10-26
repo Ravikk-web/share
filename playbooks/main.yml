@@ -19,13 +19,18 @@
 #
 #   Phase                                     upgrade   dry-run      pre-check  post-check
 #   01 Policy check & baseline                  yes      yes            yes        -
+#   -- An update already running: watched first yes      report only    yes        -
 #   02 Prechecks (read-only)                    yes      yes            yes        -
 #   03 Pre-upgrade implementation (05 watches)  yes      plan only      yes        -
 #   04 Upgrade hops (05 watches each)           yes      plan only      -          -
 #   06 Postchecks & baseline diff               yes      audit only     -          yes
 #   07 Operators & developer console            yes      plan only      -          -
-#   05 Live monitoring never runs on its own: Phases 03 and 04 include it.
+#   05 Live monitoring never runs on its own: Phases 03 and 04 include it, and so does
+#      the resume step after Phase 01 (steps/04/finish_running_update.yml).
 #
+# Running the same command again resumes: an update that is still running (or whose
+# nodes are still updating) is watched to the end first, then the normal flow runs
+# with every gate, and hops the cluster already reached are skipped.
 # A dry run never changes the cluster: every cluster write checks `dry_run`.
 # While testing, a phase include below can be commented out: each phase reads
 # what it needs from the cluster itself.
@@ -99,6 +104,7 @@
         run_phases: "{{ mode_phases[run_mode] }}"
         current_phase: "login"
         run_failed: false
+        resume_watched: false
         run_phase_results: []
         hop_results: []
         admin_acks_applied: []
@@ -148,6 +154,13 @@
         - name: "Phase 01 - Policy check, baseline snapshot, upgrade path"
           include_tasks: "{{ playbook_dir }}/01_Policy_Check.yaml"
           when: 1 in run_phases
+
+        # Why: a run started again while an update is still running (or its nodes are
+        #      still updating) watches that update to the end first, so the prechecks
+        #      judge a settled cluster and every gate still applies to the hops left.
+        - name: "Resume - watch an update that is already running (Phase 05)"
+          include_tasks: "{{ playbook_dir }}/steps/04/finish_running_update.yml"
+          when: (3 in run_phases) or (4 in run_phases)
 
         - name: "Phase 02 - Prechecks (read-only)"
           include_tasks: "{{ playbook_dir }}/02_Pre_upgrade_check.yaml"

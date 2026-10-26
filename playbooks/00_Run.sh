@@ -8,7 +8,8 @@
 #   3. shows what will happen and asks for confirmation
 #      (PROD runs that change the cluster need the word UPGRADE typed in)
 #   4. locks the cluster so only one run can touch it at a time
-#   5. empties logs/ (except logs of a run still active on another cluster)
+#   5. keeps the logs of the cluster's last runs in logs/ (log_keep_runs, this run
+#      included) and deletes its older ones
 #   6. runs main.yml, keeping the console in logs/<cluster>_<timestamp>.txt
 #   7. exits with the code the playbook wrote (see --help)
 #
@@ -20,7 +21,9 @@
 #               pools, cgroup v2 - nodes may reboot, operator upgrades, admin-ack),
 #               no cluster update
 #   post-check  phase 06 only, against the version the cluster is on now
-# To resume after a failure, run the same command again: hops already done are skipped.
+# To resume after a failure, run the same command again: an update that is still
+# running (or whose nodes are still updating) is watched to the end first, then the
+# prechecks run and hops already done are skipped.
 # ============================================================================
 set -euo pipefail
 
@@ -38,7 +41,8 @@ Usage: ./00_Run.sh [options]
                          (cgroup v2 / unpausing pools can reboot nodes), no upgrade
       --post-check       phase 06 only, against the current cluster version
   -y, --yes              do not ask for confirmation (PROD changes still need UPGRADE typed)
-  -r, --resume           accepted for habit; every run resumes on its own (finished hops are skipped)
+  -r, --resume           accepted for habit; every run resumes on its own (a running update is
+                         watched to the end first, finished hops are skipped)
   -m, --mail-to LIST     send the summary/heartbeat mails to these addresses (comma-separated);
                          alerts still also go to alert_mail_to
   -v, --verbose          verbose Ansible output
@@ -76,7 +80,7 @@ while [[ $# -gt 0 ]]; do
         --pre-check)   MODE="pre-check"; shift ;;
         --post-check)  MODE="post-check"; shift ;;
         -y|--yes)      YES=true; shift ;;
-        -r|--resume)   echo "Note: every run resumes on its own - hops already done are skipped."; shift ;;
+        -r|--resume)   echo "Note: every run resumes on its own - a running update is watched to the end first, hops already done are skipped."; shift ;;
         -m|--mail-to)  MAIL_TO="${2:-}"; [[ -n "$MAIL_TO" ]] || die "--mail-to needs an address"; shift 2 ;;
         -v|--verbose)  VERBOSE=(-v); shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -117,6 +121,18 @@ PY
 )" || die "could not read vars/secrets.yml or vars/upgrade.yml (python3 needs PyYAML)"
 [[ -n "$CLUSTER_LINES" ]] || die "no clusters defined in vars/secrets.yml"
 mapfile -t CLUSTER_NAMES < <(cut -d'|' -f1 <<< "$CLUSTER_LINES")
+
+# How many runs of a cluster logs/ keeps (vars/upgrade.yml log_keep_runs, default 5).
+LOG_KEEP_RUNS="$(python3 - <<'PY'
+import yaml
+class Loader(yaml.SafeLoader):
+    pass
+Loader.add_multi_constructor("!", lambda loader, suffix, node: None)
+upgrade = yaml.load(open("vars/upgrade.yml"), Loader=Loader) or {}
+print(upgrade.get("log_keep_runs", 5))
+PY
+)" || LOG_KEEP_RUNS=5
+[[ "$LOG_KEEP_RUNS" =~ ^[0-9]+$ && "$LOG_KEEP_RUNS" -ge 1 ]] || die "log_keep_runs in vars/upgrade.yml must be a number of 1 or more"
 
 # ----------------------------------------------------------------------------
 # 3. Cluster, mode and path
@@ -190,19 +206,24 @@ flock -n 9 || die "cluster '$CLUSTER' is already being worked on by PID $(cat "$
 echo "$$" > "$LOCK_FILE"
 
 # ----------------------------------------------------------------------------
-# 6. Start with an empty logs/ folder
+# 6. Keep the logs of this cluster's last runs
 # ----------------------------------------------------------------------------
-# Why: logs/ only ever holds the latest run. A log whose cluster has a run going on
-#      right now (its lock is held) belongs to that run and is left alone.
-#      Reports (output/) and baseline snapshots (snapshots/) are kept.
-for old_log in logs/*; do
-    [[ -f "$old_log" ]] || continue
-    owner=""
-    [[ "$(basename "$old_log")" =~ ^(.+)_[0-9]{8}_[0-9]{6}\.[a-z]+$ ]] && owner="${BASH_REMATCH[1]}"
-    if [[ -n "$owner" && "$owner" != "$CLUSTER" ]] && ! flock -n "/tmp/aro-upgrade-${owner}.lock" -c true 2>/dev/null; then
-        continue
-    fi
-    rm -f -- "$old_log"
+# Why: the log of a failed run must still be there after the run is started again.
+#      logs/ keeps the last LOG_KEEP_RUNS runs of this cluster, this run included
+#      (a run is its .txt, .csv and .status files); older runs of this cluster are
+#      deleted. Logs of other clusters are left alone (each cluster keeps its own).
+#      Reports (output/) and baseline snapshots (snapshots/) are never deleted.
+mapfile -t OLD_RUNS < <(
+    for old_log in logs/"${CLUSTER}"_*; do
+        [[ -f "$old_log" ]] || continue
+        rest="${old_log#logs/"${CLUSTER}"_}"
+        if [[ "$rest" =~ ^([0-9]{8}_[0-9]{6})\.[a-z]+$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+        fi
+    done | sort -u -r
+)
+for ((i = LOG_KEEP_RUNS - 1; i < ${#OLD_RUNS[@]}; i++)); do
+    rm -f -- "logs/${CLUSTER}_${OLD_RUNS[$i]}".*
 done
 
 # ----------------------------------------------------------------------------

@@ -1,0 +1,294 @@
+---
+# ============================================================================
+# steps/common/diagnose_nodes.yml - what is wrong with the nodes, and what to do
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Used by: Precheck 02 (a node is not Ready, under pressure or cordoned), Phase 05
+#          (before a degradation mail about nodes or a blocked pool) and the failure
+#          handler (the alert mail and the report).
+# Read-only: it reports. It never uncordons, drains, reboots or deletes anything.
+#
+# A node is looked at when it is not Ready, under Disk/Memory/PID pressure, its network
+# is unavailable, it is cordoned, its machine-config daemon is Degraded or
+# Unreconcilable, or its MCO update has not finished. For each one, fixed rules (no
+# heuristics) name the problem, the likely cause and what to do:
+#   NotReady, Ready=Unknown         kubelet stopped reporting: VM stopped/hung, network,
+#                                   or the kubelet starved (Machine / Azure VM state shown)
+#   NotReady, network / CNI message OVN-Kubernetes pod on the node not running
+#   NotReady, PLEG message          container runtime overloaded or hung
+#   machine-config daemon Degraded  the MCD reason (Unreconcilable: the configuration
+#                                   cannot be applied to this node at all)
+#   Memory/Disk/PID pressure        node short of resources
+#   NetworkUnavailable              the node network is not set up
+#   cordoned, MCO update open       the drain: a PodDisruptionBudget allowing 0
+#                                   disruptions, or no room for the evicted pods
+#   cordoned, MCO done              cordoned outside the update (maintenance left over);
+#                                   the MCO counts it as unavailable
+# Each row also shows the Machine / Azure VM state, the node's load (requests, memory
+# limits, usage when the metrics API answers; overcommitted at node_overcommit_* in
+# vars/upgrade.yml), the PodDisruptionBudgets allowing 0 disruptions whose selector
+# matches a pod on the node (DaemonSet pods are not drained and are left out), and,
+# when its pool cannot continue, says so. A pool cannot continue when no node of it is
+# updating and either nodes still need the target configuration while the unavailable
+# nodes (the MCO's own test: not Ready, disk pressure, network unavailable, cordoned)
+# use up maxUnavailable or are all the nodes still waiting, or every node runs the
+# target but an unavailable node keeps the pool from reporting Updated.
+# Pods that cannot be scheduled (PodScheduled=False) are listed with the scheduler's
+# message, for example a router pod that needs one more schedulable worker.
+#
+# Input (include vars, optional): diagnose_timeout - per oc call (default 30s)
+# Output: node_problems          [{node, role, pool, problem, detail, cause, fix}]
+#         node_problems_pending  [{pod, message}]  (at most 8)
+#         node_problems_error    '' or why the nodes could not be read
+#         node_problems_summary  one line ('' when nothing was found)
+#         node_problems_seen     when and in which phase it was read (for the report)
+# ============================================================================
+
+- name: "Node diagnosis: Read nodes, pools, machines, budgets and pods"
+  shell: |
+    set -o pipefail
+    tmpd="$(mktemp -d)"
+    trap 'rm -rf "$tmpd"' EXIT
+    to={{ diagnose_timeout | default('30s') | quote }}
+    # Why: without the nodes there is nothing to diagnose - say so instead of "no problems".
+    if ! oc get nodes,machineconfigpools -o json --request-timeout="$to" >"$tmpd/nm.json" 2>"$tmpd/err"; then
+      jq -cn --arg e "$(head -c 300 "$tmpd/err")" '{ok: false, error: ("the nodes could not be read: " + $e), nodes: [], pending: []}'
+      exit 0
+    fi
+    fetch() { f="$1"; shift; "$@" --request-timeout="$to" >"$tmpd/$f" 2>/dev/null || echo '{"items":[]}' >"$tmpd/$f"; }
+    fetch machines.json oc get machines.machine.openshift.io -n openshift-machine-api -o json
+    fetch pdb.json oc get pdb -A -o json
+    fetch pending.json oc get pods -A --field-selector=status.phase=Pending -o json
+    : >"$tmpd/pods.jsonl"
+    for n in $(jq -r '
+        def cstat(t): ((([(.status.conditions // [])[] | select(.type == t) | .status] | .[0]) // "Unknown") | tostring);
+        def ann(k): ((.metadata.annotations // {})[k] // "");
+        (.items // [])[] | select(.kind == "Node")
+        | select((cstat("Ready") != "True") or (.spec.unschedulable // false)
+                 or (cstat("MemoryPressure") == "True") or (cstat("DiskPressure") == "True") or (cstat("PIDPressure") == "True")
+                 or (cstat("NetworkUnavailable") == "True")
+                 or (ann("machineconfiguration.openshift.io/state") == "Degraded")
+                 or (ann("machineconfiguration.openshift.io/state") == "Unreconcilable")
+                 or (ann("machineconfiguration.openshift.io/currentConfig") != ann("machineconfiguration.openshift.io/desiredConfig")))
+        | .metadata.name' "$tmpd/nm.json"); do
+      oc get pods -A --field-selector="spec.nodeName=$n" -o json --request-timeout="$to" 2>/dev/null \
+        | jq -c --arg n "$n" '{node: $n, pods: [(.items // [])[] | select((.status.phase != "Succeeded") and (.status.phase != "Failed"))
+                                 | {ns: .metadata.namespace, labels: (.metadata.labels // {}),
+                                    daemonset: ((.metadata.ownerReferences // []) | map(.kind == "DaemonSet") | any),
+                                    containers: [(.spec.containers // [])[] | (.resources // {})]}]}' >>"$tmpd/pods.jsonl" || true
+    done
+    jq -s '.' "$tmpd/pods.jsonl" >"$tmpd/pods.json"
+    # Why: the metrics API may be missing or slow; usage is then simply not shown.
+    timeout 30 oc adm top nodes --no-headers 2>/dev/null | awk '{print $1 "\t" $3 "\t" $5}' >"$tmpd/top.tsv" || : >"$tmpd/top.tsv"
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: {cpu: (.[1] // ""), mem: (.[2] // "")}}) | from_entries' "$tmpd/top.tsv" >"$tmpd/top.json"
+    jq -c --slurpfile machines "$tmpd/machines.json" --slurpfile pdb "$tmpd/pdb.json" --slurpfile pending "$tmpd/pending.json" \
+          --slurpfile pods "$tmpd/pods.json" --slurpfile top "$tmpd/top.json" \
+          --argjson usage_max {{ node_overcommit_memory_usage_percent | default(90) | int }} \
+          --argjson limits_max {{ node_overcommit_memory_limits_percent | default(150) | int }} '
+      def cstat(t): ((([(.status.conditions // [])[] | select(.type == t) | .status] | .[0]) // "Unknown") | tostring);
+      def cmsg(t): ((([(.status.conditions // [])[] | select(.type == t) | (.message // "")] | .[0]) // "") | tostring);
+      def ann(k): ((.metadata.annotations // {})[k] // "");
+      def role: ((.metadata.labels // {}) | keys
+                 | map(select(startswith("node-role.kubernetes.io/")) | ltrimstr("node-role.kubernetes.io/"))) as $r
+        | if ($r | map((. == "master") or (. == "control-plane")) | any) then "master"
+          elif ($r | map(. == "infra") | any) then "infra" else "worker" end;
+      def parse_cpu:
+        if . == null then 0
+        elif (tostring | endswith("m")) then (tostring | sub("m$"; "") | tonumber)
+        elif (tostring | endswith("u")) then (tostring | sub("u$"; "") | tonumber / 1000)
+        elif (tostring | endswith("n")) then (tostring | sub("n$"; "") | tonumber / 1000000)
+        else ((tostring | tonumber) * 1000) end;
+      def parse_mem:
+        if . == null then 0
+        elif (tostring | endswith("Ki")) then ((tostring | sub("Ki$"; "") | tonumber) * 1024)
+        elif (tostring | endswith("Mi")) then ((tostring | sub("Mi$"; "") | tonumber) * 1048576)
+        elif (tostring | endswith("Gi")) then ((tostring | sub("Gi$"; "") | tonumber) * 1073741824)
+        elif (tostring | endswith("Ti")) then ((tostring | sub("Ti$"; "") | tonumber) * 1099511627776)
+        elif (tostring | endswith("Pi")) then ((tostring | sub("Pi$"; "") | tonumber) * 1125899906842624)
+        elif (tostring | endswith("m")) then ((tostring | sub("m$"; "") | tonumber) / 1000)
+        elif (tostring | endswith("k")) then ((tostring | sub("k$"; "") | tonumber) * 1000)
+        elif (tostring | endswith("M")) then ((tostring | sub("M$"; "") | tonumber) * 1000000)
+        elif (tostring | endswith("G")) then ((tostring | sub("G$"; "") | tonumber) * 1000000000)
+        elif (tostring | endswith("T")) then ((tostring | sub("T$"; "") | tonumber) * 1000000000000)
+        elif (tostring | endswith("P")) then ((tostring | sub("P$"; "") | tonumber) * 1000000000000000)
+        else (tostring | tonumber) end;
+      def pct(a; b): (if b > 0 then ((a / b * 100) | floor) else 0 end);
+      def maxu: (.spec.maxUnavailable // 1) as $m | (.status.machineCount // 0) as $c
+        | (if ($m | type) == "string" then ((($m | rtrimstr("%") | tonumber) * $c / 100) | floor) else $m end)
+        | if . < 1 then 1 else . end;
+      def mcd_failed: (ann("machineconfiguration.openshift.io/state") == "Degraded")
+        or (ann("machineconfiguration.openshift.io/state") == "Unreconcilable");
+      # The MCO counts a node as unavailable (it uses up maxUnavailable and is never picked
+      # for an update) when it is not Ready, DiskPressure or NetworkUnavailable is not
+      # False, or it is cordoned.
+      def mco_unavailable: (cstat("Ready") != "True")
+        or (([(.status.conditions // [])[] | select((.type == "DiskPressure") or (.type == "NetworkUnavailable"))
+              | select((.status | tostring) != "False")] | length) > 0)
+        or (.spec.unschedulable // false);
+      (.items // []) as $all
+      | [$all[] | select(.kind == "Node")] as $nodes
+      | [$all[] | select(.kind == "MachineConfigPool")] as $mcps
+      | [$mcps[] | .metadata.name] as $pnames
+      # The pool of a node: the MCP whose rendered configuration the node runs
+      # (rendered-<pool>-<hash>), else by role.
+      | def pool_of: ann("machineconfiguration.openshift.io/currentConfig") as $c
+          | ([$pnames[] | . as $p | select(($c | startswith("rendered-" + $p + "-")) and ((($c | ltrimstr("rendered-" + $p + "-")) | contains("-")) | not))] | .[0])
+            // (if role == "master" then "master" else "worker" end);
+      (($machines[0].items // []) | map(select((.status.nodeRef.name // "") != "")
+           | {key: .status.nodeRef.name, value: {machine: .metadata.name, phase: (.status.phase // ""),
+                                                  vm: ((.status.providerStatus.vmState // "") | tostring), error: (.status.errorMessage // "")}})
+         | from_entries) as $mach
+      # Budgets that allow no disruption right now (a selector of null matches no pod).
+      | [($pdb[0].items // [])[] | select(((.status.disruptionsAllowed // 0) == 0) and ((.status.expectedPods // 0) > 0))
+           | select(.spec.selector != null)
+           | {ns: .metadata.namespace, name: .metadata.name, selector: .spec.selector}] as $zero
+      | (($pods[0] // []) | map({key: .node, value: .pods}) | from_entries) as $podsby
+      | ($top[0] // {}) as $usage
+      # Pools that cannot continue or finish (see the header).
+      | ($mcps | map(. as $p | ($p | maxu) as $mu
+          | ($p.spec.configuration.name // "") as $target
+          | [$nodes[] | select(pool_of == $p.metadata.name)] as $pn
+          | [$pn[] | select(mco_unavailable) | .metadata.name] as $un
+          | [$pn[] | select(ann("machineconfiguration.openshift.io/currentConfig") != $target) | .metadata.name] as $todo
+          | [$pn[] | select((ann("machineconfiguration.openshift.io/currentConfig") != ann("machineconfiguration.openshift.io/desiredConfig"))
+                            or (ann("machineconfiguration.openshift.io/state") == "Working"))] as $working
+          | {key: $p.metadata.name, value: {maxu: $mu, unavailable: $un, todo: ($todo | length),
+              blocked: ((($p.spec.paused // false) | not) and (($working | length) == 0)
+                        and (((($todo | length) > 0) and ((($un | length) >= $mu) or ((($todo - $un) | length) == 0)))
+                             or ((($todo | length) == 0) and (($un | length) > 0) and (($p | cstat("Updated")) != "True"))))}})
+         | from_entries) as $pools
+      | {ok: true,
+         nodes: [$nodes[] | . as $n
+           | cstat("Ready") as $ready
+           | cmsg("Ready") as $rmsg
+           | (.spec.unschedulable // false) as $cordoned
+           | ann("machineconfiguration.openshift.io/state") as $st
+           | ann("machineconfiguration.openshift.io/currentConfig") as $cur
+           | ann("machineconfiguration.openshift.io/desiredConfig") as $des
+           | (($cur != $des) or ($st == "Working")) as $updating
+           | [(.status.conditions // [])[] | select(((.type == "MemoryPressure") or (.type == "DiskPressure") or (.type == "PIDPressure")) and ((.status | tostring) == "True")) | .type] as $pressure
+           | (cstat("NetworkUnavailable") == "True") as $netdown
+           | select(($ready != "True") or $cordoned or (($pressure | length) > 0) or $netdown or mcd_failed or $updating)
+           | .metadata.name as $name
+           | pool_of as $pool
+           | ($mach[$name] // {}) as $m
+           | ($podsby[$name] // []) as $np
+           | ([$np[] | .containers[] | (.requests.cpu // null) | parse_cpu] | add // 0) as $rcpu
+           | ([$np[] | .containers[] | (.requests.memory // null) | parse_mem] | add // 0) as $rmem
+           | ([$np[] | .containers[] | (.limits.memory // null) | parse_mem] | add // 0) as $lmem
+           | ((.status.allocatable.cpu // null) | parse_cpu) as $acpu
+           | ((.status.allocatable.memory // null) | parse_mem) as $amem
+           | ($usage[$name] // {}) as $u
+           # A budget blocks the drain of this node when its selector matches a pod here that
+           # the drain has to evict (DaemonSet pods are not evicted).
+           | [$zero[] | . as $z
+               | select([$np[] | select((.daemonset | not) and (.ns == $z.ns)) | .labels as $l
+                         | ((($z.selector.matchLabels // {}) | to_entries | map(($l[.key] // null) == .value) | all)
+                            and ((($z.selector.matchExpressions // []) | map(. as $e | ($l[$e.key] // null) as $v
+                                   | if $e.operator == "In" then (($e.values // []) | map(. == $v) | any)
+                                     elif $e.operator == "NotIn" then ((($e.values // []) | map(. == $v) | any) | not)
+                                     elif $e.operator == "Exists" then ($l | has($e.key))
+                                     elif $e.operator == "DoesNotExist" then (($l | has($e.key)) | not)
+                                     else false end) | all)))] | any)
+               | (.ns + "/" + .name)] as $blockers
+           | ($pools[$pool] // {}) as $pl
+           | (($u.mem // "") | if test("^[0-9]+%$") then (sub("%$"; "") | tonumber) else 0 end) as $umem
+           | {node: $name, role: role, pool: $pool,
+              load: ("requests " + (pct($rcpu; $acpu) | tostring) + "% CPU / " + (pct($rmem; $amem) | tostring) + "% memory, memory limits "
+                     + (pct($lmem; $amem) | tostring) + "% of allocatable"
+                     + (if ($u.mem // "") != "" then (", usage " + ($u.cpu // "?") + " CPU / " + $u.mem + " memory") else "" end)),
+              overcommitted: (($umem >= $usage_max) or (pct($lmem; $amem) > $limits_max)),
+              machine: (if ($m.machine // "") == "" then "" else ("Machine " + $m.machine + " phase " + (if $m.phase == "" then "unknown" else $m.phase end)
+                        + (if $m.vm != "" then (", VM " + $m.vm) else "" end) + (if $m.error != "" then (", error: " + ($m.error | .[0:160])) else "" end)) end),
+              vm_bad: (((($m.vm // "") != "") and (($m.vm // "") != "Running") and (($m.vm // "") != "Succeeded")) or (($m.phase // "") == "Failed")),
+              pool_note: (if ($pl.blocked // false) | not then ""
+                          elif ($pl.todo // 0) > 0 then ("pool " + $pool + " cannot continue: " + ($pl.unavailable | join(", ")) + " unavailable (maxUnavailable "
+                               + ($pl.maxu | tostring) + "), so the MCO updates no other node of this pool until one is back")
+                          else ("pool " + $pool + " cannot finish: every node runs the target configuration, but "
+                               + ($pl.unavailable | join(", ")) + " unavailable, so the pool does not report Updated") end),
+              blockers: $blockers}
+           + (if $ready == "Unknown" then
+                {problem: "NotReady: the kubelet stopped reporting",
+                 cause: "the VM is stopped or hung, the node lost its network, or the kubelet is starved of memory or CPU",
+                 fix: ("Check the VM (oc get machine -n openshift-machine-api -o wide; Azure portal); restart a hung VM. "
+                       + "A worker that does not come back can be replaced by deleting its Machine (the MachineSet creates a new one); "
+                       + "never delete a master - open an ARO support case.")}
+              elif ($ready != "True") and ($rmsg | test("network plugin|networkready=false|cni"; "i")) then
+                {problem: "NotReady: network plugin not ready",
+                 cause: "the OVN-Kubernetes pod on this node is not running",
+                 fix: ("oc get pods -n openshift-ovn-kubernetes -o wide --field-selector spec.nodeName=" + $name + " and read the log of that pod")}
+              elif ($ready != "True") and ($rmsg | test("PLEG")) then
+                {problem: "NotReady: container runtime not healthy (PLEG)",
+                 cause: "the node is overloaded or CRI-O hangs",
+                 fix: ("oc adm top node " + $name + "; oc adm node-logs " + $name + " -u crio; restart a VM that does not recover")}
+              elif $ready != "True" then
+                {problem: ("NotReady: " + (if $rmsg == "" then "no reason given" else ($rmsg | .[0:120]) end)),
+                 cause: "the kubelet reports the node not ready",
+                 fix: ("oc describe node " + $name + "; oc adm node-logs " + $name + " -u kubelet")}
+              elif mcd_failed then
+                {problem: ("machine-config daemon " + $st),
+                 cause: ((if $st == "Unreconcilable" then "the configuration cannot be applied to this node at all: " else "" end)
+                         + (ann("machineconfiguration.openshift.io/reason") | if . == "" then "no reason given" else .[0:200] end)),
+                 fix: ((if $st == "Unreconcilable" then "Fix or revert the MachineConfig the reason names; " else "" end)
+                       + "read the machine-config-daemon log of this node (oc logs -n openshift-machine-config-operator <machine-config-daemon pod on the node> -c machine-config-daemon) and fix what it names; the MCO then retries.")}
+              elif ($pressure | length) > 0 then
+                {problem: ($pressure | join(", ")),
+                 cause: "the node is short of memory, disk or process IDs; the kubelet evicts pods",
+                 fix: ("oc adm top node " + $name + "; move or scale down workloads, free disk (images, logs)")}
+              elif $netdown then
+                {problem: "network unavailable",
+                 cause: "the node network is not set up (NetworkUnavailable=True); the MCO counts the node as unavailable",
+                 fix: ("oc get pods -n openshift-ovn-kubernetes -o wide --field-selector spec.nodeName=" + $name + " and read the log of that pod")}
+              elif $cordoned and $updating then
+                {problem: "cordoned for its update (drain / reboot)",
+                 cause: "the MCO is updating this node; when this lasts, the drain cannot evict a pod: a PodDisruptionBudget that allows 0 disruptions, or no room on the other nodes for the evicted pods",
+                 fix: ("oc logs -n openshift-machine-config-operator deploy/machine-config-controller -c machine-config-controller | grep " + $name
+                       + " names the pod. With its owner, get the app healthy or delete that one pod (oc delete pod); the MCO retries by itself. Do not uncordon it.")}
+              elif $cordoned then
+                {problem: "cordoned, but not by the update",
+                 cause: "the node is cordoned although the MCO is done with it (maintenance left over?); the MCO counts it as unavailable",
+                 fix: ("oc adm uncordon " + $name + " - when nobody is working on the node")}
+              else
+                {problem: "MCO update in progress",
+                 cause: ("the MCO is applying configuration " + $des + " (state " + (if $st == "" then "unknown" else $st end) + ")"),
+                 fix: "nothing yet - the update is watched"}
+              end)
+           | . + {detail: ([.machine, .load, (if (.blockers | length) > 0 then ("PodDisruptionBudgets allowing 0 disruptions with pods on this node: " + (.blockers | join(", "))) else "" end), .pool_note]
+                           | map(select(. != "")) | join("; ")),
+                  cause: (.cause + (if .vm_bad then "; the Azure VM is not running" else "" end)
+                                 + (if .overcommitted then ("; the node is overcommitted (memory usage >= " + ($usage_max | tostring)
+                                                           + "% or memory limits above " + ($limits_max | tostring) + "% of allocatable)") else "" end))}
+           | {node, role, pool, problem, detail, cause, fix}],
+         pending: ([($pending[0].items // [])[]
+           | select(([(.status.conditions // [])[] | select((.type == "PodScheduled") and ((.status | tostring) == "False"))] | length) > 0)
+           | {pod: (.metadata.namespace + "/" + .metadata.name),
+              message: ((([(.status.conditions // [])[] | select(.type == "PodScheduled") | (.message // "")] | .[0]) // "") | .[0:240])}] | .[0:8])}' "$tmpd/nm.json"
+  args:
+    executable: /bin/bash
+  register: node_diag_raw
+  changed_when: false
+  failed_when: false
+
+- name: "Node diagnosis: Keep the result"
+  set_fact:
+    node_problems: "{{ _d.nodes | default([]) }}"
+    node_problems_pending: "{{ _d.pending | default([]) }}"
+    node_problems_error: "{{ '' if (_d.ok | default(false) | bool) else (_d.error | default('no output from the diagnosis')) }}"
+    node_problems_seen: "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}, {{ phase_names[current_phase | default('')] | default('the run') }}"
+    node_problems_summary: >-
+      {%- set out = [] -%}
+      {%- for n in _d.nodes | default([]) -%}{%- set _ = out.append(n.node ~ ': ' ~ n.problem ~ ' - ' ~ n.fix) -%}{%- endfor -%}
+      {{ out | join(' | ') | truncate(900) }}
+  vars:
+    _d: >-
+      {{ (node_diag_raw.stdout | from_json) if ((node_diag_raw.stdout | default('') | trim).startswith('{'))
+         else {'ok': false, 'error': (node_diag_raw.stderr | default('', true) | trim | truncate(300)) or 'no output from the diagnosis', 'nodes': [], 'pending': []} }}
+
+- name: "Node diagnosis: Result"
+  debug:
+    msg: >-
+      {{ ('Node diagnosis failed: ' ~ node_problems_error) if (node_problems_error | length > 0)
+         else (('Node problems: ' ~ node_problems_summary) if (node_problems | length > 0) else 'No node problems found.') }}
+      {{- (' Pods that cannot be scheduled: ' ~ (node_problems_pending | map(attribute='pod') | join(', '))) if (node_problems_pending | length > 0) else '' }}

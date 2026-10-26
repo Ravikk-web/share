@@ -1,0 +1,89 @@
+---
+# Precheck 17 - Router drain headroom (WARN)
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+# Rule: every router deployment (openshift-ingress/router-*) has at least
+#       replicas + maxUnavailable eligible nodes: Ready, schedulable, matching the
+#       router's nodeSelector and tolerating every NoSchedule/NoExecute taint.
+# Why: router pods of the same version must run on different nodes (a required pod
+#      anti-affinity set by the ingress operator) and only on their eligible nodes
+#      (workers by default). With replicas = eligible nodes - for example 3 routers on
+#      3 workers - every node drain leaves one router Pending until that node is back:
+#      the ingress ClusterOperator is Progressing meanwhile ("2 of 3 updated replica(s)
+#      are available"), and Degraded once that lasts 60 minutes (a stuck node). The
+#      upgrade still works, so this is a WARN; the room for one more router (another
+#      eligible node, or one replica fewer) is a configuration decision, never made here.
+
+- name: "Check 17: Read the router deployments, nodes and pools"
+  shell: |
+    set -o pipefail
+    tmpd="$(mktemp -d)"
+    trap 'rm -rf "$tmpd"' EXIT
+    # Why: a failed read must fail the task (retried by `until`), never become "no routers".
+    oc get deployments -n openshift-ingress -o json >"$tmpd/deploy.json" || exit 1
+    oc get nodes,machineconfigpools -o json >"$tmpd/nm.json" || exit 1
+    jq -c --slurpfile deploy "$tmpd/deploy.json" '
+      def cstat(t): ((([(.status.conditions // [])[] | select(.type == t) | .status] | .[0]) // "Unknown") | tostring);
+      def ann(k): ((.metadata.annotations // {})[k] // "");
+      def role: ((.metadata.labels // {}) | keys
+                 | map(select(startswith("node-role.kubernetes.io/")) | ltrimstr("node-role.kubernetes.io/"))) as $r
+        | if ($r | map((. == "master") or (. == "control-plane")) | any) then "master"
+          elif ($r | map(. == "infra") | any) then "infra" else "worker" end;
+      def maxu: (.spec.maxUnavailable // 1) as $m | (.status.machineCount // 0) as $c
+        | (if ($m | type) == "string" then ((($m | rtrimstr("%") | tonumber) * $c / 100) | floor) else $m end)
+        | if . < 1 then 1 else . end;
+      (.items // []) as $all
+      | [$all[] | select(.kind == "Node")] as $nodes
+      | [$all[] | select(.kind == "MachineConfigPool")] as $mcps
+      | [$mcps[] | .metadata.name] as $pnames
+      | def pool_of: ann("machineconfiguration.openshift.io/currentConfig") as $c
+          | ([$pnames[] | . as $p | select(($c | startswith("rendered-" + $p + "-")) and ((($c | ltrimstr("rendered-" + $p + "-")) | contains("-")) | not))] | .[0])
+            // (if role == "master" then "master" else "worker" end);
+      [($deploy[0].items // [])[] | select(.metadata.name | startswith("router-"))
+        | .metadata.name as $name
+        | (.spec.replicas // 1) as $replicas
+        | (.spec.template.spec.nodeSelector // {}) as $sel
+        | (.spec.template.spec.tolerations // []) as $tol
+        # A toleration matches a taint by key (or an empty key with Exists), by value
+        # (unless Exists) and by effect (an empty effect matches every effect).
+        | def tolerated: . as $t
+            | ([$tol[] | select(((((.key // "") == "") and ((.operator // "Equal") == "Exists"))
+                                  or (((.key // "") == $t.key) and (((.operator // "Equal") == "Exists") or ((.value // "") == ($t.value // ""))))))
+                        | select(((.effect // "") == "") or (.effect == $t.effect))] | length) > 0;
+          [$nodes[] | select((cstat("Ready") == "True") and ((.spec.unschedulable // false) | not))
+            | select((.metadata.labels // {}) as $l | ($sel | to_entries | map(($l[.key] // null) == .value) | all))
+            | select(([(.spec.taints // [])[] | select((.effect == "NoSchedule") or (.effect == "NoExecute")) | select(tolerated | not)] | length) == 0)] as $eligible
+        | ([$eligible[] | pool_of] | unique) as $epools
+        | ([$mcps[] | select(.metadata.name as $n | ($epools | map(. == $n) | any)) | maxu] | max // 1) as $mu
+        | {name: $name, replicas: $replicas, eligible: ($eligible | length), maxu: $mu,
+           pools: ($epools | join(", ")), ok: (($eligible | length) >= ($replicas + $mu))}]' "$tmpd/nm.json"
+  args:
+    executable: /bin/bash
+  register: c17_raw
+  changed_when: false
+  retries: "{{ oc_command_retries | default(3) }}"
+  delay: "{{ oc_command_retry_delay | default(10) }}"
+  until: c17_raw.rc == 0
+
+- name: "Check 17: Record the result"
+  set_fact:
+    preval_checks: >-
+      {{ preval_checks + [{'num': 17, 'name': 'Router drain headroom', 'gate': 'WARN',
+           'status': 'PASS' if ((_routers | length > 0) and (_short | length == 0)) else 'WARN',
+           'observed': ('No router deployment found in openshift-ingress' if (_routers | length == 0)
+                        else ((_lines | join(' | '))
+                              ~ ('' if (_short | length == 0)
+                                 else ('. While a node is drained, one router of ' ~ (_short | join(', '))
+                                       ~ ' stays Pending until the node is back: ingress is Progressing meanwhile, and Degraded once a node'
+                                       ~ ' is stuck for 60 minutes. Not a blocker; one more eligible node (or one replica fewer) would avoid it.'))))}] }}
+  vars:
+    _routers: "{{ c17_raw.stdout | from_json }}"
+    _short: "{{ _routers | rejectattr('ok') | map(attribute='name') | list }}"
+    _lines: >-
+      {%- set out = [] -%}
+      {%- for r in _routers -%}
+      {%- set _ = out.append(r.name ~ ': ' ~ r.replicas ~ ' replica(s) on ' ~ r.eligible ~ ' eligible node(s)'
+                             ~ ((' (pool ' ~ r.pools ~ ', maxUnavailable ' ~ r.maxu ~ ')') if (r.pools | length > 0) else '')
+                             ~ ('' if (r.ok | bool) else (' - needs ' ~ ((r.replicas | int) + (r.maxu | int)) ~ ' to roll without a Pending router'))) -%}
+      {%- endfor -%}
+      {{ out }}

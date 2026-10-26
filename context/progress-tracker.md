@@ -5,10 +5,18 @@ Update this file after **every meaningful implementation change**.
 ---
 
 ## Current Phase
-- **Phase 5 - Pre-upgrade implementation phase** (2026-10-14)
+- **Phase 6 - Live-run fixes** (2026-10-26), after the first live run on arod01.
 
 ## Current Goal
-- New Phase 03 (`03_Pre_upgrade_Implementation.yaml`) makes every pre-upgrade change with a rollout watch after each; phases renumbered to 01..07 (`00_Run.sh -> main.yml -> 01..07`, one failure handler). Verified offline. Next: jump-host validation (see Next Up). Nothing committed - the user commits when ready.
+- The fixes for the arod01 run:
+  - resume that watches a running update first;
+  - cgroup v2 verified on every node (MCO configuration and kernel);
+  - node diagnosis with cause and fix (report only);
+  - a "pool cannot continue" alert;
+  - drain headroom (Check 08, HARD) and router headroom (Check 17, WARN);
+  - the logs of the last 5 runs kept.
+
+  Verified offline; next is jump-host validation (see Next Up). Nothing committed - the user commits when ready.
 
 ---
 
@@ -384,26 +392,40 @@ During v1 development and testing, 20+ critical operational and syntax issues we
 ---
 
 ## Next Up
-1. Jump host, in order: `ansible-playbook --syntax-check main.yml` on Ansible 2.7.17 and 2.14.18; `ansible-doc -t module mail` (community.general on 2.14); `jq --version`; `curl` reaches `upgrade_graph_url`.
-2. `./00_Run.sh --cluster <dev> --dry-run`, then `--pre-check` (Phase 03 changes: watch the rollout mails, the operator approvals and the admin-ack), then a one-hop DEV upgrade.
-3. While testing, phases can be commented out in `main.yml` (and single tasks in `03_Pre_upgrade_Implementation.yaml`); each reads what it needs from the cluster.
-4. Non-production multi-hop soak; SRE handover; CAB.
+1. arod01 now: free the cordoned worker `arod01-9bccf-worker-northcentralus-4bk65`. If its drain is stuck, clear the pod named in the machine-config-controller log with the app owner; if the cordon is a leftover, `oc adm uncordon`. Let the worker pool finish, then run the same command again (the resume watches what is still running).
+2. Jump host, in order: `ansible-playbook --syntax-check main.yml` on Ansible 2.7.17 and 2.14.18; `ansible-doc -t module mail` (community.general on 2.14); `jq --version`; `curl` reaches `upgrade_graph_url`.
+3. On the jump host, check the new reads on a real cluster:
+   - `oc exec -n openshift-machine-config-operator <mcd pod> -c machine-config-daemon -- chroot /rootfs stat -c %T -f /sys/fs/cgroup` prints `cgroup2fs`;
+   - `oc get machines.machine.openshift.io -n openshift-machine-api` works for the account;
+   - `oc adm top nodes` answers (optional).
+4. `./00_Run.sh --cluster <dev> --dry-run`, then `--pre-check`, then a one-hop DEV upgrade. Watch Check 08: its new drain math may FAIL clusters whose workers are full (HARD by decision).
+5. Non-production multi-hop soak; SRE handover; CAB.
 
 ## Architecture Decisions (Locked)
-1. **One flow**: `00_Run.sh -> main.yml` (one play, one block / rescue / always) -> phase files `01..07` -> `steps/<phase>/`. No roles, no single-phase entry points. Run modes: upgrade (01 02 03 04 06 07), dry-run (same, read-only), pre-check (01 02 03), post-check (06) via `mode_phases` in `main.yml`. Phase 05 (monitoring) is included by 03 and 04.
+1. **One flow**: `00_Run.sh -> main.yml` (one play, one block / rescue / always) -> phase files `01..07` -> `steps/<phase>/`. No roles, no single-phase entry points. Run modes: upgrade (01 02 03 04 06 07), dry-run (same, read-only), pre-check (01 02 03), post-check (06) via `mode_phases` in `main.yml`. Phase 05 (monitoring) is included by 03, 04 and the resume step after 01 (`steps/04/finish_running_update.yml`).
 2. **One failure handler** (`steps/common/handle_failure.yml`): report, `.status` exit code, one alert; `always:` logs out.
-3. **Checks only record; phases gate.** 16 prechecks (Check 16 installed operator health, WARN), 10 postchecks.
+3. **Checks only record; phases gate.** 17 prechecks (Check 16 installed operator health, WARN; Check 17 router drain headroom, WARN), 10 postchecks.
 4. **Pre-upgrade changes only in Phase 03** (decided 2026-10-14; never in dry run): unpause allow-listed pools, cgroup v2, approve every pending operator upgrade (stop if an operator still blocks the target; channels are never changed), admin-ack after the removed-API check. Each task: check -> change -> watch rollout -> verify -> stop on FIX-FAILED. Full re-check decides AUTO-FIXED / FIX-FAILED. Phase 02 is read-only and leaves fixable problems to Phase 03 as WARN. A later minor hop's admin-ack is applied right before that hop (its key only appears on that minor). One restart of a Failed approved operator (Phases 03 and 07). Exit code 15 for Phase 03.
 5. **Mails**: heartbeat + degradation during updates, then one summary or one alert; lists `mail_to` / `alert_mail_to`; switch `send_email`.
 6. **One report per run** (`templates/report.j2`).
 7. **No AI in runtime**; Ansible 2.7.17 / 2.14.18 single codebase; flock lock per cluster; snapshot is the only saved state.
 8. **Removed on request (2026-10-13)**: single-phase / skip-to / stop-after runs, opt-in degraded-operator pod restart, opt-in machine-config-daemon force, forced-image upgrade, decorated CLI and `--clean`, prevalidation mail, per-type mail lists / switches, notification ledger.
+9. **Resume (2026-10-26)**: no resume mode. Right after Phase 01, an update still running (control plane, or a hop's nodes after ClusterVersion reports Completed) is watched to the end. Then the normal flow runs with every gate.
+   - Modes: `--pre-check` watches too, `--dry-run` reports only, `--post-check` checks as-is and says so.
+   - Logs: the last 5 runs per cluster are kept.
+10. **Nodes (2026-10-26)**:
+    - cgroup v2 is verified on every node: the MCO configuration and the kernel, the kernel through `oc exec` into the machine-config-daemon pod. A node that cannot be checked is FAIL.
+    - The rollout is never triggered by hand; the run waits on node state.
+    - Node problems are reported with cause and fix, never repaired (no uncordon, drain, reboot, scaling or ingress change).
+    - Drain headroom (Check 08) is HARD; router headroom (Check 17) is WARN.
 
 ---
 
 ## Open Questions
 - Multi-step operator upgrade chains: Phase 03 approves the current InstallPlan once per run. If an operator needs two steps to reach a version that supports the target, the run stops and the next run approves the next step. A bounded multi-round approval could remove the re-run.
 - An operator that blocks a *later* hop but only gets a compatible version in the catalog of an intermediate minor still stops the run in Phase 02 (Check 15 compares with the highest hop), as before.
+- Check 08 judges requests, not real usage. A pool that passes can still stall a drain through a PodDisruptionBudget allowing 0 disruptions; Check 12 lists those budgets as WARN. Making a zero-disruption budget on a drained pool HARD stays a user decision (`fail_on_zero_disruption_pdb`).
+- The kernel check needs `pods/exec` in `openshift-machine-config-operator`. If a cluster's policy forbids exec, `cgroup_check_kernel: false` falls back to the MCO configuration check.
 
 ## Session Notes
 
@@ -652,3 +674,64 @@ During v1 development and testing, 20+ critical operational and syntax issues we
   - Docs: architecture, project overview, UI context, code standards, AI workflow rules, WORKFLOW.md, README, Documentation.md, AGENTS.md.
 - **Verified offline** (session scratchpad): 66 YAML files parse; 1000 templated strings parse with known filters/tests; every include exists; 82 jq programs compile (libjq) and pass the jq 1.5 scan; `bash -n` on 53 rendered shell blocks and `00_Run.sh`; 13 end-to-end scenarios running the real `main.yml` with a small Ansible emulator against a fake `oc` (MCO / OLM / CVO simulated) and fake `jq` (libjq).
 - **Not verified here**: Ansible itself and a real cluster - see Next Up.
+
+### Session: Live-run fixes after arod01 (2026-10-26)
+- **What happened (first live run, arod01):**
+  - Phase 03 set cgroup v2 and the hop to 4.20.10 started.
+  - Worker `arod01-9bccf-worker-northcentralus-4bk65` stayed cordoned. The MCO counts NotReady and cordoned nodes as unavailable, so with `maxUnavailable: 1` used up the worker pool stayed at "0 of 3".
+  - The router (3 replicas on 3 workers, required anti-affinity) placed only 2 of 3 pods, so ingress went Progressing, then Degraded after 60 minutes.
+  - Phase 05 stopped after 90 minutes without progress (exit 30).
+  - The re-run stopped in Phase 02 (Checks 01/02/03), because the gate ran before Phase 04 could watch the running update.
+- **User decisions:**
+  - Resume: the recommended option. A running update is watched to the end first; pre-check watches too, dry-run reports, post-check checks as-is.
+  - cgroup: kernel check on every node, FAIL when a node cannot be checked.
+  - Capacity: drain headroom HARD, router headroom WARN.
+  - Logs: keep the last 5 runs per cluster.
+  - Nodes: report only.
+  - The ~1 hour is the whole rollout, so waiting on node state is fine.
+- **What changed:**
+  - New steps:
+    - `steps/04/read_update_state.yml`, `steps/04/finish_running_update.yml` (resume, included from `main.yml` after Phase 01)
+    - `steps/03/cgroup_nodes.yml` (per-node cgroup check)
+    - `steps/common/diagnose_nodes.yml` (node diagnosis)
+    - `steps/02/check_17_router_headroom.yml`
+  - Rewritten: `steps/02/check_08_capacity.yml` (drain headroom), `check_14_cgroup_mode.yml`, `steps/03/task_2_cgroup_v2.yml`.
+  - Changed:
+    - `check_02_nodes.yml` (diagnosis), `hop.yml` (plan with pools)
+    - `poll.yml` ("pool cannot continue" condition, diagnosis before node/pool degradation mails)
+    - `handle_failure.yml` (guarded diagnosis), `record_task.yml` (`task_recheck`)
+    - `snapshot.yml` (`update_running`), Postcheck 10 (settled baseline), Phase 06 (running-update note)
+    - `write_report.yml`, the templates (Node problems, cgroup table, resume text)
+    - `00_Run.sh` (log retention, resume text), `vars/upgrade.yml` (five settings)
+  - Docs: WORKFLOW, architecture, code standards, project overview, UI context, AI workflow rules, README, Documentation.md.
+- **Verification (offline, session scratchpad):**
+  - The previous session's harness (static checks, Ansible emulator, fake `oc` / `jq`) was reused and extended.
+  - The fake cluster now models:
+    - rendered MachineConfigs with kernel arguments, and nodes that take their pool's configuration when a rollout ends;
+    - machine-config-daemon pods and `oc exec ... stat`;
+    - Machines, router deployments, `oc adm top`, field selectors;
+    - an MCO that does not progress a pool while a node is unavailable.
+  - Two harness limits were found and fixed:
+    - On Windows the fake `jq` / `oc` wrote CR LF.
+    - On Windows a `bash -c` argument is cut at about 8 KB (scripts are now run from a file; Linux allows 128 KB, so the playbooks are unaffected).
+  - Baseline before the changes: 13 scenarios, 65 checks, 0 failed.
+  - First implementation: 26 scenarios, 124 checks, 0 failed (after 4 timing fixes in the test scenarios).
+  - Independent review of the changes by 4 reviewers (shell / jq, Ansible / Jinja, OpenShift / MCO behaviour, docs). Confirmed findings, all fixed:
+    - Checks 08 and 17 passed or crashed on a failed `oc` read (now `|| exit 1`, so the read is retried).
+    - `pools_rolling` counted `Updating=True` on a fully updated pool with one unavailable node as a running rollout. It now counts machines (`updatedMachineCount < machineCount`).
+    - An empty `cgroupMode` was treated as v1 (the nodes now decide).
+    - The machine-config-daemon pod list was not retried.
+    - The diagnosis `parse_mem` lacked the milli unit.
+    - The diagnosis said "no problems" when it could not read the nodes.
+    - PodDisruptionBudgets were matched by namespace instead of by selector.
+    - `Unreconcilable` was not recognised.
+    - The pool-blocked rule missed DiskPressure / NetworkUnavailable, `maxUnavailable` >= 2 and the "cannot finish" case.
+    - The overcommit thresholds were hard-coded (now in `vars/upgrade.yml`).
+    - `skip_cgroup_check` gave a PASS (now WARN).
+    - The alert did not show the exit code.
+    - 13 doc mismatches.
+  - After the review fixes:
+    - static checks: 0 problems (71 YAML files, 390 tasks, 1114 templated strings, 99 jq programs, 57 shell blocks, 4 templates);
+    - unit checks of the new steps: 40/40 in 13 cases;
+    - flow scenarios: 29 scenarios, 135 checks, 0 failed (3 new: a cordoned leftover node with no rollout, an empty cgroupMode with every node on v2, `skip_cgroup_check`).
+- **Not verified here**: Ansible itself and a real cluster. Also the `oc exec` kernel check, `oc get machines.machine.openshift.io` and `oc adm top nodes` under the automation account - see Next Up.

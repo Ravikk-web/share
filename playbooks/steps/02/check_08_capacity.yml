@@ -1,18 +1,33 @@
 ---
-# Precheck 08 - Capacity headroom (HARD)
+# Precheck 08 - Drain headroom (HARD)
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
-# Rule: the CPU and memory requested by running pods stay at or below max_cpu_percent /
-#       max_memory_percent of what the nodes can allocate, so pods have room to move
-#       while nodes are drained one by one.
+# Rule: for every MachineConfigPool except master, with the pool's largest
+#       maxUnavailable nodes drained, the pods that have to move (all but DaemonSet and
+#       static pods) fit on the pool's other Ready, schedulable nodes: their CPU and
+#       memory requests stay at or below max_cpu_percent / max_memory_percent of what
+#       those nodes can still allocate (allocatable minus the DaemonSet and static pods
+#       already on them).
+# Why: the Machine Config Operator drains maxUnavailable nodes of a pool at a time
+#      (default 1). On 3 workers that is a third of the capacity. Pods that do not fit
+#      stay Pending, their PodDisruptionBudgets then block the next eviction, and the
+#      pool never finishes (the console shows "Worker Nodes 0 of 3").
+# Not judged: the master pool is skipped (control-plane pods are spread over the masters
+#      on purpose; it is not listed), and a pool with fewer than 2 nodes is listed but not
+#      judged (its pods cannot move anywhere while the node reboots).
 
 # Why: requests and allocatable come in units (m, Ki, Mi, Gi ...); parse_cpu turns CPU into
 #      millicores and parse_mem turns memory into bytes. jq 1.5 has no round(), so rnd2
 #      (two decimals) is defined by hand and its name must not start with "round".
-- name: "Check 08: Sum node allocatable and pod requests"
+- name: "Check 08: Read nodes, pools and pod requests"
   shell: |
     set -o pipefail
-    defs='
+    tmpd="$(mktemp -d)"
+    trap 'rm -rf "$tmpd"' EXIT
+    # Why: a failed read must fail the task (retried by `until`), never become "no pods".
+    oc get nodes,machineconfigpools -o json >"$tmpd/nm.json" || exit 1
+    oc get pods -A --field-selector=status.phase!=Succeeded,status.phase!=Failed -o json >"$tmpd/pods.json" || exit 1
+    jq -c --slurpfile pods "$tmpd/pods.json" '
       def parse_cpu:
         if . == null then 0
         elif (tostring | endswith("m")) then (tostring | sub("m$"; "") | tonumber)
@@ -33,21 +48,49 @@
         elif (tostring | endswith("T")) then ((tostring | sub("T$"; "") | tonumber) * 1000000000000)
         elif (tostring | endswith("P")) then ((tostring | sub("P$"; "") | tonumber) * 1000000000000000)
         else (tostring | tonumber) end;
-      def rnd2: . * 100 | floor / 100;'
-    alloc="$(oc get nodes -o json | jq -c "$defs"'
-      {cpu: ([.items[]? | .status.allocatable.cpu | parse_cpu] | add // 0),
-       mem: ([.items[]? | .status.allocatable.memory | parse_mem] | add // 0),
-       nodes: ((.items // []) | length)}')"
-    req="$(oc get pods -A --field-selector=status.phase=Running -o json | jq -c "$defs"'
-      {cpu: ([.items[]? | .spec.containers[]? | .resources.requests.cpu // null | parse_cpu] | add // 0),
-       mem: ([.items[]? | .spec.containers[]? | .resources.requests.memory // null | parse_mem] | add // 0),
-       pods: ((.items // []) | length)}')"
-    jq -nc --argjson a "$alloc" --argjson r "$req" "$defs"'
-      {cpu_percent: (if $a.cpu > 0 then (($r.cpu / $a.cpu * 100) | rnd2) else 0 end),
-       mem_percent: (if $a.mem > 0 then (($r.mem / $a.mem * 100) | rnd2) else 0 end),
-       cpu_cores: "\(($r.cpu / 1000) | rnd2)/\(($a.cpu / 1000) | rnd2)",
-       mem_gib: "\(($r.mem / 1073741824) | rnd2)/\(($a.mem / 1073741824) | rnd2)",
-       nodes: $a.nodes, pods: $r.pods}'
+      def rnd2: . * 100 | floor / 100;
+      def cstat(t): ((([(.status.conditions // [])[] | select(.type == t) | .status] | .[0]) // "Unknown") | tostring);
+      def ann(k): ((.metadata.annotations // {})[k] // "");
+      def role: ((.metadata.labels // {}) | keys
+                 | map(select(startswith("node-role.kubernetes.io/")) | ltrimstr("node-role.kubernetes.io/"))) as $r
+        | if ($r | map((. == "master") or (. == "control-plane")) | any) then "master"
+          elif ($r | map(. == "infra") | any) then "infra" else "worker" end;
+      def maxu: (.spec.maxUnavailable // 1) as $m | (.status.machineCount // 0) as $c
+        | (if ($m | type) == "string" then ((($m | rtrimstr("%") | tonumber) * $c / 100) | floor) else $m end)
+        | if . < 1 then 1 else . end;
+      (.items // []) as $all
+      | [$all[] | select(.kind == "Node")] as $nodes
+      | [$all[] | select(.kind == "MachineConfigPool")] as $mcps
+      | [$mcps[] | .metadata.name] as $pnames
+      # The pool of a node: the MCP whose rendered configuration it runs
+      # (rendered-<pool>-<hash>), else by role.
+      | def pool_of: ann("machineconfiguration.openshift.io/currentConfig") as $c
+          | ([$pnames[] | . as $p | select(($c | startswith("rendered-" + $p + "-")) and ((($c | ltrimstr("rendered-" + $p + "-")) | contains("-")) | not))] | .[0])
+            // (if role == "master" then "master" else "worker" end);
+      ([$nodes[] | {key: .metadata.name, value: pool_of}] | from_entries) as $poolby
+      # DaemonSet and static (mirror) pods stay on their node; every other pod moves.
+      | [($pods[0].items // [])[] | select((.spec.nodeName // "") != "")
+          | {node: .spec.nodeName,
+             fixed: ((((.metadata.ownerReferences // []) | map((.kind == "DaemonSet") or (.kind == "Node")) | any))
+                     or ((.metadata.annotations // {}) | has("kubernetes.io/config.mirror"))),
+             cpu: ([(.spec.containers // [])[] | (.resources.requests.cpu // null) | parse_cpu] | add // 0),
+             mem: ([(.spec.containers // [])[] | (.resources.requests.memory // null) | parse_mem] | add // 0)}] as $pods
+      | [$mcps[] | select(.metadata.name != "master") | . as $p | ($p | maxu) as $mu
+         | [$nodes[] | select($poolby[.metadata.name] == $p.metadata.name)] as $pn
+         | [$pods[] | select(($poolby[.node] // "") == $p.metadata.name)] as $pp
+         | ([$pp[] | select(.fixed | not) | .cpu] | add // 0) as $need_cpu
+         | ([$pp[] | select(.fixed | not) | .mem] | add // 0) as $need_mem
+         | [$pn[] | select((cstat("Ready") == "True") and ((.spec.unschedulable // false) | not))
+             | .metadata.name as $nn
+             | {cpu: (((.status.allocatable.cpu // null) | parse_cpu) - ([$pods[] | select((.node == $nn) and .fixed) | .cpu] | add // 0)),
+                mem: (((.status.allocatable.memory // null) | parse_mem) - ([$pods[] | select((.node == $nn) and .fixed) | .mem] | add // 0))}] as $avail
+         | ([$avail[] | .cpu] | sort | reverse | .[$mu:] | add // 0) as $room_cpu
+         | ([$avail[] | .mem] | sort | reverse | .[$mu:] | add // 0) as $room_mem
+         | {pool: $p.metadata.name, nodes: ($pn | length), schedulable: ($avail | length), maxu: $mu,
+            cpu_need: (($need_cpu / 1000) | rnd2), cpu_room: (($room_cpu / 1000) | rnd2),
+            mem_need: (($need_mem / 1073741824) | rnd2), mem_room: (($room_mem / 1073741824) | rnd2),
+            cpu_percent: (if $room_cpu > 0 then (($need_cpu / $room_cpu * 100) | rnd2) else (if $need_cpu > 0 then 999 else 0 end) end),
+            mem_percent: (if $room_mem > 0 then (($need_mem / $room_mem * 100) | rnd2) else (if $need_mem > 0 then 999 else 0 end) end)}]' "$tmpd/nm.json"
   args:
     executable: /bin/bash
   register: c08_raw
@@ -58,14 +101,34 @@
 
 - name: "Check 08: Record the result"
   set_fact:
+    c08_pools: "{{ _pools }}"
     preval_checks: >-
-      {{ preval_checks + [{'num': 8, 'name': 'Capacity headroom', 'gate': 'HARD',
-           'status': 'PASS' if (_ok | bool) else 'FAIL',
-           'observed': 'Requested CPU ' ~ _u.cpu_percent ~ '% (' ~ _u.cpu_cores ~ ' cores, max ' ~ (max_cpu_percent | default(90)) ~ '%), memory '
-                       ~ _u.mem_percent ~ '% (' ~ _u.mem_gib ~ ' GiB, max ' ~ (max_memory_percent | default(90)) ~ '%) across '
-                       ~ _u.nodes ~ ' nodes and ' ~ _u.pods ~ ' running pods'}] }}
+      {{ preval_checks + [{'num': 8, 'name': 'Drain headroom', 'gate': 'HARD',
+           'status': 'PASS' if (_short | length == 0) else 'FAIL',
+           'observed': ((_lines | join(' | ')) or 'No pool other than master to judge')
+                       ~ ('' if (_short | length == 0) else ('. Draining ' ~ (_short | join(', ')) ~ ' would leave evicted pods without room: they stay Pending,'
+                                                              ~ ' PodDisruptionBudgets then block the drain and the pool never finishes.'
+                                                              ~ ' Lower the requests, scale down workloads that are not needed during the upgrade, or add a node.'))}] }}
   vars:
-    _u: "{{ c08_raw.stdout | from_json }}"
-    _ok: >-
-      {{ (_u.cpu_percent | float) <= (max_cpu_percent | default(90) | float)
-         and (_u.mem_percent | float) <= (max_memory_percent | default(90) | float) }}
+    _pools: "{{ c08_raw.stdout | from_json }}"
+    # Why: only pools with at least 2 nodes are judged; a 1-node pool has nowhere to move to.
+    _short: >-
+      {%- set out = [] -%}
+      {%- for p in _pools if (p.nodes | int) >= 2 and ((p.cpu_percent | float) > (max_cpu_percent | default(90) | float)
+                                                        or (p.mem_percent | float) > (max_memory_percent | default(90) | float)) -%}
+      {%- set _ = out.append(p.pool) -%}
+      {%- endfor -%}
+      {{ out }}
+    _lines: >-
+      {%- set out = [] -%}
+      {%- for p in _pools -%}
+      {%- if (p.nodes | int) < 2 -%}
+      {%- set _ = out.append(p.pool ~ ': ' ~ p.nodes ~ ' node(s) - not judged (its pods cannot move while the node reboots)') -%}
+      {%- else -%}
+      {%- set _ = out.append(p.pool ~ ': ' ~ p.nodes ~ ' nodes (' ~ p.schedulable ~ ' schedulable), maxUnavailable ' ~ p.maxu
+                             ~ '; with ' ~ p.maxu ~ ' drained, the pods to move need ' ~ p.cpu_need ~ ' of ' ~ p.cpu_room ~ ' CPU ('
+                             ~ p.cpu_percent ~ '%) and ' ~ p.mem_need ~ ' of ' ~ p.mem_room ~ ' GiB memory (' ~ p.mem_percent ~ '%); max '
+                             ~ (max_cpu_percent | default(90)) ~ '% / ' ~ (max_memory_percent | default(90)) ~ '%') -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}

@@ -14,7 +14,7 @@ A rule-based, one-command Ansible automation that upgrades Azure Red Hat OpenShi
    - Only one run per cluster at a time.
 4. **Checks first, then verified pre-upgrade changes.** Phase 02 only reads. Phase 03 makes every change needed before the first hop, one task at a time:
    - unpausing allow-listed MachineConfigPools
-   - cgroup v2 when the path reaches 4.19+
+   - cgroup v2 when the path reaches 4.19+, verified on every node (the MCO configuration it runs and its kernel), not only the setting
    - approving pending operator upgrades, then stopping if an operator still blocks the target
    - the admin-ack, after APIRequestCount shows no remaining callers of removed APIs
 
@@ -23,7 +23,8 @@ A rule-based, one-command Ansible automation that upgrades Azure Red Hat OpenShi
 6. **Quiet notifications.**
    - A heartbeat every 20 minutes and one degradation mail per new problem while the cluster updates.
    - Then exactly one summary (success) or one alert (failure).
-7. **Resumable.** Running the same command again skips finished hops and watches a running update.
+7. **Resumable.** Running the same command again first watches an update that is still running to the end, including a hop whose control plane is done while its worker nodes are still updating. Then the prechecks judge a settled cluster, and finished hops are skipped. The logs of the last 5 runs of a cluster are kept, so a failed run's log survives the resume.
+8. **Node problems explained.** A node that is not Ready, cordoned, under pressure or stuck in its update, and a pool that cannot continue because of it, are reported with the likely cause and what to do: in Check 02, the degradation mails and the alert. The automation never repairs nodes itself.
 
 ## Run modes
 | Mode | Phases | Cluster changes |
@@ -35,10 +36,15 @@ A rule-based, one-command Ansible automation that upgrades Azure Red Hat OpenShi
 
 ## Phases
 - **01 Policy check.** Takes the baseline snapshot and validates the whole path: shape, update graph per hop channel, and the cluster's own offer.
-- **02 Prechecks.** Runs 16 read-only checks, then the gate. A problem Phase 03 will fix (paused allow-listed pool, cgroup v1, a blocking operator with an upgrade pending) is a WARN, not a stop. Check 16 covers installed operator health: CSV phase, subscription problems, an operator's own upgrade being blocked, and a better channel for the target.
-- **03 Pre-upgrade implementation.** Four tasks, each check -> change -> watch the node rollout (Phase 05) -> verify: unpause pools, cgroup v2, operator upgrades, admin-ack. Then all 16 prechecks again and the gate.
+- **Resume step.** An update still running (control plane, or the nodes of a completed hop) is watched to the end before the prechecks.
+- **02 Prechecks.** Runs 17 read-only checks, then the gate. A problem Phase 03 will fix (paused allow-listed pool, cgroup v1, a v2 rollout not finished, a blocking operator with an upgrade pending) is a WARN, not a stop.
+  - Check 08 checks drain headroom: per pool except master, the pods of the largest `maxUnavailable` nodes must fit on the others.
+  - Check 14 checks cgroup v2 on every node; the nodes decide, not the setting (an empty `cgroupMode` is v2 on 4.14+).
+  - Check 16 covers installed operator health: CSV phase, subscription problems, an operator's own upgrade being blocked, and a better channel for the target.
+  - Check 17 warns when routers have no spare eligible node for a drain.
+- **03 Pre-upgrade implementation.** Four tasks, each check -> change -> watch the node rollout (Phase 05) -> verify: unpause pools, cgroup v2, operator upgrades, admin-ack. Then all 17 prechecks again and the gate.
 - **04 Hops.** For each hop: plan, stable-cluster wait, channel, offer, any admin-ack still pending, trigger, then watch (Phase 05).
-- **05 Watch.** Included by 03 and 04. Polls until settled, sends heartbeats and degradation mails, and fails on no progress, timeout, a long API outage, a rejected release or ClusterVersion Failing.
+- **05 Watch.** Included by 03, 04 and the resume step. Polls until settled, sends heartbeats and degradation mails, and fails on no progress, timeout, a long API outage, a rejected release or ClusterVersion Failing. A pool that cannot continue gets its own degradation mail, with the node diagnosis. A pool cannot continue when no node of it is updating while its unavailable nodes use up `maxUnavailable`.
 - **06 Postchecks.** Runs 10 checks, including the baseline diff, then the gate (audit only in a dry run).
 - **07 Operators.** Approves the current InstallPlan of each pending subscription, validates operators, enables the Developer perspective, then the gate.
 
@@ -61,6 +67,8 @@ A rule-based, one-command Ansible automation that upgrades Azure Red Hat OpenShi
 - Running a single phase on its own, outside the four modes (phases can be commented out in `main.yml` for testing).
 - Changing an operator's subscription channel.
 - Restarting degraded ClusterOperators, or forcing the machine-config daemon on nodes.
+- Repairing nodes: uncordoning, draining, rebooting, patching or replacing nodes or Machines (reported with what to do, never done).
+- Changing capacity or ingress settings (MachineSet replicas, router replicas, PodDisruptionBudgets): Checks 08 and 17 only report them.
 - etcd backup.
 - GitOps.
 - Git operations.

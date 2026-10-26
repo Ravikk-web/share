@@ -5,8 +5,10 @@
 # Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
 # MIGRATION 2.14: No changes needed.
 #
-# Never runs on its own. Included by steps/04/hop.yml (each hop) and by
-# steps/03/watch_rollout.yml (a node rollout started by a Phase 03 change).
+# Never runs on its own. Included by steps/04/hop.yml (each hop), by
+# steps/03/watch_rollout.yml (a node rollout started by a Phase 03 change) and by
+# steps/04/finish_running_update.yml (the resume step after Phase 01: an update or node
+# rollout that was already running).
 # Inputs (include vars):
 #   watch_mode     hop     - the cluster must reach watch_version
 #                  rollout - only pools and operators must settle
@@ -14,7 +16,7 @@
 #   watch_label    text for the console and the mails, e.g. "Hop 1 of 2"
 #
 # Every poll_interval_minutes it reads ClusterVersion, ClusterOperators,
-# MachineConfigPools and Nodes in one call (steps/04/poll.yml), then:
+# MachineConfigPools and Nodes in one call (steps/05/poll.yml), then:
 #   - mails a heartbeat every heartbeat_minutes,
 #   - mails a degradation alert once per new problem (after its grace period),
 #   - logs in again if the session token expired,

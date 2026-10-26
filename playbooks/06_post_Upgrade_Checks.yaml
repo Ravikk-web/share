@@ -10,6 +10,8 @@
 #   upgrade              the version Phase 04 reached
 #   dry-run, post-check  the version the cluster is on now (and in a dry run the
 #                        gate is only reported, never enforced)
+# A post-check (or a dry run) never waits for an update that is still running: it
+# checks the cluster as it is, and the result says that an update is running.
 # ============================================================================
 
 - name: "Phase 06: Start"
@@ -18,6 +20,22 @@
     postval_expected_version: >-
       {{ 'current' if run_mode in ['dry-run', 'post-check']
          else (run_final_version | default(upgrade_path | last, true)) }}
+
+- name: "Phase 06: Is an update still running?"
+  include_tasks: "{{ playbook_dir }}/steps/04/read_update_state.yml"
+
+- name: "Phase 06: Note a running update"
+  set_fact:
+    postval_update_note: >-
+      {{ ('an update to ' ~ update_state.desired ~ ' is still running')
+         if (update_state.cp_running | bool)
+         else (('pool(s) ' ~ (update_state.pools_rolling | join(', ')) ~ ' are still updating their nodes')
+               if (update_state.pools_rolling | length > 0) else '') }}
+
+- name: "Phase 06: Warn about the running update"
+  debug:
+    msg: "[WARN] {{ postval_update_note }}: these postchecks see the cluster mid-update."
+  when: postval_update_note | length > 0
 
 - name: "Phase 06: Run the 10 postchecks"
   include_tasks: "{{ playbook_dir }}/steps/06/run_all_checks.yml"
@@ -34,6 +52,7 @@
                      ~ (postval_checks | selectattr('status', 'equalto', 'PASS') | list | length) ~ ' pass, '
                      ~ (postval_checks | selectattr('status', 'equalto', 'WARN') | list | length) ~ ' warn, '
                      ~ (_blockers | length) ~ ' blocking; cluster at ' ~ (run_final_version | default('?'))
+                     ~ (('; ' ~ postval_update_note ~ ', so the cluster was checked mid-update') if (postval_update_note | length > 0) else '')
          }] }}
   vars:
     _blockers: "{{ postval_checks | selectattr('gate', 'equalto', 'HARD') | selectattr('status', 'equalto', 'FAIL') | list }}"
@@ -50,6 +69,7 @@
     msg: >-
       {{ postval_blockers | length }} blocking postcheck(s) on '{{ cluster_name }}':
       {% for c in postval_blockers %}Check {{ '%02d' | format(c.num) }} {{ c.name }}: {{ c.observed | truncate(300) }}{% if not loop.last %} | {% endif %}{% endfor %}
+      {%- if postval_update_note | length > 0 %}. Note: {{ postval_update_note }}; run the post-check again once it has finished{% endif %}
   when:
     - not (dry_run | bool)
     - postval_blockers | length > 0

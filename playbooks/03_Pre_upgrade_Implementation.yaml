@@ -17,14 +17,17 @@
 #                          stop if an operator still blocks the target version
 #   4. Admin-ack           removed-API check, then the ack the next minor hop needs
 #                          (a later minor hop's ack: right before that hop, Phase 04)
-# Then, if any task changed the cluster: run the 16 prechecks again -> GATE.
+# Then, if any task changed the cluster (or watched nodes reboot): run the 17 prechecks
+# again -> GATE.
 #
 # The order matters: a paused pool would not take the cgroup change, and the
 # admin-ack step waits for Upgradeable=True, which a blocking operator keeps False.
 # Each task reads the cluster itself, so the phase also works when Phase 02 is
 # commented out for a test, and one task can be commented out on its own.
 # Dry run: every task reports what it would change; nothing is changed.
-# While a cluster update is running (a re-run that resumes a hop) nothing is changed.
+# While a cluster update is running nothing is changed. A live run normally never gets
+# here with an update running: the resume step after Phase 01 watches it to the end
+# first. A dry run does (the resume step only reports there).
 # ============================================================================
 
 - name: "Phase 03: Start"
@@ -66,7 +69,8 @@
         status: "SKIPPED"
         observed: >-
           An update to {{ preimpl_cv.desired }} (from {{ preimpl_cv.completed }}) is running, so no pre-upgrade
-          change is made. Phase 04 watches that update; run the same command again after it if a change is still needed.
+          change is made. {{ 'A live run watches it to the end before the prechecks, then makes the changes still needed.'
+          if (dry_run | bool) else 'Run the same command again: it watches the update to the end first, then makes the changes still needed.' }}
   when: preimpl_update_running | bool
 
 # ----------------------------------------------------------------------------
@@ -92,7 +96,7 @@
 # Re-check after the changes
 # ----------------------------------------------------------------------------
 # Why: node reboots can disturb something that passed before (an operator, a volume,
-#      a PDB). All 16 prechecks run again with nothing left to Phase 03; a check a
+#      a PDB). All 17 prechecks run again with nothing left to Phase 03; a check a
 #      task worked on is AUTO-FIXED only if it now passes, otherwise FIX-FAILED.
 - name: "Phase 03: Nothing is left to Phase 03 any more"
   set_fact:
@@ -100,7 +104,7 @@
     preimpl_current_task: {}
   when: preimpl_changed | bool
 
-- name: "Phase 03: Run all 16 prechecks again after the changes"
+- name: "Phase 03: Run all 17 prechecks again after the changes"
   include_tasks: "{{ playbook_dir }}/steps/02/run_all_checks.yml"
   when: preimpl_changed | bool
 

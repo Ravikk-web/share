@@ -6,9 +6,12 @@
 # MIGRATION 2.14: No changes needed.
 #
 # Input: hop_target (X.Y.Z), hop_index (0-based)
-#   1. Plan from the live cluster:
-#        skip    - the cluster already completed this version (or a later one)
-#        resume  - an update to exactly this version is already running
+#   1. Plan from the live cluster (steps/04/read_update_state.yml):
+#        skip    - the cluster already completed this version (or a later one) and
+#                  its nodes have finished updating
+#        resume  - an update to exactly this version is already running, or the
+#                  cluster reports this version Completed while pools still roll out
+#                  its nodes
 #        start   - the hop has to be started
 #        (an update running to any other version stops the run)
 #   2. start only: wait up to prehop_settle_wait_minutes for a stable cluster
@@ -26,32 +29,21 @@
 # ----------------------------------------------------------------------------
 # 1. Plan (read-only)
 # ----------------------------------------------------------------------------
-- name: "{{ current_hop_label }} -> {{ hop_target }}: Read the cluster version"
-  shell: |
-    set -o pipefail
-    oc get clusterversion version -o json | jq -c '{
-      completed: ((((.status.history // []) | map(select(.state == "Completed")) | .[0].version) // "")),
-      desired: (.status.desired.version // ""),
-      progressing: (((((.status.conditions // []) | map(select(.type == "Progressing")) | .[0]) // {}).status // "False") | tostring),
-      channel: (.spec.channel // "")}'
-  args:
-    executable: /bin/bash
-  register: hop_cv_raw
-  changed_when: false
-  retries: "{{ oc_command_retries | default(3) }}"
-  delay: "{{ oc_command_retry_delay | default(10) }}"
-  until: hop_cv_raw.rc == 0
+- name: "{{ current_hop_label }} -> {{ hop_target }}: Read the cluster version and pools"
+  include_tasks: "{{ playbook_dir }}/steps/04/read_update_state.yml"
 
 # Why: versions are split with split('.') - regex backreferences inside YAML-quoted
-#      Jinja turn into control characters.
+#      Jinja turn into control characters. ClusterVersion reports a hop Completed once
+#      the control plane is done; its nodes may still be rolling, so a hop that equals
+#      the completed version is only "done" when no pool is still rolling.
 - name: "{{ current_hop_label }} -> {{ hop_target }}: Plan the hop"
   set_fact:
     hop_cv: "{{ _cv }}"
     hop_action: >-
-      {%- set running = _cv.progressing == 'True' and _cv.desired != _cv.completed -%}
-      {%- if running and _cv.desired == hop_target -%}resume
-      {%- elif running -%}blocked
-      {%- elif (_cv.completed | length > 0) and (hop_target is version(_cv.completed, '<=')) -%}skip
+      {%- if (_cv.cp_running | bool) and _cv.desired == hop_target -%}resume
+      {%- elif _cv.cp_running | bool -%}blocked
+      {%- elif (_cv.completed | length > 0) and (hop_target is version(_cv.completed, '<')) -%}skip
+      {%- elif hop_target == _cv.completed -%}{{ 'resume' if (_cv.pools_rolling | length > 0) else 'skip' }}
       {%- else -%}start
       {%- endif -%}
     hop_is_minor: >-
@@ -62,7 +54,7 @@
       {{ target_channel if (target_channel | default('') | length > 0)
          else ((target_channel_prefix | default('stable')) ~ '-' ~ (hop_target.split('.')[0:2] | join('.'))) }}
   vars:
-    _cv: "{{ hop_cv_raw.stdout | from_json }}"
+    _cv: "{{ update_state }}"
 
 - name: "{{ current_hop_label }} -> {{ hop_target }}: Stop - another update is running"
   fail:
@@ -75,13 +67,17 @@
   debug:
     msg: >-
       {{ {'skip': 'already done (cluster at ' ~ hop_cv.completed ~ '); nothing to do',
-          'resume': 'update to ' ~ hop_target ~ ' is already running; watching it',
+          'resume': ('update to ' ~ hop_target ~ ' is already running; watching it') if (hop_cv.cp_running | bool)
+                    else ('the cluster is at ' ~ hop_target ~ ' but pool(s) ' ~ (hop_cv.pools_rolling | join(', ')) ~ ' are still updating; watching them'),
           'start': 'will be started from ' ~ hop_cv.completed ~ ' on channel ' ~ hop_channel ~ (' (minor hop)' if (hop_is_minor | bool) else ' (z-stream hop)')}[hop_action] }}
 
+# Why: a hop the resume step already watched to the end has its row.
 - name: "{{ current_hop_label }} -> {{ hop_target }}: Record a hop that is already done"
   set_fact:
     hop_results: "{{ hop_results + [{'hop_label': current_hop_label, 'target': hop_target, 'status': 'ALREADY DONE', 'duration': ''}] }}"
-  when: hop_action == 'skip'
+  when:
+    - hop_action == 'skip'
+    - hop_results | selectattr('target', 'equalto', hop_target) | list | length == 0
 
 # ----------------------------------------------------------------------------
 # 2. Wait for a stable cluster before starting

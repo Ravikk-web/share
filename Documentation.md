@@ -2307,3 +2307,135 @@ Offline only (no Ansible on the Windows workstation): YAML / Jinja / include / j
 - a paused pool that is not allow-listed
 
 Next: `ansible-playbook --syntax-check main.yml` on 2.7.17 and 2.14.18, then dry-run, pre-check and a one-hop upgrade on DEV.
+
+
+## Live-run fixes: resume, cgroup v2 on every node, node diagnosis, drain headroom (2026-10-26)
+
+### What happened on arod01
+The first live run did what it was built for: Phase 03 set cgroup v2 and the hop to 4.20.10 started. Then:
+1. One worker, `arod01-9bccf-worker-northcentralus-4bk65`, stayed cordoned (Ready, `SchedulingDisabled`).
+2. The Machine Config Operator counts a node that is NotReady **or cordoned** as unavailable. The worker pool allows one unavailable node (`maxUnavailable: 1`). With that budget used up, the MCO updated no other worker, so the console showed **"Worker Nodes 0 of 3"**. The pool never goes Degraded; it just waits.
+3. The router has 3 replicas, and the ingress operator gives them a **required** pod anti-affinity: no two pods of the same template on one node. Routers run only on workers. With 1 of 3 workers out, the third new router could not be scheduled ("2 of 3 updated replica(s) are available"). Ingress was Progressing, and Degraded after 60 minutes: the ingress operator raises Degraded once "not all replicas available" lasts an hour.
+4. ClusterVersion reports Completed once the control plane is done. The workers, still on the old kubelet, would follow through their pool. That explains the different versions seen between masters and workers ("version mismatch"); cgroups did not cause it.
+5. Phase 05 stopped after 90 minutes without progress (exit 30).
+6. Running the command again stopped in Phase 02. Check 01 failed on ingress Degraded, Check 02 on the cordoned worker, and Check 03 on the worker pool not updated. The flow promised "run the same command again to resume", but the Phase 02 gate always ran before Phase 04 could watch the running update.
+
+A review of the code found more gaps:
+- **cgroup checked from the setting only.** Task 2 and Check 14 only read `nodes.config/cluster` `spec.cgroupMode`, never the nodes. A re-run after a half-finished rollout reported "already v2: PASS". The rollout watch could also settle before the MCO had rendered the new configuration, and a node outside every pool (or a pool paused during the watch) was never looked at.
+- **Check 08 measured the wrong thing.** It added up all nodes, masters included, and never considered a node being drained.
+- **Logs lost on re-run.** `logs/` was emptied on every run, so the resume attempt deleted the failed run's log.
+
+### User decisions
+1. **Resume (recommended option):** an update that is still running is watched to the end first, then the normal flow runs with every gate. This is automatic; there is no new mode. `--pre-check` also watches first. `--dry-run` only reports. `--post-check` checks the cluster as it is and points out the running update.
+2. **cgroup:** the kernel of every node is checked as well (`stat -c %T -f /sys/fs/cgroup` through `oc exec` into the node's machine-config-daemon pod). It is on by default, and a node that cannot be checked counts as FAIL. The rollout cannot be started manually and never needs to be: it starts within about a minute of the setting change. On arod01 the whole rollout takes about an hour (one node at a time per pool). The automation waits on node state, not on a fixed time.
+3. **Capacity:** drain headroom (Check 08) is HARD; router headroom (Check 17) is WARN.
+4. **Logs:** keep the last 5 runs per cluster.
+5. **Node problems:** report only. Nothing uncordons, drains, reboots, scales or changes ingress, and no configuration is changed to work around the router.
+
+### What changed
+- **Resume.**
+  - New `steps/04/read_update_state.yml` reads ClusterVersion and the MachineConfigPools. An update is running when the control plane updates (`Progressing=True`, desired ≠ completed), or when ClusterVersion is Completed but unpaused pools still have machines off their target configuration (`updatedMachineCount` < `machineCount`).
+
+    `Updating=True` alone is not used: the MCO also reports it for a fully updated pool held only by an unavailable node, and Check 02 must diagnose that node, not a 90-minute watch.
+  - New `steps/04/finish_running_update.yml`, included from `main.yml` right after Phase 01, watches it to the end (Phase 05, hop mode, hop exit codes 20 / 30). It records `COMPLETE (resumed)` for the hop and a phase row; a dry run records a WARN "plan only" row.
+  - `steps/04/hop.yml` plans from the same state. A hop that equals the completed version while pools still roll is watched, not skipped, and a hop the resume step already recorded gets no second row.
+  - The snapshot stores `update_running`, and Postcheck 10 prefers a snapshot of a settled cluster.
+  - Phase 06 says when an update is still running, and its gate message tells you to run the post-check again afterwards.
+  - The summary line and the alert's next steps describe the resume.
+- **cgroup v2 on every node.**
+  - New `steps/03/cgroup_nodes.yml`. For each node it checks that the MCO is done with it (current = desired configuration, state Done) and that the rendered MachineConfig it runs has no `systemd.unified_cgroup_hierarchy=0`. With `cgroup_check_kernel` it also checks that the kernel reports `cgroup2fs`.
+  - The step waits up to `cgroup_wait_seconds` in-shell. Its output: `pending` nodes (a rollout still to come or running) and `broken` nodes (finished but not on v2, or not checkable).
+  - The nodes decide, not the setting. On OpenShift 4.14+ the MCO renders an empty `cgroupMode` as v2, so an empty setting with every node on v2 passes and is not patched. An explicit `v1` is always a problem.
+  - Check 14 FAILs when:
+    - the nodes cannot be read;
+    - a finished node runs a configuration that cannot be read;
+    - a finished node runs a v2 configuration whose kernel is not on v2, or cannot be checked.
+
+    It leaves the rest to Phase 03 as WARN: a setting that is not v2 with nodes not on v2 (Phase 03 sets v2), or a v2 setting whose rollout is not finished (Phase 03 watches it). With `skip_cgroup_check` the nodes are not checked, and Check 14 and task 2 report WARN.
+  - Task 2 sets v2 and waits until every pool's target configuration carries no v1 kernel argument (`cgroup_render_wait_minutes`). It then watches the rollout and checks every node (`cgroup_node_check_wait_minutes`). AUTO-FIXED only when every node is on v2; otherwise FIX-FAILED, with the node, its configuration and kernel.
+  - When the setting was already v2 but nodes were still rolling, task 2 watches and checks without a change: PASS, and the prechecks run again (`task_recheck` in `steps/03/record_task.yml`).
+  - The report gains a "cgroup v2 on every node" table.
+- **Node diagnosis (report only).**
+  - New `steps/common/diagnose_nodes.yml`, used by Check 02, Phase 05 (before a degradation mail about a node or a blocked pool) and the failure handler (guarded, never stops the alert).
+  - Fixed rules give the problem, the likely cause and what to do (table in `WORKFLOW.md`).
+  - Each row also shows:
+    - the Machine / Azure VM state;
+    - the load: requests, memory limits, and usage when the metrics API answers. A node is overcommitted at `node_overcommit_memory_usage_percent` (90) usage, or at limits above `node_overcommit_memory_limits_percent` (150);
+    - the PodDisruptionBudgets allowing 0 disruptions whose selector (matchLabels and matchExpressions) matches a pod on the node that a drain has to evict (DaemonSet pods are left out);
+    - when the node's pool cannot continue or finish, that too.
+  - The MCD states Degraded and Unreconcilable, and `NetworkUnavailable`, have rules of their own.
+  - Memory quantities in milli units are parsed.
+  - When the nodes cannot be read, the diagnosis says it could not run.
+  - Pods that cannot be scheduled are listed with the scheduler's message.
+  - Shown in the report ("Node problems"), the alert and degradation mails, and Check 02's observed text.
+- **A pool that cannot continue.** Phase 05 raises a new degradation after `degradation_pool_blocked_minutes` (10) when all of these hold:
+  - the pool has configuration to roll out;
+  - no node of the pool is updating;
+  - its NotReady or cordoned nodes use up `maxUnavailable`.
+
+  This is exactly the "0 of 3" stall.
+  - **Unavailable** is the MCO's own test: not Ready, disk pressure, network unavailable, or cordoned.
+  - **Also flagged:** a pool whose waiting nodes are all unavailable (the MCO never picks them, whatever `maxUnavailable` is). Also a pool that "cannot finish": every node runs the target, but an unavailable node keeps it from reporting Updated.
+  - **What happens next:** the mail carries the node diagnosis, and the watch keeps going. If the node is back within `hop_timeout_minutes` (90) of the last progress, the run continues by itself. Otherwise the hop stops with exit 30, and running the same command again resumes it.
+- **Check 08 - drain headroom (HARD).**
+  - For every pool except master, the pool's largest `maxUnavailable` nodes are drained.
+  - The requests of the pods that must move (all but DaemonSet and static pods) must then stay within `max_cpu_percent` / `max_memory_percent` of what the other Ready, schedulable nodes can still allocate.
+  - Pools with one node are reported, not judged.
+- **Check 17 - router drain headroom (WARN).**
+  - Eligible nodes are those that are Ready, schedulable, match the router's nodeSelector and tolerate its NoSchedule/NoExecute taints.
+  - Each router deployment needs at least replicas + `maxUnavailable` of them.
+  - 3 routers on 3 workers is reported: every drain leaves one router Pending until the node is back.
+- **Logs.** `00_Run.sh` keeps the last `log_keep_runs` (5) runs of the cluster and deletes only that cluster's older runs.
+
+### Settings (`vars/upgrade.yml`)
+| Setting | Default | Meaning |
+|---|---|---|
+| `log_keep_runs` | 5 | runs per cluster kept in `logs/` (the new run included) |
+| `cgroup_check_kernel` | true | Check 14 / task 2 also check each node's kernel through its machine-config-daemon pod |
+| `cgroup_render_wait_minutes` | 5 | task 2 waits this long for the MCO to render the v2 configuration for every pool |
+| `cgroup_node_check_wait_minutes` | 10 | after the rollout, task 2 waits this long for the last node to report v2 |
+| `degradation_pool_blocked_minutes` | 10 | grace before the "pool cannot continue / finish" degradation mail |
+| `node_overcommit_memory_usage_percent` | 90 | node diagnosis: memory usage at which a node is called overcommitted |
+| `node_overcommit_memory_limits_percent` | 150 | node diagnosis: sum of memory limits (in percent of allocatable) at which a node is called overcommitted |
+| `max_cpu_percent`, `max_memory_percent` | 90 | now the limits of Check 08's drain headroom (room left with `maxUnavailable` nodes drained) |
+
+### Cluster writes
+None added. `oc exec` into the existing machine-config-daemon pods is a read action: it creates no object and changes nothing. Nodes are never patched, cordoned, uncordoned, drained, rebooted or deleted.
+
+### Runbook: worker pool stuck at "0 of N", ingress Progressing / Degraded
+```bash
+N=<the cordoned or NotReady worker>
+oc get mcp worker -o jsonpath='{.spec.maxUnavailable} max | {.status.machineCount} machines | {.status.updatedMachineCount} updated | {.status.unavailableMachineCount} unavailable{"\n"}'
+oc get node $N -o jsonpath='{.metadata.annotations.machineconfiguration\.openshift\.io/state} current={.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig} desired={.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig}{"\n"}'
+oc logs -n openshift-machine-config-operator deploy/machine-config-controller -c machine-config-controller --since=3h | grep "$N" | grep -iE 'drain|evict' | tail -10
+oc get pdb -A --no-headers | awk '$5 == 0'
+oc get events -n openshift-ingress --field-selector reason=FailedScheduling
+```
+- **current ≠ desired:** the MCO is updating the node and its drain is stuck. The controller log names the pod it cannot evict ("Cannot evict pod as it would violate the pod's disruption budget"). With the app owner, get the app healthy, or delete that one pod (a plain delete is not checked against the PodDisruptionBudget). Do not uncordon it.
+- **current = desired, state Done:** the node is cordoned outside the update. `oc adm uncordon $N` lets the MCO continue.
+- **Ingress:** nothing to change. Once the worker is schedulable again, the third router starts and ingress settles by itself. While the other workers update, each drain briefly leaves one router Pending (3 routers on 3 workers): that is expected.
+- **Then** run the same command again: the update that is still running is watched to the end first.
+
+### Verification
+Offline (no Ansible on the Windows workstation):
+- The static checks.
+- The flow scenarios, which run the real `main.yml` through a small Ansible emulator against a fake `oc`. The fake now models:
+  - rendered MachineConfigs with kernel arguments, and nodes that pick up their pool's configuration at the end of a rollout;
+  - machine-config-daemon pods, and `oc exec ... stat` per node;
+  - Machines, router deployments, `oc adm top`, field selectors;
+  - an MCO that does not progress a pool while one of its nodes is unavailable.
+
+An independent review by 4 reviewers (shell / jq, Ansible / Jinja, OpenShift / MCO behaviour, docs) found:
+- unchecked `oc` reads in Checks 08 and 17;
+- a too-broad "pools rolling" test;
+- an empty `cgroupMode` read as v1;
+- gaps in the node diagnosis (milli units, unreadable nodes, PDB selectors, `Unreconcilable`, the pool-blocked rule);
+- hard-coded thresholds;
+- doc mismatches.
+
+All were fixed. Final results:
+- static checks: 0 problems;
+- unit checks of the new steps: 40/40;
+- flow scenarios: 29 scenarios, 135 checks, 0 failed.
+
+Details are in the progress tracker's session notes. Still to do: `ansible-playbook --syntax-check` on Ansible 2.7.17 and 2.14.18, then a dry run and a pre-check on DEV.

@@ -49,8 +49,16 @@
           else "worker" end;
       def updating: (ann("machineconfiguration.openshift.io/state") == "Working")
         or (ann("machineconfiguration.openshift.io/currentConfig") != ann("machineconfiguration.openshift.io/desiredConfig"));
-      def unsettled: (cstat("Ready") != "True") or updating
-        or (ann("machineconfiguration.openshift.io/state") == "Degraded");
+      def mcd_failed: (ann("machineconfiguration.openshift.io/state") == "Degraded")
+        or (ann("machineconfiguration.openshift.io/state") == "Unreconcilable");
+      def unsettled: (cstat("Ready") != "True") or updating or mcd_failed;
+      # The MCO counts a node as unavailable (it uses up maxUnavailable and is never picked
+      # for an update) when it is not Ready, DiskPressure or NetworkUnavailable is not
+      # False, or it is cordoned.
+      def mco_unavailable: (cstat("Ready") != "True")
+        or (([(.status.conditions // [])[] | select((.type == "DiskPressure") or (.type == "NetworkUnavailable"))
+              | select((.status | tostring) != "False")] | length) > 0)
+        or (.spec.unschedulable // false);
       (.items // []) as $all
       | ([$all[] | select(.kind == "ClusterVersion")] | .[0] // {}) as $cv
       | ($cv.status.desired.version // "") as $desired
@@ -58,7 +66,16 @@
       | [$allcos[] | select(.metadata.name as $n | ($allow | map(. == $n) | any) | not)] as $cos
       | [$all[] | select(.kind == "MachineConfigPool")] as $mcps
       | [$all[] | select(.kind == "Node")] as $nodes
-      | {
+      | [$mcps[] | .metadata.name] as $pnames
+      # The pool of a node: the MCP whose rendered configuration it runs
+      # (rendered-<pool>-<hash>), else by role.
+      | def pool_of: ann("machineconfiguration.openshift.io/currentConfig") as $c
+          | ([$pnames[] | . as $p | select(($c | startswith("rendered-" + $p + "-")) and ((($c | ltrimstr("rendered-" + $p + "-")) | contains("-")) | not))] | .[0])
+            // (if role == "master" then "master" else "worker" end);
+        def maxu: (.spec.maxUnavailable // 1) as $m | (.status.machineCount // 0) as $c
+          | (if ($m | type) == "string" then ((($m | rtrimstr("%") | tonumber) * $c / 100) | floor) else $m end)
+          | if . < 1 then 1 else . end;
+      {
           ok: true,
           cv: {
             desired: $desired,
@@ -94,7 +111,7 @@
             name: .metadata.name,
             role: role,
             action: (if cstat("Ready") != "True" then "Rebooting / NotReady"
-                     elif ann("machineconfiguration.openshift.io/state") == "Degraded" then "Machine-config daemon Degraded"
+                     elif mcd_failed then ("Machine-config daemon " + ann("machineconfiguration.openshift.io/state"))
                      elif updating and (.spec.unschedulable // false) then "Draining / updating"
                      elif updating then "Applying configuration"
                      else "Cordoned" end)
@@ -104,8 +121,9 @@
                  ((.status.conditions // [])[]
                    | select((.type == "DiskPressure" or .type == "MemoryPressure" or .type == "PIDPressure") and .status == "True")
                    | {c: .type, m: (.message // "")}),
-                 (if ($n | ann("machineconfiguration.openshift.io/state")) == "Degraded"
-                  then {c: "MachineConfigDaemonDegraded", m: ($n | ann("machineconfiguration.openshift.io/reason"))} else empty end) ]) as $p
+                 (if ($n | mcd_failed)
+                  then {c: ("MachineConfigDaemon" + ($n | ann("machineconfiguration.openshift.io/state"))),
+                        m: ($n | ann("machineconfiguration.openshift.io/reason"))} else empty end) ]) as $p
             | select(($p | length) > 0)
             | {name: .metadata.name, role: role, condition: ($p | map(.c) | join(", ")), message: (($p[0].m // "") | .[0:200])}],
           conditions: (
@@ -123,8 +141,9 @@
                  detail: ("machine-config daemon state " + (ann("machineconfiguration.openshift.io/state") | if . == "" then "unknown" else . end)
                           + (if (.spec.unschedulable // false) then "; node cordoned (a PodDisruptionBudget may be blocking the drain)" else "" end)),
                  grace: "node_stall"} ]
-            + [ $nodes[] | select(ann("machineconfiguration.openshift.io/state") == "Degraded")
-              | {key: ("node-mcd-degraded:" + .metadata.name), title: ("Node " + .metadata.name + " machine-config daemon Degraded"),
+            + [ $nodes[] | select(mcd_failed)
+              | {key: ("node-mcd-degraded:" + .metadata.name),
+                 title: ("Node " + .metadata.name + " machine-config daemon " + ann("machineconfiguration.openshift.io/state")),
                  detail: (ann("machineconfiguration.openshift.io/reason") | .[0:200]), grace: "co"} ]
             + [ $cos[] | select(cstat("Degraded") == "True")
               | {key: ("co-degraded:" + .metadata.name), title: ("ClusterOperator " + .metadata.name + " Degraded"),
@@ -135,6 +154,34 @@
             + [ $mcps[] | select(cstat("Degraded") == "True")
               | {key: ("mcp-degraded:" + .metadata.name), title: ("MachineConfigPool " + .metadata.name + " Degraded"),
                  detail: (cmsg("Degraded") | .[0:200]), grace: "co"} ]
+            # A pool the MCO cannot finish, while no node of it is updating (it never goes
+            # Degraded in this state):
+            #  - nodes still need the target configuration, and the unavailable nodes use up
+            #    maxUnavailable, or every node still waiting is itself unavailable (the MCO
+            #    never picks a node that is not ready): "cannot continue";
+            #  - every node runs the target, but an unavailable node keeps the pool from
+            #    reporting Updated: "cannot finish".
+            + [ $mcps[] | select((.spec.paused // false) | not) | . as $p
+              | ($p | maxu) as $mu
+              | ($p.spec.configuration.name // "") as $target
+              | [$nodes[] | select(pool_of == $p.metadata.name)] as $pn
+              | [$pn[] | select(mco_unavailable) | .metadata.name] as $un
+              | [$pn[] | select(ann("machineconfiguration.openshift.io/currentConfig") != $target) | .metadata.name] as $todo
+              | select(([$pn[] | select(updating)] | length) == 0)
+              | select(((($todo | length) > 0) and ((($un | length) >= $mu) or ((($todo - $un) | length) == 0)))
+                       or ((($todo | length) == 0) and (($un | length) > 0) and (($p | cstat("Updated")) != "True")))
+              | {key: ("pool-blocked:" + $p.metadata.name),
+                 title: ("MachineConfigPool " + $p.metadata.name + (if ($todo | length) > 0 then " cannot continue" else " cannot finish" end)),
+                 detail: (if ($todo | length) > 0
+                          then ("no node is updating, " + (($todo | length) | tostring) + " still need the new configuration, and "
+                                + ($un | join(", ")) + (if ($un | length) == 1 then " is" else " are" end)
+                                + " unavailable (NotReady, disk pressure, network unavailable or cordoned) with maxUnavailable "
+                                + ($mu | tostring) + ": the MCO updates no other node until one is back")
+                          else ("every node runs the target configuration, but " + ($un | join(", "))
+                                + (if ($un | length) == 1 then " is" else " are" end)
+                                + " unavailable (NotReady, disk pressure, network unavailable or cordoned), so the pool does not report Updated")
+                          end),
+                 grace: "pool_blocked"} ]
             + (if ($cv | cstat("Failing")) == "True"
                then [{key: "cv-failing", title: "ClusterVersion reports Failing", detail: ($cv | cmsg("Failing") | .[0:200]), grace: "cv_failing"}]
                else [] end)
@@ -341,6 +388,7 @@
           uncordoned_notready: "{{ degradation_uncordoned_notready_minutes | default(5) }}"
           pressure: "{{ degradation_pressure_minutes | default(5) }}"
           node_stall: "{{ node_stall_threshold_minutes | default(30) }}"
+          pool_blocked: "{{ degradation_pool_blocked_minutes | default(10) }}"
           co: "{{ degradation_co_minutes | default(10) }}"
           cv_failing: "{{ degradation_cv_failing_minutes | default(10) }}"
 
@@ -366,6 +414,23 @@
         event_task: "Degradation ({{ monitor_label }})"
         event_reason: "{{ degradation_new_items | map(attribute='title') | join('; ') }}"
         event_observed: "{{ degradation_new_items | map(attribute='detail') | join(' | ') | truncate(500) }}"
+      when: degradation_new_items | length > 0
+
+    # Why: a mail about a node or a pool that cannot continue says what is wrong with
+    #      the node and what to do (read-only diagnosis; nothing is changed).
+    - name: "Poll: Work out what is wrong with the nodes (for the alert)"
+      include_tasks: "{{ playbook_dir }}/steps/common/diagnose_nodes.yml"
+      when:
+        - degradation_new_items | selectattr('key', 'match', '^(node-|pool-blocked)') | list | length > 0
+        - not (monitor_abort | bool)
+
+    # Why: only a mail about nodes or a blocked pool shows the node diagnosis (a fresh one).
+    - name: "Poll: Node details for the alert"
+      set_fact:
+        progress_node_problems: "{{ (node_problems | default([])) if (_about_nodes | bool) else [] }}"
+        progress_pending_pods: "{{ (node_problems_pending | default([])) if (_about_nodes | bool) else [] }}"
+      vars:
+        _about_nodes: "{{ (degradation_new_items | selectattr('key', 'match', '^(node-|pool-blocked)') | list | length > 0) and not (monitor_abort | bool) }}"
       when: degradation_new_items | length > 0
 
     - name: "Poll: Send the degradation alert"

@@ -1,0 +1,129 @@
+---
+# ============================================================================
+# steps/04/finish_running_update.yml - watch an update that is already running
+# ============================================================================
+# Targets: Ansible 2.7.17 (test) / 2.14.18 (prod)
+# MIGRATION 2.14: No changes needed.
+#
+# Used by: main.yml right after Phase 01 (upgrade, pre-check and dry-run modes).
+# Why:     a run started again while the cluster is still updating would otherwise be
+#          judged by the prechecks first: nodes are cordoned or rebooting and pools are
+#          not updated, so the Phase 02 gate always stops it. The update is watched to
+#          the end first; the normal flow then runs, with every gate, on a settled cluster.
+# Finds (steps/04/read_update_state.yml):
+#   - the control plane updating to a hop of upgrade_path, or
+#   - the control plane done but unpaused pools still rolling (the nodes of a hop that
+#     ClusterVersion already reports Completed, or any other node rollout).
+# Does:    live run - Phase 05 watches it in hop mode until the cluster settles
+#                     (heartbeat and degradation mails; hop exit codes 20 / 30) and the
+#                     hop is recorded as "COMPLETE (resumed)".
+#          dry run  - reports what a live run would watch; nothing is changed.
+#          An update to a version outside upgrade_path stops the run (never taken over).
+# Outputs: resume_watched, run_phase_results (+1 row), hop_results (+1 row for a hop).
+# No cluster write.
+# ============================================================================
+
+- name: "Resume: Is an update still running?"
+  include_tasks: "{{ playbook_dir }}/steps/04/read_update_state.yml"
+
+- name: "Resume: Plan"
+  set_fact:
+    resume_needed: "{{ update_state.running | bool }}"
+    resume_target: "{{ update_state.target }}"
+    # Why: a hop of the path keeps its "Hop i of n" label in the mails and the report.
+    resume_label: >-
+      {%- set idx = [] -%}
+      {%- for v in upgrade_path | default([]) -%}{%- if v == update_state.target -%}{%- set _ = idx.append(loop.index) -%}{%- endif -%}{%- endfor -%}
+      {{ ('Hop ' ~ idx[0] ~ ' of ' ~ (upgrade_path | length)) if (idx | length > 0) else 'Node rollout' }}
+    resume_what: >-
+      {{ ('the update to ' ~ update_state.desired ~ ' (control plane'
+          ~ ((', pools ' ~ (update_state.pools_rolling | join(', ')) ~ ' updating') if (update_state.pools_rolling | length > 0) else '') ~ ')')
+         if (update_state.cp_running | bool)
+         else ('the node rollout of pool(s) ' ~ (update_state.pools_rolling | join(', ')) ~ ' at ' ~ update_state.completed) }}
+
+- name: "Resume: Nothing is running"
+  debug:
+    msg: "No update or node rollout is running on {{ cluster_name }} (cluster at {{ update_state.completed }}); the run continues normally."
+  when: not (resume_needed | bool)
+
+- name: "Resume: Stop - an update outside this path is running"
+  fail:
+    msg: >-
+      The cluster is updating to {{ update_state.desired }} (from {{ update_state.completed }}), which is not a hop of
+      {{ upgrade_path | join(' -> ') }}. Let it finish (or investigate), then run the same command again.
+  when:
+    - update_state.cp_running | bool
+    - update_state.desired not in (upgrade_path | default([]))
+
+# ----------------------------------------------------------------------------
+# Dry run: report only
+# ----------------------------------------------------------------------------
+- name: "Resume (dry run): Record what a live run would watch first"
+  set_fact:
+    run_phase_results: >-
+      {{ run_phase_results + [{
+           'phase': '04', 'name': phase_names['04'] ~ ' - update already running (plan only)', 'status': 'WARN',
+           'detail': (resume_what ~ ' is still running. A live run watches it to the end before the prechecks; '
+                      ~ 'the prechecks of this dry run see the cluster mid-update.')
+         }] }}
+  when:
+    - resume_needed | bool
+    - dry_run | bool
+
+- name: "Resume (dry run): Show it"
+  debug:
+    msg: "[WARN] {{ run_phase_results[-1].detail }}"
+  when:
+    - resume_needed | bool
+    - dry_run | bool
+
+# ----------------------------------------------------------------------------
+# Live run: watch it to the end
+# ----------------------------------------------------------------------------
+# Why: the hop context makes a failed watch a hop failure (exit 20 / 30), as in Phase 04.
+- name: "Resume: Set the hop context"
+  set_fact:
+    current_phase: "04"
+    current_hop_label: "{{ resume_label }}"
+    current_hop_target: "{{ resume_target }}"
+    hop_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+  when:
+    - resume_needed | bool
+    - not (dry_run | bool)
+
+- name: "Resume: Log it"
+  include_tasks: "{{ playbook_dir }}/steps/common/log_event.yml"
+  vars:
+    event_status: "START"
+    event_task: "Resume {{ resume_label }} -> {{ resume_target }}"
+    event_reason: "{{ resume_what }} is still running; watching it to the end before the prechecks"
+  when:
+    - resume_needed | bool
+    - not (dry_run | bool)
+
+- name: "Resume: Watch {{ resume_label | default('') }} until the cluster settles (Phase 05)"
+  include_tasks: "{{ playbook_dir }}/05_Live_monitoring_upgrade.yaml"
+  vars:
+    watch_mode: "hop"
+    watch_version: "{{ resume_target }}"
+    watch_label: "{{ resume_label }} (resumed)"
+  when:
+    - resume_needed | bool
+    - not (dry_run | bool)
+
+- name: "Resume: Record it"
+  set_fact:
+    resume_watched: true
+    current_hop_target: ""
+    hop_results: >-
+      {{ hop_results + ([{'hop_label': resume_label, 'target': resume_target, 'status': 'COMPLETE (resumed)', 'duration': monitor_elapsed}]
+                        if (resume_target in (upgrade_path | default([]))) else []) }}
+    run_phase_results: >-
+      {{ run_phase_results + [{
+           'phase': '04', 'name': phase_names['04'] ~ ' - update already running', 'status': 'PASS',
+           'detail': ('Watched ' ~ resume_what ~ ' until the cluster settled at ' ~ resume_target ~ ' (' ~ monitor_elapsed
+                      ~ '); the prechecks ran after it.')
+         }] }}
+  when:
+    - resume_needed | bool
+    - not (dry_run | bool)
