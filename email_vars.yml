@@ -1,0 +1,10 @@
+#################################################
+# Detail for sharing the Logfile over fail
+#################################################
+    smtp_host: smtp.test.hcscint.net
+    smtp_port: 25
+    sender: Cluster-Upgrade-Automation@ARO-Team
+    recipients:
+      - abhishek_thakur@bcbsil.com
+      - Ravikant_Kispotta@bcbsil.com
+      #- Amit_Sharma1@bcbsil.com
