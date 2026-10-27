@@ -10,13 +10,13 @@ Update this file after **every meaningful implementation change**.
 ## Current Goal
 - The fixes for the arod01 run:
   - resume that watches a running update first;
-  - cgroup v2 verified on every node (MCO configuration and kernel);
+  - cgroup v2 verified on every node (MCO configuration, kernel or both: `cgroup_check_method`, default `config`);
   - node diagnosis with cause and fix (report only);
   - a "pool cannot continue" alert;
   - drain headroom (Check 08, HARD) and router headroom (Check 17, WARN);
   - the logs of the last 5 runs kept.
 
-  Verified offline; next is jump-host validation (see Next Up). Nothing committed - the user commits when ready.
+  Committed as `de65045` (2026-10-27). The `cgroup_check_method` switch that followed is verified offline and not committed yet. Next is jump-host validation (see Next Up).
 
 ---
 
@@ -414,7 +414,7 @@ During v1 development and testing, 20+ critical operational and syntax issues we
    - Modes: `--pre-check` watches too, `--dry-run` reports only, `--post-check` checks as-is and says so.
    - Logs: the last 5 runs per cluster are kept.
 10. **Nodes (2026-10-26)**:
-    - cgroup v2 is verified on every node: the MCO configuration and the kernel, the kernel through `oc exec` into the machine-config-daemon pod. A node that cannot be checked is FAIL.
+    - cgroup v2 is verified on every node. The MCO must be done with the node; `cgroup_check_method` (2026-10-27) picks the proof: `config` (default, the MCO configuration it runs), `kernel` (through `oc exec` into the machine-config-daemon pod) or `both`. A node that cannot be checked is FAIL.
     - The rollout is never triggered by hand; the run waits on node state.
     - Node problems are reported with cause and fix, never repaired (no uncordon, drain, reboot, scaling or ingress change).
     - Drain headroom (Check 08) is HARD; router headroom (Check 17) is WARN.
@@ -425,7 +425,8 @@ During v1 development and testing, 20+ critical operational and syntax issues we
 - Multi-step operator upgrade chains: Phase 03 approves the current InstallPlan once per run. If an operator needs two steps to reach a version that supports the target, the run stops and the next run approves the next step. A bounded multi-round approval could remove the re-run.
 - An operator that blocks a *later* hop but only gets a compatible version in the catalog of an intermediate minor still stops the run in Phase 02 (Check 15 compares with the highest hop), as before.
 - Check 08 judges requests, not real usage. A pool that passes can still stall a drain through a PodDisruptionBudget allowing 0 disruptions; Check 12 lists those budgets as WARN. Making a zero-disruption budget on a drained pool HARD stays a user decision (`fail_on_zero_disruption_pdb`).
-- The kernel check needs `pods/exec` in `openshift-machine-config-operator`. If a cluster's policy forbids exec, `cgroup_check_kernel: false` falls back to the MCO configuration check.
+- The kernel check (`cgroup_check_method` `kernel` or `both`) needs `pods/exec` in `openshift-machine-config-operator`. The default `config` needs no exec.
+- `cgroup_check_method: kernel` does not read MachineConfigs, so a finished node on a v1 kernel counts as "still to roll out", not "broken": Check 14 leaves it to Phase 03, which then reports FIX-FAILED after the watch instead of Phase 02 stopping at once. Use `both` to tell the two apart.
 
 ## Session Notes
 
@@ -735,3 +736,29 @@ During v1 development and testing, 20+ critical operational and syntax issues we
     - unit checks of the new steps: 40/40 in 13 cases;
     - flow scenarios: 29 scenarios, 135 checks, 0 failed (3 new: a cordoned leftover node with no rollout, an empty cgroupMode with every node on v2, `skip_cgroup_check`).
 - **Not verified here**: Ansible itself and a real cluster. Also the `oc exec` kernel check, `oc get machines.machine.openshift.io` and `oc adm top nodes` under the automation account - see Next Up.
+- Committed as `de65045` on 2026-10-27 (not pushed).
+
+### Session: cgroup check method switch (2026-10-27)
+- **User request**: switch the per-node cgroup check between the kernel check and the node configuration check.
+- **User decisions**:
+  - modes `config` / `kernel` / `both`;
+  - default `config`;
+  - set in `vars/upgrade.yml` only;
+  - `kernel` mode still reads the MCO node state (annotations), not as a pass/fail check.
+- **What changed**:
+  - `cgroup_check_kernel` is replaced by `cgroup_check_method`.
+  - `steps/03/cgroup_nodes.yml`:
+    - MachineConfigs are read only for `config` / `both`;
+    - the exec runs only for `kernel` / `both`;
+    - the output adds `method` and `config_checked`, and the summary names the method.
+  - In `kernel` mode, a finished node on `tmpfs` counts as pending, not broken (see Open Questions).
+  - `main.yml` checks the value at the start.
+  - Check 14 and task 2 show the method in the task name.
+  - Docs: WORKFLOW, architecture, code standards, project overview, UI context, README, Documentation.md.
+- **Verified offline**:
+  - static checks: 0 problems;
+  - unit checks: 62/62;
+  - flow scenarios: 33 scenarios, 147 checks, 0 failed.
+
+  The 4 new scenarios: `config` v1 → v2, `kernel` v1 → v2, `kernel` with an uncheckable node, a misspelt value.
+- **Not committed.**

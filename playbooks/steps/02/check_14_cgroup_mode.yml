@@ -4,7 +4,7 @@
 # MIGRATION 2.14: No changes needed.
 # Rule: OpenShift 4.19+ cannot run on cgroup v1, so when any hop of the path is 4.19
 #       or later, every node must run cgroup v2 (steps/03/cgroup_nodes.yml: the MCO
-#       configuration it runs and, with cgroup_check_kernel, its kernel), and
+#       configuration it runs and/or its kernel, by cgroup_check_method), and
 #       nodes.config/cluster must not say cgroupMode v1.
 #       The nodes decide, not the setting: an empty cgroupMode is rendered as v2 by the
 #       MCO on OpenShift 4.14 and later, while clusters upgraded from 4.13 on v1 carry an
@@ -17,7 +17,8 @@
 #     checks every node)
 # Stays FAIL: the nodes cannot be read, or a node the MCO finished runs a configuration
 # that cannot be read, or runs a v2 configuration but its kernel is not on cgroup v2 or
-# cannot be checked (waiting does not fix these).
+# cannot be checked (waiting does not fix these). With cgroup_check_method kernel, a
+# finished node on a v1 kernel counts as still to roll out (the configuration is not read).
 # skip_cgroup_check: true leaves cgroups alone: the nodes are not checked and the check
 # is a WARN (not recommended).
 # Sets: cgroup_nodes (when the nodes were checked; shown in the report).
@@ -45,7 +46,7 @@
 
 # Why: the setting alone proves nothing - a node is on v2 only once the MCO rolled a
 #      v2 configuration out to it and it rebooted.
-- name: "Check 14: Check every node (configuration and kernel)"
+- name: "Check 14: Check every node (cgroup_check_method {{ cgroup_check_method | default('config') }})"
   include_tasks: "{{ playbook_dir }}/steps/03/cgroup_nodes.yml"
   vars:
     cgroup_wait_seconds: 0

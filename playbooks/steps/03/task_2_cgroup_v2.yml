@@ -7,7 +7,7 @@
 #
 # Check:   whether any hop reaches 4.19+ (OpenShift 4.19+ cannot run on cgroup v1),
 #          nodes.config/cluster spec.cgroupMode, and every node (steps/03/cgroup_nodes.yml:
-#          the MCO configuration it runs and, with cgroup_check_kernel, its kernel).
+#          the MCO configuration it runs and/or its kernel, by cgroup_check_method).
 #          The nodes decide: an empty cgroupMode is rendered as v2 by the MCO on
 #          OpenShift 4.14+, so a cluster whose nodes all run v2 needs no change.
 # Change:  spec.cgroupMode=v2 when the setting is not v2 (or is v1) and the nodes are
@@ -57,7 +57,7 @@
   vars:
     _p: "{{ (target_max_version | string).split('.') }}"
 
-- name: "Task 2: Check every node (configuration and kernel)"
+- name: "Task 2: Check every node (cgroup_check_method {{ cgroup_check_method | default('config') }})"
   include_tasks: "{{ playbook_dir }}/steps/03/cgroup_nodes.yml"
   vars:
     cgroup_wait_seconds: 0
@@ -70,7 +70,7 @@
 #   skip      skip_cgroup_check is true (nothing is checked or changed)
 #   unread    the nodes could not be checked
 #   broken    a node the MCO finished runs an unreadable configuration, or a v2
-#             configuration whose kernel is not on v2 / cannot be checked
+#             configuration whose kernel is not on v2, or its kernel cannot be checked
 #   watch     the setting is v2, but nodes still have to roll it out
 #   disabled  the setting is not v2, nodes are not on v2, and the fix is switched off
 #   patch     set v2, then wait, watch and verify

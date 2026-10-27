@@ -36,7 +36,7 @@ Page `#f8f9fb`, surface `#ffffff`, border `#e4e7ec`, heading `#101828`. System f
 - **02 Prechecks:**
   - the 17-row check table (titled "run again after the Phase 03 changes" when Phase 03 re-checked; a check Phase 03 fixed shows AUTO-FIXED)
   - the installed operators table: operator, namespace, version, channel, CSV phase, blocks upgrade, result, notes
-  - "cgroup v2 on every node" (`<details>`, open when a node is not on v2), whenever the nodes were checked. One row per node: node, role, MCO configuration (v1/v2 and its name, "update not finished"), kernel (`cgroup2fs` / `tmpfs` / error), result pill, problem.
+  - "cgroup v2 on every node" (`<details>`, open when a node is not on v2), whenever the nodes were checked. One row per node: node, role, MCO configuration (v1/v2 and its name, "update not finished"), kernel (`cgroup2fs` / `tmpfs` / error), result pill, problem. A column `cgroup_check_method` leaves out reads "not checked"; the summary line names the method.
 - **03 Pre-upgrade implementation:** one row per task (#, task, result pill, what was found and done, including the rollout watch), the changes made with documentation links, and the admin-acks applied in Phase 03. "(plan only)" in a dry run.
 - **04 Upgrade hops:** hop table and the admin-acks applied right before a hop.
 - **06 Postchecks:** the 10-row check table.

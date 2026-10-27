@@ -79,11 +79,15 @@ mcp_auto_unpause_list: ["worker", "master"]
 # Task 2 (Check 14): set cgroupMode v2 when a hop reaches 4.19+ (every node reboots,
 # watched to the end before the next task).
 auto_fix_cgroup_v2: true
-# Check 14 and task 2 check every node, not only the setting: the Machine Config
-# Operator configuration the node runs and, with cgroup_check_kernel, its kernel
-# (`stat -c %T -f /sys/fs/cgroup` through the node's machine-config-daemon pod,
-# `oc exec`, read-only). A node that cannot be checked counts as not on v2.
-cgroup_check_kernel: true
+# Check 14 and task 2 check every node, not only the setting. The MCO must be done with
+# the node; then cgroup_check_method decides what proves it runs v2:
+#   config - the Machine Config Operator configuration it runs has no cgroup v1 kernel
+#            argument (reads MachineConfigs, no exec)
+#   kernel - its kernel: `stat -c %T -f /sys/fs/cgroup` through the node's
+#            machine-config-daemon pod (`oc exec`, read-only; needs pods/exec)
+#   both   - the configuration and the kernel
+# A node that cannot be checked counts as not on v2.
+cgroup_check_method: config
 cgroup_render_wait_minutes: 5        # task 2: wait for the MCO to render the v2 configuration
 cgroup_node_check_wait_minutes: 10   # task 2: after the rollout, wait this long for the last node
 

@@ -104,17 +104,18 @@ Such an update is watched to the end by Phase 05 in hop mode, with the heartbeat
    | 11 | PersistentVolumeClaims | WARN |
    | 12 | PodDisruptionBudgets | WARN (HARD if `fail_on_zero_disruption_pdb`) |
    | 13 | Platform pods | WARN |
-   | 14 | cgroup v2 for 4.19+: the setting AND every node (MCO configuration and kernel) (Phase 03 task 2) | HARD |
+   | 14 | cgroup v2 for 4.19+: the setting AND every node (MCO configuration and/or kernel, `cgroup_check_method`) (Phase 03 task 2) | HARD |
    | 15 | Operator upgrade blockers (`olm.maxOpenShiftVersion`, OLM `Upgradeable=False`) (Phase 03 task 3) | HARD |
    | 16 | Installed operator health (CSV phase, subscription problems, own upgrade blocked, channel) | WARN |
    | 17 | Router drain headroom: eligible nodes ≥ router replicas + `maxUnavailable` | WARN |
 
    - **Check 08** models the node drain. For each pool except master, it drains the pool's largest `maxUnavailable` nodes. The requests of the pods that have to move (all but DaemonSet and static pods) must then stay within `max_cpu_percent` / `max_memory_percent` of what the pool's other Ready, schedulable nodes can still allocate. Pods that do not fit stay Pending, their PodDisruptionBudgets then block the drain, and the pool never finishes. The master pool is skipped; a pool with one node is listed, not judged. A failed read fails the check and is retried; it never passes on missing data.
-   - **Check 14** checks every node with `steps/03/cgroup_nodes.yml` whenever the path reaches 4.19+:
-     - the MCO has finished the node, and the rendered configuration it runs has no `systemd.unified_cgroup_hierarchy=0`;
-     - with `cgroup_check_kernel` (on by default), `stat -c %T -f /sys/fs/cgroup` on the node prints `cgroup2fs` (`oc exec` into the node's machine-config-daemon pod, read-only).
+   - **Check 14** checks every node with `steps/03/cgroup_nodes.yml` whenever the path reaches 4.19+. The MCO must have finished the node. Then `cgroup_check_method` in `vars/upgrade.yml` decides what proves the node runs v2:
+     - `config` (default): the rendered configuration it runs has no `systemd.unified_cgroup_hierarchy=0`. No exec.
+     - `kernel`: `stat -c %T -f /sys/fs/cgroup` on the node prints `cgroup2fs` (`oc exec` into the node's machine-config-daemon pod, read-only; needs `pods/exec`). MachineConfigs are not read, so a finished node on a v1 kernel cannot be told from one the rollout has not reached yet: it counts as still to roll out.
+     - `both`: the configuration, then the kernel of every node that runs a v2 configuration.
 
-     The nodes decide, not the setting. An empty `cgroupMode` is fine when every node runs v2: the MCO renders an empty setting as v2 on OpenShift 4.14+. An explicit `v1` is always a problem. A node that cannot be checked counts as not on v2. With `skip_cgroup_check` the nodes are not checked and the check is a WARN.
+     Any other value stops the run at the start. The nodes decide, not the setting. An empty `cgroupMode` is fine when every node runs v2: the MCO renders an empty setting as v2 on OpenShift 4.14+. An explicit `v1` is always a problem. A node that cannot be checked counts as not on v2. With `skip_cgroup_check` the nodes are not checked and the check is a WARN.
    - **Check 17** warns when a router deployment has fewer eligible nodes (Ready, schedulable, matching its nodeSelector and taints) than replicas + `maxUnavailable`. Router pods of the same version must run on different nodes, so every drain then leaves one router Pending until the node is back: ingress is Progressing meanwhile, and Degraded after 60 minutes. Not a blocker.
    - **Node diagnosis.** When Check 02 fails, `steps/common/diagnose_nodes.yml` says for each node what is wrong, the likely cause and what to do (see "Node problems" below).
 
@@ -122,7 +123,7 @@ Such an update is watched to the end by Phase 05 in hop mode, with the heartbeat
    - Check 03: every failing pool is paused and on `mcp_auto_unpause_list`, and none is Degraded.
    - Check 14, on a path that reaches 4.19+:
      - the setting is not v2 and nodes are not on v2 (needs `auto_fix_cgroup_v2` and `auto_remediation_enabled`): Phase 03 sets v2;
-     - the setting is v2 but nodes still run a v1 configuration: they have not finished, or not started, rolling it out, and Phase 03 watches the rollout.
+     - the setting is v2 but nodes still run a v1 configuration (with `kernel`: a v1 kernel): they have not finished, or not started, rolling it out, and Phase 03 watches the rollout.
 
      In both cases Phase 03 then checks every node. If the MCO never renders a v2 configuration (for example a custom MachineConfig that forces v1), Phase 03 stops after `cgroup_render_wait_minutes`.
    - Check 15: every blocking operator has an upgrade pending.
@@ -130,7 +131,7 @@ Such an update is watched to the end by Phase 05 in hop mode, with the heartbeat
    The following stay FAIL:
    - a blocking operator with nothing pending;
    - a Degraded pool, or a paused pool that is not on the list;
-   - for Check 14: the nodes cannot be read; or a node the MCO has finished runs a configuration that cannot be read; or it runs a v2 configuration but its kernel is not on cgroup v2, or cannot be checked.
+   - for Check 14: the nodes cannot be read; or a node the MCO has finished runs a configuration that cannot be read; or it runs a v2 configuration but its kernel is not on cgroup v2 (`both`); or its kernel cannot be checked (`kernel`, `both`).
 
 3. **GATE:** any HARD check that is FAIL stops the run. Nothing has been changed at this point.
 
@@ -283,7 +284,7 @@ Templates: summary `email-summary.j2`, alert `error-report.j2`, heartbeat and de
 
 The unpause and cgroup changes also need `auto_remediation_enabled`. A dry run makes none of these changes. A pre-check makes only the Phase 03 ones.
 
-Nothing else is changed. In particular, nodes are never patched, cordoned, uncordoned, drained, rebooted or deleted: the MCO applies the cgroup setting to the nodes itself, and node problems are only reported. The one action that runs inside the cluster without changing it is `oc exec` into the existing machine-config-daemon pod of each node, for the read-only kernel check of Check 14 and Phase 03 task 2 (`cgroup_check_kernel`).
+Nothing else is changed. In particular, nodes are never patched, cordoned, uncordoned, drained, rebooted or deleted: the MCO applies the cgroup setting to the nodes itself, and node problems are only reported. The one action that runs inside the cluster without changing it is `oc exec` into the existing machine-config-daemon pod of each node, for the read-only kernel check of Check 14 and Phase 03 task 2 (only with `cgroup_check_method` `kernel` or `both`).
 
 ## Where things are
 ```

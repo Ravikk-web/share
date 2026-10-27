@@ -66,19 +66,24 @@ If a run stops, fix the cause and run the same command again:
 ## Current status
 - **Phase:** Live-run fixes (2026-10-26), after the first live run on arod01. That run stopped with the worker pool at "0 of 3" behind one cordoned worker, and the resume then stopped in the prechecks.
   - **Resume:** running the same command again first watches an update that is still running to the end. That includes a hop whose control plane is done while its workers are still updating. Then the prechecks run.
-  - **cgroup v2 is checked on every node:** the MCO configuration it runs, and its kernel (`stat -c %T -f /sys/fs/cgroup` through the node's machine-config-daemon pod). AUTO-FIXED only when every node is on v2.
+  - **cgroup v2 is checked on every node.** `cgroup_check_method` in `vars/upgrade.yml` chooses how:
+    - `config` (default): the MCO configuration the node runs;
+    - `kernel`: its kernel (`stat -c %T -f /sys/fs/cgroup` through the node's machine-config-daemon pod, needs `pods/exec`);
+    - `both`.
+
+    AUTO-FIXED only when every node is on v2.
   - **Node problems** are reported with the likely cause and what to do, in Check 02, the degradation mails and the alert. The automation never repairs a node.
   - **"Pool cannot continue" alert:** no node updating while unavailable nodes use up `maxUnavailable`.
   - **New checks:** Check 08 now checks drain headroom per pool (HARD), and the new Check 17 checks router headroom (WARN).
   - **Logs:** the last 5 runs per cluster are kept.
-  - **Settings:** `log_keep_runs`, `cgroup_check_kernel`, `cgroup_render_wait_minutes`, `cgroup_node_check_wait_minutes`, `degradation_pool_blocked_minutes`, `node_overcommit_memory_usage_percent`, `node_overcommit_memory_limits_percent`. No new cluster writes.
-- **Verified offline only** (no Ansible on the workstation). After an independent review whose findings were all fixed: static checks 0 problems, unit checks 40/40, flow scenarios 29/29 (135 checks, 0 failed).
+  - **Settings:** `log_keep_runs`, `cgroup_check_method`, `cgroup_render_wait_minutes`, `cgroup_node_check_wait_minutes`, `degradation_pool_blocked_minutes`, `node_overcommit_memory_usage_percent`, `node_overcommit_memory_limits_percent`. No new cluster writes.
+- **Verified offline only** (no Ansible on the workstation). After an independent review whose findings were all fixed, and including the `cgroup_check_method` switch: static checks 0 problems, unit checks 62/62, flow scenarios 33/33 (147 checks, 0 failed).
   - Static checks: YAML, Jinja, include paths, the jq programs compiled plus a jq 1.5 scan, `bash -n`.
   - Unit checks of each new shell step against a fake cluster.
   - End-to-end flow scenarios: the real `main.yml` run by a small Ansible emulator against a fake `oc` cluster.
 - **Next:**
   1. arod01: free the cordoned worker (runbook in `Documentation.md`), let the worker pool finish, then run the same command again.
   2. On the jump host: `ansible-playbook --syntax-check main.yml` with Ansible 2.7.17 and 2.14.18.
-  3. Check the new reads on a real cluster: the `oc exec ... stat` kernel check, `oc get machines.machine.openshift.io`, `oc adm top nodes`.
+  3. Check the new reads on a real cluster: `oc get machines.machine.openshift.io`, `oc adm top nodes` and, before using `cgroup_check_method` `kernel` or `both`, the `oc exec ... stat` kernel check.
   4. `--dry-run`, `--pre-check`, then a one-hop upgrade on DEV.
-- Nothing is committed. Changes stay local until you ask.
+- The live-run fixes are committed (`de65045`). The `cgroup_check_method` switch is not committed yet. Nothing is pushed.

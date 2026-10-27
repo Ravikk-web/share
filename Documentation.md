@@ -2391,7 +2391,7 @@ A review of the code found more gaps:
 | Setting | Default | Meaning |
 |---|---|---|
 | `log_keep_runs` | 5 | runs per cluster kept in `logs/` (the new run included) |
-| `cgroup_check_kernel` | true | Check 14 / task 2 also check each node's kernel through its machine-config-daemon pod |
+| `cgroup_check_kernel` | true | Check 14 / task 2 also check each node's kernel through its machine-config-daemon pod. **Replaced on 2026-10-27 by `cgroup_check_method`** (see the next section) |
 | `cgroup_render_wait_minutes` | 5 | task 2 waits this long for the MCO to render the v2 configuration for every pool |
 | `cgroup_node_check_wait_minutes` | 10 | after the rollout, task 2 waits this long for the last node to report v2 |
 | `degradation_pool_blocked_minutes` | 10 | grace before the "pool cannot continue / finish" degradation mail |
@@ -2439,3 +2439,49 @@ All were fixed. Final results:
 - flow scenarios: 29 scenarios, 135 checks, 0 failed.
 
 Details are in the progress tracker's session notes. Still to do: `ansible-playbook --syntax-check` on Ansible 2.7.17 and 2.14.18, then a dry run and a pre-check on DEV.
+
+---
+
+## cgroup check method switch (2026-10-27)
+
+The live-run fixes above were committed as `de65045`. Then the user asked for a way to switch the per-node cgroup check between the kernel check and the node configuration check.
+
+### User decisions
+1. Three modes: `config`, `kernel` and `both`.
+2. The default is `config`.
+3. The mode is set in `vars/upgrade.yml` only (no CLI option).
+4. In `kernel` mode the MCO node state is still read (node annotations only), but not judged as a pass/fail check.
+
+### What changed
+- `cgroup_check_kernel` (true/false) is replaced by `cgroup_check_method` in `vars/upgrade.yml`.
+- `steps/03/cgroup_nodes.yml`. For every node, the MCO must be done with it (current = desired configuration, state Done) in every mode. Then:
+
+  | Mode | Proof that the node runs v2 | Reads | Needs |
+  |---|---|---|---|
+  | `config` (default) | the rendered MachineConfig it runs has no `systemd.unified_cgroup_hierarchy=0` | nodes, MachineConfigs | - |
+  | `kernel` | `stat -c %T -f /sys/fs/cgroup` prints `cgroup2fs` | nodes, machine-config-daemon pods, `oc exec` per finished Ready node | `pods/exec` in `openshift-machine-config-operator` |
+  | `both` | both of the above (the kernel only on nodes that run a v2 configuration) | all of the above | `pods/exec` |
+
+  - A column that was not checked reads `not checked` in the report table.
+  - The output now also has `method` and `config_checked`.
+  - The summary line names the method, for example `all 6 nodes run cgroup v2 (cgroup_check_method config: MCO update finished; configuration has no cgroup v1 kernel argument; kernel not checked)`.
+- **Pending or broken in `kernel` mode.** Without the configuration, a finished node on a v1 kernel (`tmpfs`) cannot be told from a node the rollout has not reached yet, so it counts as `pending`, not `broken`. That keeps the normal v1 → v2 path working: before the change every node is finished and on `tmpfs`, and Check 14 must leave the fix to Phase 03. The cost: a node that stays on v1 after its rollout is reported by task 2 as FIX-FAILED after the watch (`cgroup_node_check_wait_minutes`), instead of Check 14 stopping the run at once. Use `both` to get the early stop. A kernel that cannot be checked is `broken` in every mode.
+- `main.yml` checks the value at the start ("Start: Check the settings in vars/upgrade.yml"). Any value other than `config`, `kernel` or `both` (case does not matter) stops the run before login.
+- Check 14 and task 2 show the method in the task name.
+- The render wait of task 2 still reads MachineConfigs in every mode: it waits for the pool targets, not for the nodes.
+
+### Cluster writes
+None added. In the default `config` mode the run no longer uses `oc exec` at all.
+
+### Verification
+Offline, with the harness from the session scratchpad. The earlier kernel scenarios now set `both` explicitly.
+- Static checks: 0 problems.
+- Unit checks: 62/62. New cases:
+  - per mode: `config` (no exec), `kernel` (no MachineConfig read, `tmpfs` counts as pending);
+  - the summary line of each mode;
+  - the start-up check of the value.
+- Flow scenarios: 33 scenarios, 147 checks, 0 failed. New scenarios:
+  - v1 → v2 with `config`;
+  - v1 → v2 with `kernel`;
+  - `kernel` with a node that cannot be checked;
+  - a misspelt value.

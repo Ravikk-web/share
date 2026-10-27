@@ -14,7 +14,7 @@ A rule-based, one-command Ansible automation that upgrades Azure Red Hat OpenShi
    - Only one run per cluster at a time.
 4. **Checks first, then verified pre-upgrade changes.** Phase 02 only reads. Phase 03 makes every change needed before the first hop, one task at a time:
    - unpausing allow-listed MachineConfigPools
-   - cgroup v2 when the path reaches 4.19+, verified on every node (the MCO configuration it runs and its kernel), not only the setting
+   - cgroup v2 when the path reaches 4.19+, verified on every node (the MCO configuration it runs, its kernel, or both: `cgroup_check_method`), not only the setting
    - approving pending operator upgrades, then stopping if an operator still blocks the target
    - the admin-ack, after APIRequestCount shows no remaining callers of removed APIs
 

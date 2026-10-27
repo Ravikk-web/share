@@ -56,7 +56,7 @@ Shared steps live in the folder of the phase that owns the change, and other pha
 - `steps/03/admin_ack.yml` (with `api_usage.yml`): Precheck 07 evaluates with it, Phase 03 applies, and `steps/04/start_hop.yml` applies again before each later minor hop.
 - `steps/02/read_operators.yml`: Precheck 15 and Phase 03 task 3 read the installed operators with it.
 - `steps/07/approve_operators.yml`: Phase 03 task 3 (before the first hop) and Phase 07 (after the cluster upgrade) approve operator upgrades with it.
-- `steps/03/cgroup_nodes.yml`: Precheck 14 and Phase 03 task 2 check every node's cgroup mode with it (the MCO configuration the node runs and, with `cgroup_check_kernel`, its kernel through `oc exec` into the node's machine-config-daemon pod).
+- `steps/03/cgroup_nodes.yml`: Precheck 14 and Phase 03 task 2 check every node's cgroup mode with it. The MCO must be done with the node; `cgroup_check_method` then picks the proof: `config` (default, the MCO configuration the node runs), `kernel` (its kernel through `oc exec` into the node's machine-config-daemon pod; MachineConfigs not read) or `both`.
 - `steps/04/read_update_state.yml`: is an update or a node rollout still running? Used by the snapshot, the resume step, the hop plan and Phase 06.
 - `steps/common/diagnose_nodes.yml`: what is wrong with a node and what to do (read-only). Used by Precheck 02, Phase 05 (degradation mails about nodes or a blocked pool) and the failure handler.
 
@@ -94,7 +94,7 @@ Phase 02 never changes the cluster. A precheck whose problem Phase 03 will fix i
 | Check | Deferred to Phase 03 when |
 |---|---|
 | 03 MachineConfigPools | every failing pool is paused and on `mcp_auto_unpause_list`, none is Degraded |
-| 14 cgroup mode | path reaches 4.19+ and the nodes could be read, none "broken", and either: the setting is not v2 and nodes are not on v2 (`auto_fix_cgroup_v2`), or the setting is v2 and nodes still run a v1 configuration. Never with `skip_cgroup_check` (then WARN, nodes not checked). Broken means a finished node whose configuration cannot be read, or whose v2 configuration runs on a kernel that is not on v2 or cannot be checked |
+| 14 cgroup mode | path reaches 4.19+ and the nodes could be read, none "broken", and either: the setting is not v2 and nodes are not on v2 (`auto_fix_cgroup_v2`), or the setting is v2 and nodes still run a v1 configuration. Never with `skip_cgroup_check` (then WARN, nodes not checked). Broken means a finished node whose configuration cannot be read, or whose v2 configuration runs on a kernel that is not on v2, or whose kernel cannot be checked. With `cgroup_check_method: kernel` a finished node on a v1 kernel is not broken but still to roll out (its configuration is not read) |
 | 15 Operator upgrade blockers | every blocking operator has an upgrade pending (`UpgradePending`), operator approvals switched on |
 
 Check 07 already passes when the only thing missing is the admin-ack (Phase 03 applies it).
@@ -116,7 +116,7 @@ Each task is one file, `steps/03/task_<n>_<name>.yml`, and works the same way:
 | # | Task | Change | Re-checked by |
 |---|---|---|---|
 | 1 | MachineConfigPools | unpause paused pools on `mcp_auto_unpause_list` | Check 03 |
-| 2 | cgroup v2 | `cgroupMode: v2` when a hop reaches 4.19+; wait until the MCO rendered a v2 configuration for every pool; watch the rollout (all nodes reboot); AUTO-FIXED only when every node is on v2 (configuration and kernel) | Check 14 |
+| 2 | cgroup v2 | `cgroupMode: v2` when a hop reaches 4.19+; wait until the MCO rendered a v2 configuration for every pool; watch the rollout (all nodes reboot); AUTO-FIXED only when every node is on v2 (by `cgroup_check_method`: configuration, kernel or both) | Check 14 |
 | 3 | Operator upgrades | approve the current InstallPlan of every `UpgradePending` subscription; stop if an operator still blocks the target | Check 15 |
 | 4 | Admin-ack | removed-API check, then the keys the next minor hop needs | Check 07 |
 
@@ -170,7 +170,7 @@ No Phase 03 change is made while a cluster update is running; all tasks are then
 
 Phase 04 never runs in a dry run, and `start_hop.yml` refuses to run if `dry_run` is set. In a dry run Phase 03 evaluates only, and `admin_ack.yml` refuses apply mode.
 
-**Read actions inside the cluster (not writes).** The kernel check of Precheck 14 and Phase 03 task 2 runs `stat -c %T -f /sys/fs/cgroup` through `oc exec` in the existing machine-config-daemon pod of each node (`cgroup_check_kernel`). It creates no object and changes nothing. Nodes themselves are never patched, cordoned, uncordoned, drained, rebooted or deleted: the MCO applies the cgroup setting, and node problems are reported only.
+**Read actions inside the cluster (not writes).** The kernel check of Precheck 14 and Phase 03 task 2 runs `stat -c %T -f /sys/fs/cgroup` through `oc exec` in the existing machine-config-daemon pod of each node (only with `cgroup_check_method` `kernel` or `both`). It creates no object and changes nothing. Nodes themselves are never patched, cordoned, uncordoned, drained, rebooted or deleted: the MCO applies the cgroup setting, and node problems are reported only.
 
 ---
 
@@ -188,4 +188,4 @@ Phase 04 never runs in a dry run, and `start_hop.yml` refuses to run if `dry_run
 10. **Lock.** One run per cluster at a time.
 11. **Mails.** At most one alert per failed run and one summary per successful run.
 12. **Nodes are reported, not repaired.** No step uncordons, drains, reboots, patches or deletes a node or a Machine; `steps/common/diagnose_nodes.yml` only reads and reports.
-13. **cgroup v2 is verified on the nodes.** AUTO-FIXED for cgroup v2, and a PASS of Check 14, require every node to run a v2 configuration (and, with `cgroup_check_kernel`, a v2 kernel), not just the setting. With `skip_cgroup_check` the nodes are not checked, and Check 14 and task 2 report WARN, never PASS.
+13. **cgroup v2 is verified on the nodes.** AUTO-FIXED for cgroup v2, and a PASS of Check 14, require every node to be finished by the MCO and on v2 by `cgroup_check_method` (`config`: a v2 configuration, `kernel`: a v2 kernel, `both`: both), not just the setting. `main.yml` stops at the start on any other value. With `skip_cgroup_check` the nodes are not checked, and Check 14 and task 2 report WARN, never PASS.

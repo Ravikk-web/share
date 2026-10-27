@@ -96,6 +96,13 @@
           Start the run with 00_Run.sh. Needed: cluster_name (one of {{ clusters.keys() | list | join(', ') }}),
           run_mode (upgrade, dry-run, pre-check or post-check) and, except for post-check, upgrade_path.
 
+    - name: "Start: Check the settings in vars/upgrade.yml"
+      assert:
+        that:
+          - cgroup_check_method | default('config') | string | lower in ['config', 'kernel', 'both']
+        fail_msg: >-
+          cgroup_check_method in vars/upgrade.yml is '{{ cgroup_check_method }}'; it must be config, kernel or both.
+
     - name: "Start: Set up the run"
       set_fact:
         run_timestamp: "{{ run_timestamp | default(lookup('pipe', 'date +%Y%m%d_%H%M%S'), true) }}"
