@@ -34,6 +34,9 @@
         exclude_cluster_operators: "{{ exclude_cluster_operators | default([]) }}"
         exclude_nodes: "{{ exclude_nodes | default([]) }}"
         exclude_alerts: "{{ exclude_alerts | default([]) }}"
+        warn_only_pod_health: "{{ warn_only_pod_health | default(false) | bool }}"
+        warn_only_resource_utilization: "{{ warn_only_resource_utilization | default(false) | bool }}"
+        warn_only_pvc_status: "{{ warn_only_pvc_status | default(false) | bool }}"
 
     - name: "Set timestamp for report filenames"
       set_fact:
@@ -129,10 +132,14 @@
           .dot-pass{background:var(--pass)}.dot-warn{background:var(--warn)}.dot-fail{background:var(--fail)}
 
           /* Quick Triage Banner */
-          .triage-box{background:var(--card);border:1px solid var(--border);border-left:4px solid var(--fail);border-radius:8px;padding:14px 18px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,0.04)}
-          .triage-hdr{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);font-weight:600;margin-bottom:10px}
+          .triage-box{background:var(--card);border:1px solid var(--border);border-left:4px solid var(--fail);border-radius:8px;padding:14px 18px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,0.04);transition:all .2s}
+          .triage-hdr{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);font-weight:600;margin-bottom:10px;user-select:none}
+          .triage-box.collapsed .triage-hdr{margin-bottom:0}
           .triage-count{margin-left:auto;font-size:11px;background:var(--fail-bg);color:var(--fail);padding:2px 8px;border-radius:10px;font-weight:700}
-          .triage-list{display:flex;flex-direction:column;gap:6px}
+          .triage-toggle-btn{background:var(--sub-bg);border:1px solid var(--border);color:var(--text-sec);padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:4px;transition:all .15s}
+          .triage-toggle-btn:hover{background:var(--border);color:var(--text)}
+          .triage-list{display:flex;flex-direction:column;gap:6px;transition:all .2s}
+          .triage-box.collapsed .triage-list{display:none}
           .triage-item{display:flex;align-items:baseline;gap:10px;font-size:12px;padding:6px 10px;border-radius:6px;background:var(--sub-bg);border-left:3px solid var(--fail)}
           .triage-item.ti-warn{border-left-color:var(--warn)}
           .ti-cl{font-weight:700;color:var(--text);min-width:70px}
@@ -281,13 +288,16 @@
           {% set fail_clusters = master_results | selectattr('overall_status','equalto','FAIL') | list %}
           {% set warn_clusters = master_results | selectattr('overall_status','equalto','WARN') | list %}
           {% if fail_clusters | length > 0 or warn_clusters | length > 0 %}
-          <div class="triage-box">
+          <div class="triage-box" id="triageBox">
             <div class="triage-hdr">
               <span class="dot dot-fail"></span>
               <strong>Quick Triage &middot; Attention Required</strong>
               <span class="triage-count">{{ fail_clusters | length }} Critical, {{ warn_clusters | length }} Warning</span>
+              <button type="button" class="triage-toggle-btn" id="triageToggleBtn" onclick="toggleTriage()" title="Collapse / Expand Quick Triage">
+                <span id="triageChv">&#9660;</span> <span id="triageBtnTxt">Collapse</span>
+              </button>
             </div>
-            <div class="triage-list">
+            <div class="triage-list" id="triageList">
               {% for cl in fail_clusters %}
                 {% for ch in cl.checks %}{% if ch.status == 'FAIL' %}
                 <div class="triage-item">
@@ -466,11 +476,8 @@
                 <tr><td>{{ loop.index + 11 }}</td><td>{{ c.check_name }}</td><td class="st-{{ c.status | lower }}"><span class="dot dot-{{ c.status | lower }}"></span>{{ c.status }}</td><td><span class="dt">{{ c.details }}</span></td></tr>
                 {% endfor %}
                 </tbody></table>
-                {% if checks[11].status == 'FAIL' %}
-                <div class="pod-wrap" data-pods="{{ checks[11].details }}"></div>
-                {% endif %}
-                {% if checks[12].status != 'PASS' %}
-                <div class="pod-wrap" data-pods="{{ checks[12].details }}"></div>
+                {% if checks[11].status != 'PASS' %}
+                <div class="pod-wrap" data-pods="{{ checks[11].details }}" data-status="{{ checks[11].status }}"></div>
                 {% endif %}
               </details>
 
@@ -550,12 +557,51 @@
             });
           }
 
+          // Quick Triage Toggle
+          function toggleTriage(){
+            var box = document.getElementById('triageBox');
+            var chv = document.getElementById('triageChv');
+            var txt = document.getElementById('triageBtnTxt');
+            if(!box) return;
+            box.classList.toggle('collapsed');
+            var isCol = box.classList.contains('collapsed');
+            if(chv) chv.innerHTML = isCol ? '&#9654;' : '&#9660;';
+            if(txt) txt.textContent = isCol ? 'Expand' : 'Collapse';
+            try{localStorage.setItem('aro_triage_collapsed', isCol ? 'true' : 'false')}catch(e){}
+          }
+          (function(){
+            try{
+              if(localStorage.getItem('aro_triage_collapsed') === 'true'){
+                var box = document.getElementById('triageBox');
+                var chv = document.getElementById('triageChv');
+                var txt = document.getElementById('triageBtnTxt');
+                if(box) box.classList.add('collapsed');
+                if(chv) chv.innerHTML = '&#9654;';
+                if(txt) txt.textContent = 'Expand';
+              }
+            }catch(e){}
+          })();
+
           // Expand / Collapse All
           function toggleAllDetails(open){
             var secs = document.querySelectorAll('.sec');
             secs.forEach(function(s){
               if(open){s.setAttribute('open','')}else{s.removeAttribute('open')}
             });
+            var box = document.getElementById('triageBox');
+            var chv = document.getElementById('triageChv');
+            var txt = document.getElementById('triageBtnTxt');
+            if(box){
+              if(open){
+                box.classList.remove('collapsed');
+                if(chv) chv.innerHTML = '&#9660;';
+                if(txt) txt.textContent = 'Collapse';
+              } else {
+                box.classList.add('collapsed');
+                if(chv) chv.innerHTML = '&#9654;';
+                if(txt) txt.textContent = 'Expand';
+              }
+            }
           }
 
           // Copy Slack Incident Summary
@@ -717,7 +763,9 @@
               var gw=el.querySelector('.gw');if(gw)gw.innerHTML=buildGauges(allGaugeNodes);
               var stEl=el.querySelector('.res-subtables');if(stEl)stEl.innerHTML=subH;
               if(issueNodes.length>0){
-                var iH='<div class="issues-hdr"><span class="dot dot-fail"></span> '+issueNodes.length+' Node(s) with WARN/FAIL across resource checks</div>';
+                var hasFail=issueNodes.some(function(x){return x.status==='FAIL'});
+                var dotCls=hasFail?'dot-fail':'dot-warn';
+                var iH='<div class="issues-hdr" style="'+(hasFail?'':'color:var(--warn);background:var(--warn-bg)')+'"><span class="dot '+dotCls+'"></span> '+issueNodes.length+' Node(s) with WARN/FAIL across resource checks</div>';
                 iH+='<table class="sub-tbl"><thead><tr><th style="width:40px">#</th><th>Node</th><th>Check</th><th style="width:100px">Usage</th><th style="width:60px">Status</th><th style="width:40px"></th></tr></thead><tbody>';
                 for(var i=0;i<issueNodes.length;i++){
                   var ni=issueNodes[i],clr=pctColor(ni.pct),pw=Math.min(ni.pct,100);
@@ -739,12 +787,17 @@
               var pods=[],re2=/([^\s;]+\/[^\s;(]+)\s*\(([^)]+)\)/g,m2;
               while((m2=re2.exec(raw))!==null){pods.push({name:m2[1].trim(),status:m2[2].trim()})}
               if(!pods.length)continue;
-              var h='<div class="sub-sec" style="margin:12px 16px"><h4><span class="dot dot-fail"></span> Problematic Pods ('+pods.length+')</h4>';
+              var pSt=pws[p].getAttribute('data-status')||'FAIL';
+              var isWarn=(pSt==='WARN');
+              var dotCls=isWarn?'dot-warn':'dot-fail';
+              var rowCls=isWarn?'nw-row':'nf-row';
+              var bdgCls=isWarn?'st-badge-warn':'st-badge-fail';
+              var h='<div class="sub-sec" style="margin:12px 16px"><h4><span class="dot '+dotCls+'"></span> Problematic Pods ('+pods.length+')</h4>';
               h+='<table class="sub-tbl"><thead><tr><th style="width:40px">#</th><th>Namespace / Pod</th><th style="width:120px">Status</th><th style="width:40px"></th></tr></thead><tbody>';
               for(var i=0;i<pods.length;i++){
-                h+='<tr class="nf-row"><td style="text-align:center;color:var(--text-sec)">'+(i+1)+'</td>';
+                h+='<tr class="'+rowCls+'"><td style="text-align:center;color:var(--text-sec)">'+(i+1)+'</td>';
                 h+='<td class="node-nm" title="'+pods[i].name+'">'+pods[i].name+'</td>';
-                h+='<td><span class="st-badge st-badge-fail">'+pods[i].status+'</span></td>';
+                h+='<td><span class="st-badge '+bdgCls+'">'+pods[i].status+'</span></td>';
                 h+='<td><button class="cp-btn" onclick="copyName(this,\''+pods[i].name.replace(/'/g,"\\'")+'\')">'+cpIco+'</button></td></tr>';
               }
               h+='</tbody></table></div>';
@@ -797,3 +850,4 @@
       file:
         path: "{{ report_dir }}"
         state: absent
+      when: email_sent_successfully | default(true)

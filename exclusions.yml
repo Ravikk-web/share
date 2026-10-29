@@ -1,0 +1,41 @@
+---
+# =============================================================================
+# ARO Capacity & Health Check Exclusions
+# Central configuration for ignoring known/expected anomalies across clusters
+# =============================================================================
+
+# 1. Namespaces excluded from Pod Health (Check 12) & PVC Status (Check 15)
+# Supports exact namespace names or regex patterns (e.g. "openshift-.*", "app-.*")
+exclude_namespaces:
+  - openshift-insights
+  - twistlock
+  - openshift-gitops
+  - openshift-logging
+  - openshift-operators
+  - gh-actions-system
+  - app00046878-openshift-platform
+  - app00046995-g6
+  - default
+
+# 2. Cluster Operators excluded from Operator checks (Check 4 & Check 17)
+# Operators listed here will be skipped from failure/warning conditions
+exclude_cluster_operators:
+  - operator-lifecycle-manager   # Known cannot-update condition in dev
+  - aro                          # ARO custom operator (version mismatch expected)
+
+# 3. Nodes excluded from Node checks (Checks 6-11 & Check 16)
+# Supports exact node names or patterns (e.g. decommissioned or benchmark nodes)
+exclude_nodes: []
+  # - "sample-node-name-to-skip"
+
+# 4. Prometheus Alerts excluded from Cluster Alerts (Check 5)
+# In addition to built-in system suppressions (Watchdog, InfoInhibitor, AlertmanagerReceiversNotConfigured)
+exclude_alerts:
+  - Watchdog
+  - InfoInhibitor
+  - AlertmanagerReceiversNotConfigured
+# 5. Severity Overrides (Demote FAIL to WARN)
+# When set to true, issues detected in these checks will trigger a WARN instead of failing the cluster
+warn_only_pod_health: true            # Check 12: Problematic pods trigger WARN instead of FAIL
+warn_only_resource_utilization: true  # Checks 8-11: High CPU/Memory triggers WARN instead of FAIL
+warn_only_pvc_status: true            # Check 15: Pending/Lost PVCs trigger WARN instead of FAIL
